@@ -1,0 +1,44 @@
+{
+  "name": "@dma1dma1/dstack",
+  "version": "0.1.0",
+  "description": "Pi port of pstack 0.14.2. Sticky /dmode, child agents, role-to-model table.",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    "extensions",
+    "agents",
+    "skills",
+    "prompts",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "check-skills": "node scripts/check-forbidden.mjs && node scripts/check-skill-names.mjs",
+    "typecheck": "tsc --noEmit",
+    "validate": "node --experimental-strip-types scripts/validate.mjs"
+  },
+  "pi": {
+    "extensions": ["./extensions/dstack.ts"],
+    "skills": ["./skills"],
+    "prompts": ["./prompts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "@types/node": "^24.0.0",
+    "typebox": "*",
+    "typescript": "^5.9.0"
+  }
+}

@@ -1,0 +1,84 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import {
+	assertNotNested,
+	buildChildArgv,
+	capOutput,
+	childEnv,
+	mapWithConcurrency,
+	NestingError,
+	parseTaskRequest,
+	PER_TASK_OUTPUT_CAP,
+	resolveAgent,
+} from "../extensions/spawn.ts";
+import { MAX_CONCURRENCY, MAX_PARALLEL_TASKS, NESTING_ENV } from "../extensions/types.ts";
+
+test("spawn argv includes json print no-session no-extensions", () => {
+	const args = buildChildArgv({ task: "look around", model: "acme/fast", tools: "read,grep,find,ls" });
+	assert.deepEqual(args.slice(0, 5), ["--mode", "json", "-p", "--no-session", "--no-extensions"]);
+	assert.ok(args.includes("--model"));
+	assert.equal(args[args.indexOf("--model") + 1], "acme/fast");
+	assert.ok(args.includes("--tools"));
+	assert.equal(args[args.indexOf("--tools") + 1], "read,grep,find,ls");
+	assert.equal(args.at(-1), "Task: look around");
+});
+
+test("inherit-parent omits --model", () => {
+	const args = buildChildArgv({ task: "x", omitModel: true, model: "acme/fast" });
+	assert.equal(args.includes("--model"), false);
+});
+
+test("append-system-prompt is a file path", () => {
+	const args = buildChildArgv({
+		task: "x",
+		systemPromptPath: "/tmp/dstack/prompt.md",
+	});
+	assert.equal(args[args.indexOf("--append-system-prompt") + 1], "/tmp/dstack/prompt.md");
+});
+
+test("nesting refused when DSTACK_NESTING is set", () => {
+	assert.throws(() => assertNotNested({ [NESTING_ENV]: "1" }), NestingError);
+	assert.doesNotThrow(() => assertNotNested({}));
+	assert.equal(childEnv({})[NESTING_ENV], "1");
+});
+
+test("output cap 50 KiB", () => {
+	const small = "ok";
+	assert.equal(capOutput(small), small);
+	const big = "a".repeat(PER_TASK_OUTPUT_CAP + 20);
+	const capped = capOutput(big);
+	assert.ok(Buffer.byteLength(capped, "utf8") > PER_TASK_OUTPUT_CAP);
+	assert.ok(capped.includes("Output truncated"));
+	assert.ok(Buffer.byteLength(capped.split("\n\n[Output truncated")[0] ?? "", "utf8") <= PER_TASK_OUTPUT_CAP);
+});
+
+test("concurrency 4 for 8 tasks", async () => {
+	let live = 0;
+	let peak = 0;
+	const items = Array.from({ length: MAX_PARALLEL_TASKS }, (_, i) => i);
+	const results = await mapWithConcurrency(items, MAX_CONCURRENCY, async (item) => {
+		live += 1;
+		peak = Math.max(peak, live);
+		await new Promise((r) => setTimeout(r, 20));
+		live -= 1;
+		return item;
+	});
+	assert.deepEqual(results, items);
+	assert.equal(peak, MAX_CONCURRENCY);
+});
+
+test("parseTaskRequest rejects too many tasks", () => {
+	const tasks = Array.from({ length: 9 }, () => ({ agent: "general-purpose", task: "x" }));
+	const parsed = parseTaskRequest({ tasks });
+	assert.ok("error" in parsed);
+});
+
+test("dmode false forces general-purpose", () => {
+	assert.deepEqual(resolveAgent({ agent: "poteto-agent", task: "x", dmode: false }), {
+		agent: "general-purpose",
+		dmode: false,
+		tools: undefined,
+	});
+	assert.equal(resolveAgent({ agent: "poteto-agent", task: "x" }).dmode, true);
+	assert.equal(resolveAgent({ agent: "comment-sicko", task: "x" }).tools, "read,grep,find,ls");
+});
