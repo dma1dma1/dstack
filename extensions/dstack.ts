@@ -23,6 +23,7 @@ import { formatSessions } from "./sessions.ts";
 import {
 	companionStatus,
 	dedupeSlugs,
+	ensurePermissionConfig,
 	formatCompanionReport,
 	formatInstallResults,
 	formatSetupKickoff,
@@ -239,8 +240,12 @@ export default function dstack(pi: ExtensionAPI) {
 				ctx.ui.notify(`Installing ${missing.length} required companions.`, "info");
 			}
 			const installed = await installCompanionSources(missing);
+			const perm = await ensurePermissionConfig();
 			const companions = [
 				formatInstallResults(installed),
+				perm === "wrote"
+					? "Wrote a safe-auto permission policy (allow routine work, ask on deploys/pushes, deny rm -rf)."
+					: "Left the existing permission policy in place.",
 				formatCompanionReport(companionStatus(await loadSettingsPackages())),
 				optionalMissing(status).length
 					? `Still optional: ${optionalMissing(status).join(", ")}`

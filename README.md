@@ -49,6 +49,8 @@ pi install npm:@juicesharp/rpiv-ask-user-question
 
 If those two are already loaded, dstack does not register a second todo or ask tool.
 
+The first `/setup-dstack` also writes `~/.pi/agent/extensions/pi-permission-system/config.json` when that file is missing. Routine reads, edits, and bash run. Pushes, deploys, and `sudo` ask. `rm -rf` is denied. Yolo stays off. Edit that file or use `/permission-system` to change it.
+
 ## Tools
 
 | Tool | Role |

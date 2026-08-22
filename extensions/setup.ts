@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { LIST_ROLES, ROLE_NAMES, type DstackConfig, type ListRoleName, type RoleValue } from "./types.ts";
 import { emptyConfig, validateRoles } from "./models.ts";
@@ -17,18 +17,74 @@ export const COMPANIONS = [
 	{ need: "Optional web", source: "npm:pi-web-access", optional: true },
 ] as const;
 
-export const PERMISSION_RECIPES = {
-	ask: [
-		"gt submit*",
-		"gt merge*",
-		"gh pr merge*",
-		"kubectl apply*",
-		"terraform apply*",
-		"vercel deploy*",
-	],
-	deny: ["rm -rf *"],
-	askIfLooksLikeDataLoss: ["recursive deletes that look like data loss"],
-};
+export const PERMISSION_CONFIG_RELATIVE = ".pi/agent/extensions/pi-permission-system/config.json";
+
+export function permissionConfigPath(home = homedir()): string {
+	return join(home, PERMISSION_CONFIG_RELATIVE);
+}
+
+export const SAFE_AUTO_PERMISSION_CONFIG = {
+	yoloMode: false,
+	permissionReviewLog: true,
+	permission: {
+		"*": "allow",
+		read: "allow",
+		grep: "allow",
+		find: "allow",
+		ls: "allow",
+		write: "allow",
+		edit: "allow",
+		skill: { "*": "allow" },
+		mcp: { "*": "allow" },
+		path: {
+			"*": "allow",
+			"*.env": "deny",
+			"*.env.*": "deny",
+			"*.env.example": "allow",
+			"~/.ssh/*": "deny",
+			"**/id_rsa": "deny",
+			"**/id_ed25519": "deny",
+		},
+		external_directory: "ask",
+		bash: {
+			"*": "allow",
+			"sudo *": "ask",
+			"chmod -R *": "ask",
+			"chown -R *": "ask",
+			"git push*": "ask",
+			"git reset --hard*": "ask",
+			"git clean *": "ask",
+			"gt submit*": "ask",
+			"gt merge*": "ask",
+			"gh pr merge*": "ask",
+			"npm publish*": "ask",
+			"pnpm publish*": "ask",
+			"kubectl apply*": "ask",
+			"kubectl delete*": "ask",
+			"terraform apply*": "ask",
+			"terraform destroy*": "ask",
+			"vercel deploy*": "ask",
+			"docker push*": "ask",
+			"docker system prune*": "ask",
+			"rm -rf *": "deny",
+			"rm -fr *": "deny",
+			"mkfs *": "deny",
+			"dd if=*": "deny",
+		},
+	},
+} as const;
+
+export async function ensurePermissionConfig(home = homedir()): Promise<"wrote" | "exists"> {
+	const path = permissionConfigPath(home);
+	try {
+		await readFile(path, "utf8");
+		return "exists";
+	} catch {
+		await mkdir(dirname(path), { recursive: true });
+		await writeFile(path, `${JSON.stringify(SAFE_AUTO_PERMISSION_CONFIG, null, 2)}\n`, "utf8");
+		return "wrote";
+	}
+}
 
 export type InstalledPackage = { source: string };
 

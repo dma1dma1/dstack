@@ -1,13 +1,19 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, writeFile, mkdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { emptyConfig, validateRoles } from "../extensions/models.ts";
 import {
 	classifySlug,
 	companionStatus,
 	dedupeSlugs,
+	ensurePermissionConfig,
 	formatSetupKickoff,
 	installCompanionSources,
+	permissionConfigPath,
 	requiredMissing,
+	SAFE_AUTO_PERMISSION_CONFIG,
 	suggestConfig,
 	suggestPanel,
 } from "../extensions/setup.ts";
@@ -94,4 +100,24 @@ test("installCompanionSources runs pi install once per missing source", async ()
 		["install", "npm:pi-background-tasks"],
 	]);
 	assert.equal(results.every((r) => r.ok), true);
+});
+
+test("safe-auto policy allows routine bash and denies rm -rf", () => {
+	assert.equal(SAFE_AUTO_PERMISSION_CONFIG.yoloMode, false);
+	assert.equal(SAFE_AUTO_PERMISSION_CONFIG.permission.bash["*"], "allow");
+	assert.equal(SAFE_AUTO_PERMISSION_CONFIG.permission.bash["git push*"], "ask");
+	assert.equal(SAFE_AUTO_PERMISSION_CONFIG.permission.bash["rm -rf *"], "deny");
+	assert.equal(SAFE_AUTO_PERMISSION_CONFIG.permission.external_directory, "ask");
+});
+
+test("ensurePermissionConfig writes once and leaves an existing file", async () => {
+	const home = await mkdtemp(join(tmpdir(), "dstack-perm-"));
+	const path = permissionConfigPath(home);
+	assert.equal(await ensurePermissionConfig(home), "wrote");
+	const first = await readFile(path, "utf8");
+	assert.match(first, /git push\*/);
+	await mkdir(join(home, ".pi/agent/extensions/pi-permission-system"), { recursive: true });
+	await writeFile(path, '{"yoloMode":true}\n', "utf8");
+	assert.equal(await ensurePermissionConfig(home), "exists");
+	assert.equal(await readFile(path, "utf8"), '{"yoloMode":true}\n');
 });

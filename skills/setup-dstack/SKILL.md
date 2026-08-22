@@ -33,7 +33,7 @@ When the user accepts, write the full file with `dstack_config` `action=write` a
 
 ### 5. Companions
 
-`/setup-dstack` already installs the required three if they were missing (MCP, permissions, background jobs). Report what happened. Offer the optional ones. Do not install optional packages unless the user asks.
+`/setup-dstack` already installs the required three if they were missing (MCP, permissions, background jobs). If there is no permission config yet, it writes a safe-auto policy: allow routine tools and bash, ask on push/deploy/sudo, deny `rm -rf` and similar, ask before leaving the working tree. It does not overwrite a config you already have. Offer the optional companions. Do not install those unless the user asks.
 
 - `npm:pi-mcp-adapter`
 - `npm:@gotgenes/pi-permission-system`
