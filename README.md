@@ -10,7 +10,15 @@ The npm name `dstack` is taken. This package is `@dma1dma1/dstack`.
 pi install npm:@dma1dma1/dstack
 ```
 
-Open Pi in a repo. Run `/setup-dstack`. That writes `~/.pi/agent/dstack/models.json` from models Pi can already see, then lists companion packages.
+Pi has no package-to-package install graph, so that line only loads dstack. Required companions are MCP, permission confirms, and background jobs. `/setup-dstack` installs those if they are missing. From this repo you can also run:
+
+```bash
+npm run install-companions
+```
+
+Add `-- --optional` to include richer todos, questions, and web.
+
+Open Pi in a repo. Run `/setup-dstack`. That installs missing required companions, then proposes a mapping from the models you have. Change it in chat, then it writes `~/.pi/agent/dstack/models.json`.
 
 Turn the sticky workflow on:
 
@@ -24,16 +32,15 @@ Ask "how does X work?" on a real repo. dmode fans out `general-purpose` explorer
 
 ## Full stack
 
-dstack does not reimplement MCP, permissions, or background jobs. `/setup-dstack` prints these if they are missing:
+dstack does not reimplement MCP, permissions, or background jobs. `/setup-dstack` installs the required three if they are missing. To do that from a shell:
 
 ```bash
 pi install npm:pi-mcp-adapter
 pi install npm:@gotgenes/pi-permission-system
 pi install npm:pi-background-tasks
-pi install npm:pi-web-access
 ```
 
-Optional richer todos and questions:
+Optional richer todos, questions, and web:
 
 ```bash
 pi install npm:@juicesharp/rpiv-todo

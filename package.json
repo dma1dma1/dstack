@@ -18,7 +18,8 @@
     "test": "node --experimental-strip-types --test tests/*.test.ts",
     "check-skills": "node scripts/check-forbidden.mjs && node scripts/check-skill-names.mjs",
     "typecheck": "tsc --noEmit",
-    "validate": "node --experimental-strip-types scripts/validate.mjs"
+    "validate": "node --experimental-strip-types scripts/validate.mjs",
+    "install-companions": "node --experimental-strip-types scripts/install-companions.mjs"
   },
   "pi": {
     "extensions": ["./extensions/dstack.ts"],

@@ -1,5 +1,5 @@
-import { mkdtemp, writeFile, unlink, rmdir, readFile } from "node:fs/promises";
-import { tmpdir, homedir } from "node:os";
+import { mkdtemp, writeFile, unlink, rmdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -12,6 +12,7 @@ import {
 	emptyConfig,
 	formatConfigError,
 	loadConfig,
+	parseConfig,
 	resolveModel,
 	saveConfig,
 	slugsFromRegistry,
@@ -21,9 +22,15 @@ import { dmodeReminder, modeStatusText, restoreMode, toggleMode, type SessionEnt
 import { formatSessions } from "./sessions.ts";
 import {
 	companionStatus,
+	dedupeSlugs,
 	formatCompanionReport,
-	parseSettingsPackages,
-	PERMISSION_RECIPES,
+	formatInstallResults,
+	formatSetupKickoff,
+	installCompanionSources,
+	loadSettingsPackages,
+	optionalMissing,
+	requiredMissing,
+	suggestConfig,
 } from "./setup.ts";
 import {
 	assertNotNested,
@@ -44,7 +51,7 @@ import {
 	saveTodos,
 	todoFilePath,
 } from "./todo.ts";
-import { MODE_ENTRY, type DstackConfig, type ModeState, type TaskSpec, type TodoState } from "./types.ts";
+import { MODE_ENTRY, type ModeState, type TaskSpec, type TodoState } from "./types.ts";
 import { createWorktree, WorktreeError } from "./worktree.ts";
 
 const TaskItem = Type.Object({
@@ -93,9 +100,9 @@ const AskParams = Type.Object({
 });
 
 const ConfigParams = Type.Object({
-	action: StringEnum(["get", "set", "list"] as const),
+	action: StringEnum(["get", "set", "list", "write"] as const),
 	role: Type.Optional(Type.String()),
-	value: Type.Optional(Type.String({ description: "Slug, inherit-parent, auto, or comma-separated list" })),
+	value: Type.Optional(Type.String({ description: "Slug, inherit-parent, auto, comma-separated list, or full models.json for write" })),
 });
 
 function skillPath(): string {
@@ -211,85 +218,46 @@ export default function dstack(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("setup-dstack", {
-		description: "Detect models, write models.json, list companions.",
+		description: "Suggest role models from your catalog, then change them in chat.",
 		handler: async (_args, ctx) => {
 			const slugs = slugsFromRegistry(ctx.modelRegistry.getAvailable());
 			const path = defaultConfigPath();
 			const loaded = await loadConfig(path);
+			if (!loaded.ok) {
+				ctx.ui.notify(formatConfigError(loaded.error), "error");
+			}
 			const current = loaded.ok ? loaded.value : emptyConfig();
-			const defaults: DstackConfig = {
-				roles: { ...current.roles },
-				worktree: current.worktree,
-			};
-			const listRoles = [
-				"how critics",
-				"arena runners",
-				"arena cross-judge pool",
-				"architect runners",
-				"interrogate reviewers",
-			];
-			for (const role of [
-				"feature, refactoring",
-				"bug-fix",
-				"perf-issue",
-				"hillclimb",
-				"judgment and prose",
-				"hardest tasks",
-				"how explorer",
-				"how explainer",
-				"why investigators",
-				"why synthesizer",
-				"reflect tooling",
-				"reflect judgment, divergent, synthesizer",
-				"swarm workers",
-			]) {
-				if (!defaults.roles[role]) defaults.roles[role] = "inherit-parent";
-			}
-			if (slugs.length > 0) {
-				const panel = slugs.slice(0, 4);
-				for (const role of listRoles) {
-					if (!defaults.roles[role]) defaults.roles[role] = panel;
-				}
-			}
-			const known = new Set(slugs);
-			const valid = validateRoles(defaults.roles, known);
-			if (!valid.ok) {
-				ctx.ui.notify(formatConfigError(valid.error), "error");
+			if (slugs.length === 0) {
+				ctx.ui.notify("No models in the registry. Add a provider, then run /setup-dstack again.", "error");
 				return;
 			}
-			const ok = ctx.hasUI
-				? await ctx.ui.confirm("Write dstack models.json?", `${path}\n${JSON.stringify(defaults, null, 2)}`)
-				: true;
-			if (!ok) {
-				ctx.ui.notify("Setup cancelled.", "info");
-				return;
+			const catalog = dedupeSlugs(slugs);
+			const suggestion = suggestConfig(slugs, current);
+			const status = companionStatus(await loadSettingsPackages());
+			const missing = requiredMissing(status);
+			if (missing.length > 0) {
+				ctx.ui.notify(`Installing ${missing.length} required companions.`, "info");
 			}
-			await saveConfig(path, { ...defaults, roles: valid.value });
-			let settingsRaw: unknown = {};
-			try {
-				settingsRaw = JSON.parse(await readFile(join(homedir(), ".pi/agent/settings.json"), "utf8")) as unknown;
-			} catch {
-				settingsRaw = {};
-			}
-			const companions = companionStatus(parseSettingsPackages(settingsRaw));
-			const report = [`Wrote ${path}`, `Detected models: ${slugs.join(", ") || "(none)"}`, "", formatCompanionReport(companions)].join(
-				"\n",
+			const installed = await installCompanionSources(missing);
+			const companions = [
+				formatInstallResults(installed),
+				formatCompanionReport(companionStatus(await loadSettingsPackages())),
+				optionalMissing(status).length
+					? `Still optional: ${optionalMissing(status).join(", ")}`
+					: "",
+			]
+				.filter(Boolean)
+				.join("\n");
+			ctx.ui.notify(`Suggested mappings from ${catalog.length} of ${slugs.length} models. Reply here to change them.`, "info");
+			pi.sendUserMessage(
+				formatSetupKickoff({
+					rawCount: slugs.length,
+					catalog,
+					suggestion,
+					current,
+					companions,
+				}),
 			);
-			ctx.ui.notify(report, "info");
-			if (companions.some((c) => c.source === "npm:@gotgenes/pi-permission-system" && c.installed) && ctx.hasUI) {
-				const writePerms = await ctx.ui.confirm(
-					"Write permission recipes?",
-					`Ask: ${PERMISSION_RECIPES.ask.join(", ")}\nDeny: ${PERMISSION_RECIPES.deny.join(", ")}`,
-				);
-				if (writePerms) {
-					const dest = join(homedir(), ".pi/agent/dstack/permission-recipes.json");
-					const { mkdir, writeFile } = await import("node:fs/promises");
-					const { dirname } = await import("node:path");
-					await mkdir(dirname(dest), { recursive: true });
-					await writeFile(dest, `${JSON.stringify(PERMISSION_RECIPES, null, 2)}\n`, "utf8");
-					ctx.ui.notify(`Wrote ${dest}`, "info");
-				}
-			}
 		},
 	});
 
@@ -500,6 +468,23 @@ export default function dstack(pi: ExtensionAPI) {
 				}
 				return textResult(JSON.stringify(loaded.value, null, 2));
 			}
+			const known = new Set(slugsFromRegistry(ctx.modelRegistry.getAvailable()));
+			if (params.action === "write") {
+				if (!params.value) return textResult("write requires a models.json value", {}, true);
+				let raw: unknown;
+				try {
+					raw = JSON.parse(params.value) as unknown;
+				} catch (err) {
+					return textResult(`write value is not JSON: ${(err as Error).message}`, {}, true);
+				}
+				const parsed = parseConfig(raw);
+				if (!parsed.ok) return textResult(formatConfigError(parsed.error), {}, true);
+				const valid = validateRoles(parsed.value.roles, known);
+				if (!valid.ok) return textResult(formatConfigError(valid.error), {}, true);
+				const next = { ...parsed.value, roles: valid.value };
+				await saveConfig(path, next);
+				return textResult(JSON.stringify(next, null, 2));
+			}
 			if (!params.role || params.value === undefined) {
 				return textResult("set requires role and value", {}, true);
 			}
@@ -507,7 +492,6 @@ export default function dstack(pi: ExtensionAPI) {
 				? params.value.split(",").map((s) => s.trim()).filter(Boolean)
 				: params.value.trim();
 			const next = { ...loaded.value, roles: { ...loaded.value.roles, [params.role]: value } };
-			const known = new Set(slugsFromRegistry(ctx.modelRegistry.getAvailable()));
 			const valid = validateRoles(next.roles, known);
 			if (!valid.ok) {
 				return textResult(formatConfigError(valid.error), {}, true);
