@@ -1,52 +1,39 @@
 ---
 name: setup-dstack
-description: Detect available Pi models and write ~/.pi/agent/dstack/models.json. Lists companion packages. Use for /setup-dstack or changing dstack model choices.
+description: Suggest role-to-model mappings from the models you have, then change them in chat. Writes ~/.pi/agent/dstack/models.json. Use for /setup-dstack or changing dstack model choices.
 ---
 
 # Setup dstack
 
-Run `/setup-dstack`. That command detects models from `ctx.modelRegistry`, writes `~/.pi/agent/dstack/models.json`, and lists companions. Prefer the command over editing the file by hand.
+`/setup-dstack` detects your Pi models, collapses dated twins, and proposes one mapping. You change it in plain language. The command does not open a picker and does not dump the registry.
 
-If you must write the file yourself, follow the steps below. Use `dstack_ask`, not free text.
+If the command already injected a catalog and a suggestion, use those. Do not re-enumerate every slug.
 
 ## Steps
 
-### 1. Detect available models
+### 1. Show the suggestion
 
-Read slugs from `ctx.modelRegistry.getAvailable()` as `provider/id`. Never write a slug you have not seen. `inherit-parent` and `auto` are always valid.
+Print the suggested mapping as a short list. Name why a role got a family (fast explorer, judgment for prose, mixed panel for critics). Mention `inherit-parent` and `auto` as always valid.
 
-### 2. Load current state
+If `models.json` already exists, show current next to suggested only where they differ.
 
-If `~/.pi/agent/dstack/models.json` exists, treat it as the current choices. Otherwise start from `inherit-parent` on scalar roles.
+### 2. Talk
 
-### 3. Map and confirm
+Ask what to change. Accept replies like "opus for judgment", "inherit-parent on feature work", "drop haiku from critics", "worktree from origin/main".
 
-Show every role. Confirm with `dstack_ask`. Panel roles (how critics, arena runners, architect runners, interrogate reviewers, arena cross-judge pool) are lists. A list of only `inherit-parent` / `auto` is a no-op. Refuse to save that.
+Resolve names to catalog slugs. Never write a slug that is not in the catalog. If a name is ambiguous, ask one clarifying question with two or three slugs, not the whole list.
 
-### 4. Validate
+### 3. Validate
 
-Every real slug must be in the detected set. `dstack_config` will refuse unknown slugs and all-inherit critic panels.
+Every real slug must be in the catalog. A panel of only `inherit-parent` / `auto` is a no-op. Refuse that and ask again.
 
-### 5. Write the file
+### 4. Write
 
-Overwrite `~/.pi/agent/dstack/models.json`. Shape:
+When the user accepts, write the full file with `dstack_config` `action=write` and a JSON value of `{ "roles", "worktree" }`. One write. Then confirm the path `~/.pi/agent/dstack/models.json`.
 
-```json
-{
-  "roles": {
-    "how explorer": "inherit-parent",
-    "how critics": ["inherit-parent", "provider/model"]
-  },
-  "worktree": {
-    "base": "~/.dma/worktrees",
-    "from": "HEAD"
-  }
-}
-```
+### 5. Companions
 
-### 6. Companions
-
-List these and print `pi install` lines for anything missing. Do not install them unless the user confirms.
+`/setup-dstack` already installs the required three if they were missing (MCP, permissions, background jobs). If there is no permission config yet, it writes a safe-auto policy: allow routine tools and bash, ask on push/deploy/sudo, deny `rm -rf` and similar, ask before leaving the working tree. It does not overwrite a config you already have. Offer the optional companions. Do not install those unless the user asks.
 
 - `npm:pi-mcp-adapter`
 - `npm:@gotgenes/pi-permission-system`

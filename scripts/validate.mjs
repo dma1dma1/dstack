@@ -131,6 +131,9 @@ function makePi() {
 		tools,
 		custom,
 		handlers,
+		sendUserMessage(content) {
+			custom.push({ type: "user-message", data: content });
+		},
 		registerCommand(name, opts) {
 			commands.set(name, opts);
 		},
@@ -334,10 +337,27 @@ async function main() {
 	assert("ask-select", askSelect.content[0].text === "a", askSelect.content[0].text);
 
 	await pi.commands.get("setup-dstack").handler("", ctx);
-	const configPath = join(home, ".pi/agent/dstack/models.json");
-	assert("setup-wrote-config", existsSync(configPath), configPath);
-	const setupReport = ctx.notifies.find((n) => String(n.message).includes("Wrote "));
-	assert("setup-lists-companions", Boolean(setupReport?.message?.includes("companion") || setupReport?.message?.includes("pi-permission") || setupReport?.message?.includes("not installed") || setupReport?.message), setupReport?.message?.slice(0, 200));
+	const kickoff = pi.custom.find((e) => e.type === "user-message");
+	assert(
+		"setup-kicked-chat",
+		typeof kickoff?.data === "string" && kickoff.data.includes("Suggested mapping") && kickoff.data.includes("Do not open a model picker"),
+		String(kickoff?.data).slice(0, 200),
+	);
+	assert("setup-did-not-write-yet", !existsSync(join(home, ".pi/agent/dstack/models.json")));
+	const wrote = await pi.tools.get("dstack_config").execute(
+		"4b",
+		{
+			action: "write",
+			value: JSON.stringify({
+				roles: { "bug-fix": "acme/fast", "how critics": ["acme/fast", "acme/smart"] },
+				worktree: { base: "~/.dma/worktrees", from: "HEAD" },
+			}),
+		},
+		undefined,
+		undefined,
+		ctx,
+	);
+	assert("config-write", !wrote.isError && wrote.content[0].text.includes("acme/fast"), wrote.content[0].text.slice(0, 160));
 
 	const listedCfg = await pi.tools.get("dstack_config").execute("5", { action: "list" }, undefined, undefined, ctx);
 	assert("config-list", listedCfg.content[0].text.includes("roles") && !listedCfg.isError);
