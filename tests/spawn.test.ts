@@ -5,6 +5,7 @@ import {
 	buildChildArgv,
 	capOutput,
 	childEnv,
+	formatUsageStats,
 	mapWithConcurrency,
 	NestingError,
 	parseTaskRequest,
@@ -40,6 +41,24 @@ test("nesting refused when DSTACK_NESTING is set", () => {
 	assert.throws(() => assertNotNested({ [NESTING_ENV]: "1" }), NestingError);
 	assert.doesNotThrow(() => assertNotNested({}));
 	assert.equal(childEnv({})[NESTING_ENV], "1");
+});
+
+test("child usage reports model, tokens, context, turns, and cost", () => {
+	assert.equal(
+		formatUsageStats(
+			{
+				input: 12_400,
+				output: 2_100,
+				cacheRead: 8_700,
+				cacheWrite: 1_200,
+				cost: 0.084,
+				contextTokens: 18_200,
+				turns: 4,
+			},
+			"acme/agent-model",
+		),
+		"4 turns ↑12k ↓2.1k R8.7k W1.2k $0.0840 ctx:18k acme/agent-model",
+	);
 });
 
 test("output cap 50 KiB", () => {
