@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+	applyJsonEvent,
 	assertNotNested,
 	buildChildArgv,
 	capOutput,
@@ -11,6 +12,7 @@ import {
 	parseTaskRequest,
 	PER_TASK_OUTPUT_CAP,
 	resolveAgent,
+	type ChildResult,
 } from "../extensions/spawn.ts";
 import { MAX_CONCURRENCY, MAX_PARALLEL_TASKS, NESTING_ENV } from "../extensions/types.ts";
 
@@ -41,6 +43,29 @@ test("nesting refused when DSTACK_NESTING is set", () => {
 	assert.throws(() => assertNotNested({ [NESTING_ENV]: "1" }), NestingError);
 	assert.doesNotThrow(() => assertNotNested({}));
 	assert.equal(childEnv({})[NESTING_ENV], "1");
+});
+
+test("child telemetry reports the concrete provider model", () => {
+	const result: ChildResult = {
+		text: "",
+		exitCode: 0,
+		stderr: "",
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+	};
+	applyJsonEvent(
+		{
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "done" }],
+				provider: "router",
+				model: "requested-model",
+				responseModel: "concrete-model",
+			},
+		},
+		{ messages: [], result },
+	);
+	assert.equal(result.model, "router/concrete-model");
 });
 
 test("child usage reports model, tokens, context, turns, and cost", () => {

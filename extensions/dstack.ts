@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { discoverAgents, packageRoot } from "./agents.ts";
 import { richerAskPresent, parseAskParams } from "./ask.ts";
@@ -38,10 +39,12 @@ import {
 	buildChildArgv,
 	capOutput,
 	childEnv,
+	formatUsageStats,
 	mapWithConcurrency,
 	parseTaskRequest,
 	resolveAgent,
 	runChildProcess,
+	type ChildResult,
 	MAX_CONCURRENCY,
 	NestingError,
 } from "./spawn.ts";
@@ -112,6 +115,37 @@ function skillPath(): string {
 
 function textResult(text: string, details: unknown = {}, isError = false) {
 	return { content: [{ type: "text" as const, text }], details, isError };
+}
+
+type TaskUsageRow = {
+	agent: string;
+	model?: string;
+	usage: ChildResult["usage"];
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function isChildUsage(value: unknown): value is ChildResult["usage"] {
+	if (!isRecord(value)) return false;
+	return ["input", "output", "cacheRead", "cacheWrite", "cost", "contextTokens", "turns"].every(
+		(key) => typeof value[key] === "number",
+	);
+}
+
+function taskUsageRows(details: unknown): TaskUsageRow[] {
+	if (!isRecord(details) || !Array.isArray(details.results)) return [];
+	const rows: TaskUsageRow[] = [];
+	for (const result of details.results) {
+		if (!isRecord(result) || typeof result.agent !== "string" || !isChildUsage(result.usage)) continue;
+		rows.push({
+			agent: result.agent,
+			model: typeof result.model === "string" ? result.model : undefined,
+			usage: result.usage,
+		});
+	}
+	return rows;
 }
 
 function branchEntries(ctx: ExtensionContext): SessionEntryLike[] {
@@ -272,6 +306,15 @@ export default function dstack(pi: ExtensionAPI) {
 		description:
 			"Spawn an isolated child Pi process. Modes: single (agent+task), parallel (tasks), chain (chain). Children cannot spawn children.",
 		parameters: TaskParams,
+		renderResult(result, _options, theme) {
+			const text = result.content.find((part) => part.type === "text")?.text ?? "(no output)";
+			const rows = taskUsageRows(result.details);
+			if (rows.length === 0) return new Text(text, 0, 0);
+			const usage = rows
+				.map((row) => theme.fg("dim", `${row.agent}: ${formatUsageStats(row.usage, row.model)}`))
+				.join("\n");
+			return new Text(`${text}\n${usage}`, 0, 0);
+		},
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			try {
 				assertNotNested();

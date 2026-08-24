@@ -153,7 +153,9 @@ export type JsonLineEvent = {
 		content?: Array<{ type?: string; text?: string }>;
 		stopReason?: string;
 		errorMessage?: string;
+		provider?: string;
 		model?: string;
+		responseModel?: string;
 		usage?: {
 			input?: number;
 			output?: number;
@@ -182,6 +184,26 @@ export type ChildResult = {
 		turns: number;
 	};
 };
+
+function formatTokens(count: number): string {
+	if (count < 1000) return count.toString();
+	if (count < 10_000) return `${(count / 1000).toFixed(1)}k`;
+	if (count < 1_000_000) return `${Math.round(count / 1000)}k`;
+	return `${(count / 1_000_000).toFixed(1)}M`;
+}
+
+export function formatUsageStats(usage: ChildResult["usage"], model?: string): string {
+	const parts: string[] = [];
+	if (usage.turns) parts.push(`${usage.turns} turn${usage.turns === 1 ? "" : "s"}`);
+	if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
+	if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
+	if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
+	if (usage.cacheWrite) parts.push(`W${formatTokens(usage.cacheWrite)}`);
+	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
+	if (usage.contextTokens) parts.push(`ctx:${formatTokens(usage.contextTokens)}`);
+	if (model) parts.push(model);
+	return parts.join(" ");
+}
 
 function lastAssistantText(messages: Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>): string {
 	for (let i = messages.length - 1; i >= 0; i--) {
@@ -212,7 +234,10 @@ export function applyJsonEvent(
 		state.result.usage.cost += usage.cost?.total || 0;
 		state.result.usage.contextTokens = usage.totalTokens || 0;
 	}
-	if (!state.result.model && msg.model) state.result.model = msg.model;
+	const reportedModel = msg.responseModel ?? msg.model;
+	if (!state.result.model && reportedModel) {
+		state.result.model = msg.provider ? `${msg.provider}/${reportedModel}` : reportedModel;
+	}
 	if (msg.stopReason) state.result.stopReason = msg.stopReason;
 	if (msg.errorMessage) state.result.errorMessage = msg.errorMessage;
 	state.result.text = lastAssistantText(state.messages);
