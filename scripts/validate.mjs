@@ -40,7 +40,9 @@ if (process.argv.includes("--mode") && process.argv.includes("json")) {
 				role: "assistant",
 				content: [{ type: "text", text }],
 				stopReason: "end",
-				model: "fake/child",
+				provider: "fake-router",
+				model: "requested-child",
+				responseModel: "concrete-child",
 				usage: { input: 1, output: 1, totalTokens: 2 },
 			},
 		})}\n`,
@@ -408,6 +410,16 @@ async function main() {
 		ctx,
 	);
 	assert("spawn-single", !single.isError && single.content[0].text.includes("child-ok"), single.content[0].text);
+	const renderedSingle = pi.tools
+		.get("dstack_task")
+		.renderResult(single, { expanded: false }, { fg: (_color, text) => text })
+		.render(160)
+		.join("\n");
+	assert(
+		"spawn-single-usage-rendered",
+		renderedSingle.includes("general-purpose: 1 turn ↑1 ↓1 ctx:2 fake-router/concrete-child"),
+		renderedSingle,
+	);
 	const kids = readdirSync(process.env.DSTACK_VALIDATE_DIR).filter((f) => f.endsWith(".json"));
 	const lastKid = JSON.parse(readFileSync(join(process.env.DSTACK_VALIDATE_DIR, kids.at(-1)), "utf8"));
 	assert("child-no-extensions", lastKid.noExtensions === true);
@@ -431,6 +443,41 @@ async function main() {
 		"spawn-parallel",
 		!parallel.isError && parallel.content[0].text.includes("[general-purpose]") && parallel.content[0].text.includes("[comment-sicko]"),
 		parallel.content[0].text.slice(0, 200),
+	);
+	const renderedParallel = pi.tools
+		.get("dstack_task")
+		.renderResult(parallel, { expanded: false }, { fg: (_color, text) => text })
+		.render(160)
+		.join("\n");
+	assert(
+		"spawn-parallel-usage-rendered",
+		renderedParallel.includes("general-purpose: 1 turn ↑1 ↓1 ctx:2 fake-router/concrete-child") &&
+			renderedParallel.includes("comment-sicko: 1 turn ↑1 ↓1 ctx:2 fake-router/concrete-child"),
+		renderedParallel.slice(-300),
+	);
+
+	const chain = await pi.tools.get("dstack_task").execute(
+		"12b",
+		{
+			chain: [
+				{ agent: "general-purpose", task: "first" },
+				{ agent: "comment-sicko", task: "then {previous}" },
+			],
+		},
+		undefined,
+		undefined,
+		ctx,
+	);
+	const renderedChain = pi.tools
+		.get("dstack_task")
+		.renderResult(chain, { expanded: false }, { fg: (_color, text) => text })
+		.render(160)
+		.join("\n");
+	assert(
+		"spawn-chain-usage-rendered",
+		renderedChain.includes("general-purpose: 1 turn ↑1 ↓1 ctx:2 fake-router/concrete-child") &&
+			renderedChain.includes("comment-sicko: 1 turn ↑1 ↓1 ctx:2 fake-router/concrete-child"),
+		renderedChain.slice(-300),
 	);
 
 	const repo = await makeRepo();
