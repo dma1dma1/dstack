@@ -63,8 +63,6 @@ The first `/setup-dstack` also writes `~/.pi/agent/extensions/pi-permission-syst
 
 While `dstack_task` runs, a small agent dock below the editor shows one status line per child. The transcript keeps the tool card compact. Press Ctrl+O to show the full child activity and output.
 
-`dstack_task` is a custom foreground tool that spawns child Pi processes. Pi's extension API does not expose the internal background-subagent registry, so these children do not appear as built-in background tasks. The agent dock is dstack's TUI view of the same processes.
-
 Nesting has three depths. An unset `DSTACK_NESTING` or `0` is root depth 0. Root children run at depth 1 and may spawn depth-2 children. Depth 2 is terminal. dstack rejects malformed values instead of guessing. Parallel writers should each set `worktree: true`.
 
 `worktree: true` on `dstack_task` creates `~/.dma/worktrees/<repo>/<slug>` on branch `dma/<slug>` and runs the child there. The default base is `HEAD`, so the child sees the parent's current commit, not `origin/main`, unless `worktree.from` in `models.json` is `origin/main`. If `git worktree add` fails, the child does not run in the parent tree. Uncommitted parent diffs stay invisible either way.
