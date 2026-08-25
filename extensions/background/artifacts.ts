@@ -1,7 +1,7 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, open } from "node:fs/promises";
-import { isAbsolute, normalize } from "node:path";
+import { lstat, mkdir, open, rename, unlink } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, normalize } from "node:path";
 
 export type AbsolutePath = string & { readonly __brand: "AbsolutePath" };
 export type Sha256 = string & { readonly __brand: "Sha256" };
@@ -32,6 +32,44 @@ function validateSeal(seal: OutputArtifactSeal): void {
 	if (!/^[a-f0-9]{64}$/u.test(seal.sha256)) {
 		throw new Error("artifact sha256 integrity check failed");
 	}
+}
+
+export async function atomicWriteFile(path: string, bytes: string | Buffer): Promise<void> {
+	if (!isAbsolute(path) || normalize(path) !== path) throw new Error("atomic write path must be absolute and normalized");
+	await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+	const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
+	let handle;
+	try {
+		handle = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+		await handle.writeFile(bytes);
+		await handle.sync();
+		await handle.close();
+		handle = undefined;
+		await rename(temporary, path);
+		const directory = await open(dirname(path), constants.O_RDONLY);
+		try {
+			await directory.sync();
+		} finally {
+			await directory.close();
+		}
+	} finally {
+		if (handle !== undefined) await handle.close().catch(() => undefined);
+		await unlink(temporary).catch(() => undefined);
+	}
+}
+
+export function sealBytes(path: string, bytes: Buffer): OutputArtifactSeal {
+	return {
+		path,
+		bytes: bytes.byteLength,
+		sha256: createHash("sha256").update(bytes).digest("hex"),
+	};
+}
+
+export async function writeSealedArtifact(path: string, bytes: string | Buffer): Promise<OutputArtifactSeal> {
+	const buffer = typeof bytes === "string" ? Buffer.from(bytes) : bytes;
+	await atomicWriteFile(path, buffer);
+	return sealBytes(path, buffer);
 }
 
 export async function readOutputArtifact(seal: OutputArtifactSeal): Promise<Buffer> {

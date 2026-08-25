@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { basename } from "node:path";
+import { constants, existsSync } from "node:fs";
+import { access, realpath, stat } from "node:fs/promises";
+import { basename, delimiter, join } from "node:path";
 import {
 	MAX_CONCURRENCY,
 	MAX_PARALLEL_TASKS,
@@ -163,6 +164,52 @@ export function getPiInvocation(args: string[]): { command: string; args: string
 	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
 	if (!isGenericRuntime) return { command: process.execPath, args };
 	return { command: "pi", args };
+}
+
+async function regularRealPath(path: string, label: string): Promise<string> {
+	const resolved = await realpath(path);
+	if (!(await stat(resolved)).isFile()) throw new Error(`${label} must be a regular file`);
+	return resolved;
+}
+
+async function executableRealPath(path: string, label: string): Promise<string> {
+	const resolved = await regularRealPath(path, label);
+	if (process.platform !== "win32") await access(resolved, constants.X_OK);
+	return resolved;
+}
+
+async function resolvePathCommand(command: string, pathValue: string | undefined): Promise<string> {
+	for (const directory of (pathValue ?? "").split(delimiter)) {
+		if (!directory) continue;
+		const candidate = join(directory, process.platform === "win32" ? `${command}.exe` : command);
+		try {
+			return await executableRealPath(candidate, command);
+		} catch {
+			continue;
+		}
+	}
+	throw new Error(`Cannot resolve ${command} to an absolute executable from PATH`);
+}
+
+export async function freezePiChildLaunch(input: Readonly<{
+	execPath?: string;
+	entryScript?: string;
+	pathValue?: string;
+}> = {}): Promise<ChildInvocation> {
+	const execPath = input.execPath ?? process.execPath;
+	const entryScript = input.entryScript ?? process.argv[1];
+	const bunVirtual = entryScript?.startsWith("/$bunfs/root/") === true;
+	if (entryScript !== undefined && !bunVirtual && existsSync(entryScript)) {
+		return {
+			command: await executableRealPath(execPath, "Pi runtime"),
+			argsPrefix: [await regularRealPath(entryScript, "Pi entry script")],
+		};
+	}
+	const execName = basename(execPath).toLowerCase();
+	if (!/^(node|bun)(\.exe)?$/.test(execName)) {
+		return { command: await executableRealPath(execPath, "Pi executable"), argsPrefix: [] };
+	}
+	return { command: await resolvePathCommand("pi", input.pathValue ?? process.env.PATH), argsPrefix: [] };
 }
 
 export type ChildContentPart =
@@ -362,14 +409,23 @@ function snapshotChildResult(result: ChildResult): ChildResult {
 	return { ...result, messages: [...result.messages], usage: { ...result.usage } };
 }
 
+export type ChildInvocation = Readonly<{
+	command: string;
+	argsPrefix: readonly string[];
+}>;
+
 export async function runChildProcess(input: {
 	args: string[];
 	cwd: string;
 	env: Record<string, string>;
+	invocation?: ChildInvocation;
 	signal?: AbortSignal;
 	onUpdate?: (result: ChildResult) => void;
+	onStdout?: (chunk: Buffer) => void;
 }): Promise<ChildResult> {
-	const invocation = getPiInvocation(input.args);
+	const invocation = input.invocation === undefined
+		? getPiInvocation(input.args)
+		: { command: input.invocation.command, args: [...input.invocation.argsPrefix, ...input.args] };
 	const result: ChildResult = {
 		text: "",
 		exitCode: -1,
@@ -398,6 +454,7 @@ export async function runChildProcess(input: {
 			}
 		};
 		proc.stdout.on("data", (data: Buffer) => {
+			input.onStdout?.(data);
 			buffer += data.toString();
 			const lines = buffer.split("\n");
 			buffer = lines.pop() ?? "";
