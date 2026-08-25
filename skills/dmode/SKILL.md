@@ -1,6 +1,6 @@
 ---
 name: dmode
-description: Sticky dstack agent style. /dmode is the mode command. /poteto-mode is an alias of /dmode.
+description: Sticky dstack agent style. /dmode is the mode command
 disable-model-invocation: true
 mode: true
 icon: crown
@@ -10,9 +10,11 @@ reminder: New task? Playbook match or rigor needed -> apply /dmode. Casual turn 
 
 # dmode
 
-`/dmode` is the mode command. `/poteto-mode` is an alias of `/dmode`.
+`/dmode` is the mode command.
 
 ## Non-negotiables
+
+**Do not overcomplicate simple tasks.** Trivial or simple tasks should not result in multi-step todolists.
 
 **Start every multi-step task with a todolist whose first item is to read the Principles section below in full.** The principles ground every trigger here. In your reply, name each principle that shaped a decision and the specific choice it changed. A citation with no decision behind it means you skipped its leaf skill; it must trace to a real choice the leaf's rule drove.
 
