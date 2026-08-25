@@ -34,7 +34,7 @@ For each candidate, read the first JSONL line and check that `message.content[0]
 
 ### 2. Spawn three reviewers in parallel
 
-One message, three `dstack_task` calls, `agent: general-purpose`, explicit `model:` on each, agent mode (`dmode: false`). Reviewers need MCP access for context lookups (tickets, chat threads, observability traces referenced in the transcript); missing MCP companions skip that sources. The prompt forbids file writes; the parent applies edits.
+Spawn three reviewers in one parallel `dstack_task` call, `agent: general-purpose`, explicit `model:` on each, agent mode (`dmode: false`). `dstack_task` returns a `taskId` immediately; the parent may do independent work. Reviewers need MCP access for context lookups (tickets, chat threads, observability traces referenced in the transcript); missing MCP companions skip that sources. The prompt forbids file writes; the parent applies edits.
 
 | Lens | `model` | Prompt template |
 |---|---|---|
@@ -42,11 +42,11 @@ One message, three `dstack_task` calls, `agent: general-purpose`, explicit `mode
 | Tooling | your configured reflect-tooling model (or inherit-parent if unset) | `references/tooling-reviewer.md` |
 | Divergent | your configured reflect-judgment model (or inherit-parent if unset) | `references/divergent-reviewer.md` |
 
-Pass each template verbatim, substituting the transcript path or digest where marked. Reviewers return findings in the `dstack_task` response body.
+Pass each template verbatim, substituting the transcript path or digest where marked.
 
 ### 3. Synthesize
 
-One `dstack_task` call, `agent: general-purpose`, using your configured reflect-judgment model (or inherit-parent if unset), agent mode (`dmode: false`). The synthesizer's quality check includes spot-verifying citations, which can require MCP access; missing MCP companions skip that sources. Use `references/synthesizer.md` verbatim, with each reviewer's full output inlined where marked. The synthesizer returns a structured Accepted / Rejected / Backlog list.
+Wait for the background completion notification from Step 2 without polling, then call `dstack_result` once with `taskId`. Spawn the synthesizer with one `dstack_task` call, `agent: general-purpose`, using your configured reflect-judgment model (or inherit-parent if unset), agent mode (`dmode: false`). `dstack_task` returns a `taskId` immediately; the parent may do independent work. Wait for the background completion notification without polling, then call `dstack_result` once with `taskId`. The synthesizer's quality check includes spot-verifying citations, which can require MCP access; missing MCP companions skip that sources. Use `references/synthesizer.md` verbatim, with each reviewer's full output inlined where marked. The synthesizer returns a structured Accepted / Rejected / Backlog list.
 
 ### 4. Structural enforcement check
 

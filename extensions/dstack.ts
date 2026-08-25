@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdtemp, writeFile, unlink, rmdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -66,6 +67,9 @@ import {
 	todoFilePath,
 } from "./todo.ts";
 import { MODE_ENTRY, type ChildDepth, type ModeState, type TaskSpec, type TodoState } from "./types.ts";
+import { createEventBusV1Port, type BackgroundTaskPort } from "./background/eventbus-v1.ts";
+import { createTaskResultFiles, launchTaskGroup } from "./background/launch.ts";
+import { readDstackResult } from "./background/result.ts";
 import { createWorktree, WorktreeError } from "./worktree.ts";
 
 const TaskItem = Type.Object({
@@ -90,6 +94,10 @@ const TaskParams = Type.Object({
 	dmode: Type.Optional(Type.Boolean()),
 	tasks: Type.Optional(Type.Array(TaskItem)),
 	chain: Type.Optional(Type.Array(TaskItem)),
+});
+
+const ResultParams = Type.Object({
+	taskId: Type.String({ description: "Background task id returned by dstack_task" }),
 });
 
 const TodoParams = Type.Object({
@@ -290,18 +298,6 @@ export function latestActivity(result: TaskResult): string {
 	return oneLine(part.text) || (result.exitCode === -1 ? "running" : "no output");
 }
 
-export function agentDockLines(runs: Iterable<TaskDetails>): string[] {
-	const details = [...runs];
-	const results = details.flatMap((run) => run.results);
-	const running = results.filter((result) => result.exitCode === -1).length;
-	const lines = [`dstack agents  ${running} running`];
-	for (const result of results) {
-		const icon = result.exitCode === -1 ? "⏳" : result.exitCode === 0 ? "✓" : "✗";
-		lines.push(`  ${icon} ${result.agent}  ${latestActivity(result)}`);
-	}
-	return lines;
-}
-
 function branchEntries(ctx: ExtensionContext): SessionEntryLike[] {
 	return ctx.sessionManager.getBranch() as SessionEntryLike[];
 }
@@ -343,15 +339,11 @@ export default function dstack(pi: ExtensionAPI) {
 	let todos: TodoState = { items: [] };
 	let sessionId = "unknown";
 	let pendingContinuation: { sessionId: string; tasks: TodoSnapshot[] } | undefined;
-	const activeTaskRuns = new Map<string, TaskDetails>();
+	let eventBusPort: BackgroundTaskPort | undefined;
 
-	function updateAgentDock(ctx: ExtensionContext) {
-		if (ctx.mode !== "tui") return;
-		ctx.ui.setWidget(
-			"dstack-agents",
-			activeTaskRuns.size > 0 ? agentDockLines(activeTaskRuns.values()) : undefined,
-			{ placement: "belowEditor" },
-		);
+	function getEventBusPort(): BackgroundTaskPort {
+		eventBusPort ??= createEventBusV1Port({ events: pi.events, makeRequestId: randomUUID });
+		return eventBusPort;
 	}
 
 	function persistMode() {
@@ -435,10 +427,10 @@ export default function dstack(pi: ExtensionAPI) {
 		);
 	});
 
-	pi.on("session_shutdown", async (_event, ctx) => {
+	pi.on("session_shutdown", async () => {
 		pendingContinuation = undefined;
-		activeTaskRuns.clear();
-		updateAgentDock(ctx);
+		eventBusPort?.close();
+		eventBusPort = undefined;
 	});
 
 	pi.on("session_before_tree", async () => {
@@ -515,7 +507,7 @@ export default function dstack(pi: ExtensionAPI) {
 		name: "dstack_task",
 		label: "dstack task",
 		description:
-			"Spawn an isolated child Pi process. Modes: single (agent+task), parallel (tasks), chain (chain). Depth-1 children may spawn terminal depth-2 children.",
+			"Launch a background child-agent group. Modes: single (agent+task), parallel (tasks), chain (chain). Root calls return a task id immediately; wait for the completion notification, then call dstack_result once. Depth-1 nested calls stay synchronous and may spawn terminal depth-2 children. Do not poll.",
 		parameters: TaskParams,
 		renderCall(params, theme) {
 			const request = parseTaskRequest(params);
@@ -554,9 +546,9 @@ export default function dstack(pi: ExtensionAPI) {
 			return new Text(rows.join("\n"), 0, 0);
 		},
 		async execute(_id, params, signal, onUpdate, ctx) {
-			let childDepth: ChildDepth;
+			let parentDepth: ReturnType<typeof spawnableDepth>;
 			try {
-				childDepth = childDepthFor(spawnableDepth());
+				parentDepth = spawnableDepth();
 			} catch (err) {
 				if (err instanceof NestingError) {
 					return textResult(err.message, {}, true);
@@ -571,6 +563,35 @@ export default function dstack(pi: ExtensionAPI) {
 			const config = loaded.ok ? loaded.value : emptyConfig();
 			const agents = discoverAgents();
 			const specs = request.kind === "single" ? [request.spec] : request.specs;
+			if (parentDepth === 0) {
+				const port = getEventBusPort();
+				const availabilitySignal = signal === undefined
+					? AbortSignal.timeout(1000)
+					: AbortSignal.any([signal, AbortSignal.timeout(1000)]);
+				try {
+					await port.capabilities(availabilitySignal);
+				} catch (error) {
+					return textResult(`pi-background-tasks EventBus v1 unavailable: ${error instanceof Error ? error.message : String(error)}`, {}, true);
+				}
+				try {
+					const receipt = await launchTaskGroup({
+						request,
+						ctxCwd: ctx.cwd,
+						sessionId,
+						config,
+						agents,
+						extensionPath: extensionPath(),
+						skillPath: skillPath(),
+						runnerPath: join(packageRoot(), "extensions/background/runner.ts"),
+						port,
+						signal,
+					});
+					return textResult(JSON.stringify(receipt), receipt);
+				} catch (error) {
+					return textResult(error instanceof Error ? error.message : String(error), {}, true);
+				}
+			}
+			const childDepth: ChildDepth = childDepthFor(parentDepth);
 			const details: TaskDetails = {
 				mode: request.kind,
 				results: specs.map((spec, index) =>
@@ -579,8 +600,6 @@ export default function dstack(pi: ExtensionAPI) {
 			};
 			const publish = () => {
 				const snapshot = cloneDetails(details);
-				activeTaskRuns.set(_id, snapshot);
-				updateAgentDock(ctx);
 				onUpdate?.(textResult(progressText(snapshot), snapshot));
 			};
 			publish();
@@ -673,10 +692,25 @@ export default function dstack(pi: ExtensionAPI) {
 					return textResult(err.message, {}, true);
 				}
 				return textResult(err instanceof Error ? err.message : String(err), {}, true);
-			} finally {
-				activeTaskRuns.delete(_id);
-				updateAgentDock(ctx);
 			}
+		},
+	});
+
+	pi.registerTool({
+		name: "dstack_result",
+		label: "dstack result",
+		description: "Read the current result projection for a background dstack task.",
+		parameters: ResultParams,
+		async execute(_id, params, signal) {
+			const files = createTaskResultFiles(sessionId);
+			const result = await readDstackResult({
+				taskId: params.taskId,
+				statusExact: (taskId) => getEventBusPort().statusExact(taskId, signal),
+				readBinding: files.readBinding,
+				readProgress: files.readProgress,
+				readCommittedResult: files.readCommittedResult,
+			});
+			return textResult(JSON.stringify(result), result);
 		},
 	});
 

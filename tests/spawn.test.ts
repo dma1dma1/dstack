@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import {
 	applyJsonEvent,
@@ -13,6 +16,7 @@ import {
 	parseTaskRequest,
 	PER_TASK_OUTPUT_CAP,
 	resolveAgent,
+	runChildProcess,
 	spawnableDepth,
 	type ChildResult,
 } from "../extensions/spawn.ts";
@@ -77,6 +81,33 @@ test("root and depth-1 processes produce validated child depths", () => {
 		KEEP: "yes",
 		[NESTING_ENV]: "2",
 	});
+});
+
+test("a failed on-spawn boundary kills the child before accepting JSON", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "dstack-spawn-boundary-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const script = [
+		`process.stdout.write(JSON.stringify({type:"message_end",message:{role:"assistant",content:[{type:"text",text:"must-not-be-read"}]}}) + "\\n");`,
+		`setInterval(() => {}, 1000);`,
+	].join("\n");
+	let updates = 0;
+	let stdoutChunks = 0;
+	await assert.rejects(
+		runChildProcess({
+			args: [],
+			cwd: root,
+			env: childEnv(1),
+			invocation: { command: process.execPath, argsPrefix: ["--input-type=module", "-e", script] },
+			onSpawn: () => {
+				throw new Error("lease binding failed");
+			},
+			onUpdate: () => { updates += 1; },
+			onStdout: () => { stdoutChunks += 1; },
+		}),
+		/lease binding failed/,
+	);
+	assert.equal(updates, 0);
+	assert.equal(stdoutChunks, 0);
 });
 
 test("child telemetry reports the concrete provider model", () => {

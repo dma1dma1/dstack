@@ -27,7 +27,7 @@ Open a todolist with one entry per phase before launching anything.
 
 ## Phase B: Fan out
 
-Spawn all N workers in one message with `dstack_task`, `agent: "general-purpose"`, `dmode: false`, and the swarm-workers role model. Cap concurrency at 4. 
+Spawn all N workers in one parallel `dstack_task` call with `agent: "general-purpose"`, `dmode: false`, and the swarm-workers role model. Cap concurrency at 4. `dstack_task` returns a `taskId` immediately; the parent may do independent work.
 When a worker must start from a non-default pushed branch, pass that branch as `cwd` after creating a worktree.
 
 Every brief stands alone. Include the goal, scope, exact slice or race arm, how to verify, and what to report. Reports use `PASS`, `ISSUES`, or `BLOCKED` with evidence.
@@ -36,7 +36,7 @@ If a worker drops out, proceed with N-1 and note it.
 
 ## Phase C: Aggregate
 
-Read the terminal results. For coverage, every required slice needs a result. For a race, apply the selection rule declared up front. Use first pass, rank all, or best-of. Do not paste raw worker dumps.
+Wait for the background completion notification without polling, then call `dstack_result` once with `taskId` to read the terminal results. For coverage, every required slice needs a result. For a race, apply the selection rule declared up front. Use first pass, rank all, or best-of. Do not paste raw worker dumps.
 
 Keep a compact result table, one-line evidenced issues, and explicit gaps or dropouts.
 
