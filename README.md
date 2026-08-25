@@ -55,13 +55,14 @@ The first `/setup-dstack` also writes `~/.pi/agent/extensions/pi-permission-syst
 
 | Tool | Role |
 | --- | --- |
-| `dstack_task` | Isolated child `pi --mode json --print --no-session --no-extensions -e <absolute dstack extension>`. Max 8 tasks, 4 at a time. |
+| `dstack_task` | Launches one background single, parallel, or chain group through `pi-background-tasks`. Max 8 tasks, 4 at a time. |
+| `dstack_result` | Returns the current or completed result for a background dstack task without waiting. |
 | `dstack_todo` | Durable todos under `~/.pi/agent/dstack/todos/`. |
 | `dstack_ask` | Typed questions. |
 | `dstack_sessions` | `SessionManager.list(cwd)`. |
 | `dstack_config` | Get / set / list `models.json`. |
 
-While `dstack_task` runs, a small agent dock below the editor shows one status line per child. The transcript keeps the tool card compact. Press Ctrl+O to show the full child activity and output.
+`dstack_task` returns a task ID immediately. Continue with independent work or wait for the normal completion notification, then call `dstack_result` once. Do not poll. The companion task manager owns status, logs, cancellation, and notifications.
 
 Nesting has three depths. An unset `DSTACK_NESTING` or `0` is root depth 0. Root children run at depth 1 and may spawn depth-2 children. Depth 2 is terminal. dstack rejects malformed values instead of guessing. Parallel writers should each set `worktree: true`.
 
