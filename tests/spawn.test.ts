@@ -2,23 +2,40 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
 	applyJsonEvent,
-	assertNotNested,
 	buildChildArgv,
 	capOutput,
+	childDepthFor,
 	childEnv,
 	formatUsageStats,
 	mapWithConcurrency,
 	NestingError,
+	parseNestingDepth,
 	parseTaskRequest,
 	PER_TASK_OUTPUT_CAP,
 	resolveAgent,
+	spawnableDepth,
 	type ChildResult,
 } from "../extensions/spawn.ts";
 import { MAX_CONCURRENCY, MAX_PARALLEL_TASKS, NESTING_ENV } from "../extensions/types.ts";
 
-test("spawn argv includes json print no-session no-extensions", () => {
-	const args = buildChildArgv({ task: "look around", model: "acme/fast", tools: "read,grep,find,ls" });
-	assert.deepEqual(args.slice(0, 5), ["--mode", "json", "-p", "--no-session", "--no-extensions"]);
+const extensionPath = "/opt/dstack/extensions/dstack.ts";
+
+function childArgv(input: Omit<Parameters<typeof buildChildArgv>[0], "extensionPath">) {
+	return buildChildArgv({ ...input, extensionPath });
+}
+
+test("spawn argv isolates extensions and loads dstack explicitly", () => {
+	const args = childArgv({ task: "look around", model: "acme/fast", tools: "read,grep,find,ls" });
+	assert.deepEqual(args.slice(0, 7), [
+		"--mode",
+		"json",
+		"-p",
+		"--no-session",
+		"--no-extensions",
+		"-e",
+		extensionPath,
+	]);
+	assert.equal(args.filter((arg) => arg === "-e").length, 1);
 	assert.ok(args.includes("--model"));
 	assert.equal(args[args.indexOf("--model") + 1], "acme/fast");
 	assert.ok(args.includes("--tools"));
@@ -27,22 +44,39 @@ test("spawn argv includes json print no-session no-extensions", () => {
 });
 
 test("inherit-parent omits --model", () => {
-	const args = buildChildArgv({ task: "x", omitModel: true, model: "acme/fast" });
+	const args = childArgv({ task: "x", omitModel: true, model: "acme/fast" });
 	assert.equal(args.includes("--model"), false);
 });
 
 test("append-system-prompt is a file path", () => {
-	const args = buildChildArgv({
+	const args = childArgv({
 		task: "x",
 		systemPromptPath: "/tmp/dstack/prompt.md",
 	});
 	assert.equal(args[args.indexOf("--append-system-prompt") + 1], "/tmp/dstack/prompt.md");
 });
 
-test("nesting refused when DSTACK_NESTING is set", () => {
-	assert.throws(() => assertNotNested({ [NESTING_ENV]: "1" }), NestingError);
-	assert.doesNotThrow(() => assertNotNested({}));
-	assert.equal(childEnv({})[NESTING_ENV], "1");
+test("nesting depth parses strictly and fails closed", () => {
+	assert.equal(parseNestingDepth(undefined), 0);
+	assert.equal(parseNestingDepth("0"), 0);
+	assert.equal(parseNestingDepth("1"), 1);
+	assert.equal(parseNestingDepth("2"), 2);
+	for (const malformed of ["", "01", " 1", "-1", "3", "true"]) {
+		assert.throws(() => parseNestingDepth(malformed), NestingError);
+	}
+});
+
+test("root and depth-1 processes produce validated child depths", () => {
+	assert.equal(spawnableDepth({}), 0);
+	assert.equal(spawnableDepth({ [NESTING_ENV]: "0" }), 0);
+	assert.equal(spawnableDepth({ [NESTING_ENV]: "1" }), 1);
+	assert.throws(() => spawnableDepth({ [NESTING_ENV]: "2" }), NestingError);
+	assert.equal(childDepthFor(0), 1);
+	assert.equal(childDepthFor(1), 2);
+	assert.deepEqual(childEnv(2, { KEEP: "yes", [NESTING_ENV]: "1" }), {
+		KEEP: "yes",
+		[NESTING_ENV]: "2",
+	});
 });
 
 test("child telemetry reports the concrete provider model", () => {

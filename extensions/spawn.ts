@@ -6,19 +6,37 @@ import {
 	MAX_PARALLEL_TASKS,
 	NESTING_ENV,
 	PER_TASK_OUTPUT_CAP,
+	type ChildDepth,
+	type NestingDepth,
+	type SpawnableDepth,
 	type TaskRequest,
 	type TaskSpec,
 } from "./types.ts";
 
 export class NestingError extends Error {
-	constructor() {
-		super("dstack_task refused: children cannot spawn children (DSTACK_NESTING is set).");
+	constructor(message: string) {
+		super(message);
 		this.name = "NestingError";
 	}
 }
 
-export function assertNotNested(env: NodeJS.Dict<string> = process.env): void {
-	if (env[NESTING_ENV]) throw new NestingError();
+export function parseNestingDepth(value: string | undefined): NestingDepth {
+	if (value === undefined || value === "0") return 0;
+	if (value === "1") return 1;
+	if (value === "2") return 2;
+	throw new NestingError(`dstack_task refused: invalid ${NESTING_ENV} value ${JSON.stringify(value)}.`);
+}
+
+export function spawnableDepth(env: NodeJS.Dict<string> = process.env): SpawnableDepth {
+	const depth = parseNestingDepth(env[NESTING_ENV]);
+	if (depth === 2) {
+		throw new NestingError("dstack_task refused: depth 2 is terminal and cannot spawn children.");
+	}
+	return depth;
+}
+
+export function childDepthFor(parentDepth: SpawnableDepth): ChildDepth {
+	return parentDepth === 0 ? 1 : 2;
 }
 
 export type SpawnArgv = {
@@ -28,12 +46,13 @@ export type SpawnArgv = {
 
 export function buildChildArgv(input: {
 	task: string;
+	extensionPath: string;
 	model?: string;
 	omitModel?: boolean;
 	tools?: string;
 	systemPromptPath?: string;
 }): string[] {
-	const args = ["--mode", "json", "-p", "--no-session", "--no-extensions"];
+	const args = ["--mode", "json", "-p", "--no-session", "--no-extensions", "-e", input.extensionPath];
 	if (input.model && !input.omitModel) args.push("--model", input.model);
 	if (input.tools) args.push("--tools", input.tools);
 	if (input.systemPromptPath) args.push("--append-system-prompt", input.systemPromptPath);
@@ -41,12 +60,12 @@ export function buildChildArgv(input: {
 	return args;
 }
 
-export function childEnv(parent: NodeJS.Dict<string> = process.env): Record<string, string> {
+export function childEnv(depth: ChildDepth, parent: NodeJS.Dict<string> = process.env): Record<string, string> {
 	const env: Record<string, string> = {};
 	for (const [key, value] of Object.entries(parent)) {
 		if (value !== undefined) env[key] = value;
 	}
-	env[NESTING_ENV] = "1";
+	env[NESTING_ENV] = String(depth);
 	return env;
 }
 

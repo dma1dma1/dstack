@@ -21,6 +21,10 @@ if (process.argv.includes("--mode") && process.argv.includes("json")) {
 					cwd: process.cwd(),
 					nesting: process.env.DSTACK_NESTING ?? null,
 					noExtensions: process.argv.includes("--no-extensions"),
+					explicitExtension: (() => {
+						const i = process.argv.indexOf("-e");
+						return i === -1 ? null : (process.argv[i + 1] ?? null);
+					})(),
 					tools: (() => {
 						const i = process.argv.indexOf("--tools");
 						return i === -1 ? null : (process.argv[i + 1] ?? null);
@@ -391,16 +395,50 @@ async function main() {
 	const sessions = await pi.tools.get("dstack_sessions").execute("9", {}, undefined, undefined, ctx);
 	assert("sessions-lists", !sessions.isError, sessions.content[0].text.slice(0, 160));
 
+	const childRecordCount = () => readdirSync(process.env.DSTACK_VALIDATE_DIR).filter((file) => file.endsWith(".json")).length;
+	const beforeNested = childRecordCount();
 	process.env.DSTACK_NESTING = "1";
 	const nested = await pi.tools.get("dstack_task").execute(
 		"10",
-		{ agent: "general-purpose", task: "should refuse" },
+		{ agent: "poteto-agent", task: "spawn terminal worker" },
+		undefined,
+		undefined,
+		ctx,
+	);
+	assert("nesting-depth-1-spawns", !nested.isError && childRecordCount() === beforeNested + 1, nested.content[0].text);
+	const nestedKids = readdirSync(process.env.DSTACK_VALIDATE_DIR).filter((file) => file.endsWith(".json"));
+	const nestedKid = JSON.parse(readFileSync(join(process.env.DSTACK_VALIDATE_DIR, nestedKids.at(-1)), "utf8"));
+	assert("nesting-depth-2-env", nestedKid.nesting === "2", String(nestedKid.nesting));
+
+	const beforeTerminal = childRecordCount();
+	process.env.DSTACK_NESTING = "2";
+	const terminal = await pi.tools.get("dstack_task").execute(
+		"10b",
+		{ agent: "poteto-agent", task: "must refuse" },
+		undefined,
+		undefined,
+		ctx,
+	);
+	assert(
+		"nesting-depth-2-refused",
+		terminal.isError === true && terminal.content[0].text.includes("depth 2 is terminal") && childRecordCount() === beforeTerminal,
+		terminal.content[0].text,
+	);
+
+	process.env.DSTACK_NESTING = "invalid";
+	const malformedDepth = await pi.tools.get("dstack_task").execute(
+		"10c",
+		{ agent: "poteto-agent", task: "must refuse" },
 		undefined,
 		undefined,
 		ctx,
 	);
 	delete process.env.DSTACK_NESTING;
-	assert("nesting-refused", nested.isError === true && nested.content[0].text.includes("DSTACK_NESTING"), nested.content[0].text);
+	assert(
+		"nesting-malformed-refused",
+		malformedDepth.isError === true && malformedDepth.content[0].text.includes("invalid DSTACK_NESTING"),
+		malformedDepth.content[0].text,
+	);
 
 	const single = await pi.tools.get("dstack_task").execute(
 		"11",
@@ -423,9 +461,9 @@ async function main() {
 	const kids = readdirSync(process.env.DSTACK_VALIDATE_DIR).filter((f) => f.endsWith(".json"));
 	const lastKid = JSON.parse(readFileSync(join(process.env.DSTACK_VALIDATE_DIR, kids.at(-1)), "utf8"));
 	assert("child-no-extensions", lastKid.noExtensions === true);
+	assert("child-explicit-dstack", lastKid.explicitExtension === join(root, "extensions/dstack.ts"), String(lastKid.explicitExtension));
 	assert("child-nesting-env", lastKid.nesting === "1");
 	assert("child-tools-allowlist", lastKid.tools === "read,grep,find,ls", String(lastKid.tools));
-	assert("child-no-dstack-task", !String(lastKid.argv).includes("dstack_task"));
 
 	const parallel = await pi.tools.get("dstack_task").execute(
 		"12",
@@ -521,8 +559,12 @@ async function main() {
 	assert("dmode-false-forces-general", forced.agent === "general-purpose" && forced.dmode === false, JSON.stringify(forced));
 	const sickoRes = resolveAgent({ agent: "comment-sicko", task: "x" });
 	assert("comment-sicko-cannot-write", sickoRes.tools === "read,grep,find,ls", sickoRes.tools);
-	const argv = buildChildArgv({ task: "t", tools: "read,grep,find,ls" });
-	assert("child-argv-no-extensions", argv.includes("--no-extensions") && argv.includes("--tools"));
+	const childExtension = join(root, "extensions/dstack.ts");
+	const argv = buildChildArgv({ task: "t", extensionPath: childExtension, tools: "read,grep,find,ls" });
+	assert(
+		"child-argv-isolated-dstack",
+		argv.includes("--no-extensions") && argv[argv.indexOf("-e") + 1] === childExtension && argv.includes("--tools"),
+	);
 
 	try {
 		const rpc = await rpcBatch([
