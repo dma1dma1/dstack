@@ -507,7 +507,7 @@ export default function dstack(pi: ExtensionAPI) {
 		name: "dstack_task",
 		label: "dstack task",
 		description:
-			"Spawn an isolated child Pi process. Modes: single (agent+task), parallel (tasks), chain (chain). Depth-1 children may spawn terminal depth-2 children.",
+			"Launch a background child-agent group. Modes: single (agent+task), parallel (tasks), chain (chain). Root calls return a task id immediately; wait for the completion notification, then call dstack_result once. Depth-1 nested calls stay synchronous and may spawn terminal depth-2 children. Do not poll.",
 		parameters: TaskParams,
 		renderCall(params, theme) {
 			const request = parseTaskRequest(params);

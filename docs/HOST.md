@@ -6,7 +6,8 @@ Skills in this package talk to Pi through dstack tools. This file is the rewrite
 
 | Skill name | Host |
 | --- | --- |
-| `dstack_task` | Child Pi process. Never `Task` or `subagent`. |
+| `dstack_task` | Background single, parallel, or chain group at root depth. Returns a task id immediately. Depth-1 nested calls remain synchronous. |
+| `dstack_result` | Nonblocking result lookup after the normal completion notification. |
 | `dstack_todo` | First-party todos, or `@juicesharp/rpiv-todo` if that package is already loaded. |
 | `dstack_ask` | Typed options via `ctx.ui.select` / `ctx.ui.confirm`. |
 | `dstack_sessions` | `SessionManager.list(cwd)`. Do not glob session dirs. |
@@ -35,7 +36,7 @@ The user-facing mode command is `/dmode`. `/poteto-mode` is an alias of `/dmode`
 | frontmatter `name: Poteto Mode` | `name: dmode` |
 | `environment: "cloud"` | delete the line |
 | `move_agent_to_root` | worktree `cwd` |
-| `run_in_background: true` | omit in v1 |
+| `run_in_background: true` | omit the field. Root `dstack_task` calls always run in the background. |
 
 ## Worktrees
 
