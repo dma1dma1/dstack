@@ -55,11 +55,13 @@ The first `/setup-dstack` also writes `~/.pi/agent/extensions/pi-permission-syst
 
 | Tool | Role |
 | --- | --- |
-| `dstack_task` | Isolated child `pi --mode json --print --no-session --no-extensions`. Max 8 tasks, 4 at a time. |
+| `dstack_task` | Isolated child `pi --mode json --print --no-session --no-extensions -e <absolute dstack extension>`. Max 8 tasks, 4 at a time. |
 | `dstack_todo` | Durable todos under `~/.pi/agent/dstack/todos/`. |
 | `dstack_ask` | Typed questions. |
 | `dstack_sessions` | `SessionManager.list(cwd)`. |
 | `dstack_config` | Get / set / list `models.json`. |
+
+Nesting has three depths. An unset `DSTACK_NESTING` or `0` is root depth 0. Root children run at depth 1 and may spawn depth-2 children. Depth 2 is terminal. dstack rejects malformed values instead of guessing. Parallel writers should each set `worktree: true`.
 
 `worktree: true` on `dstack_task` creates `~/.dma/worktrees/<repo>/<slug>` on branch `dma/<slug>` and runs the child there. The default base is `HEAD`, so the child sees the parent's current commit, not `origin/main`, unless `worktree.from` in `models.json` is `origin/main`. If `git worktree add` fails, the child does not run in the parent tree. Uncommitted parent diffs stay invisible either way.
 
@@ -67,7 +69,7 @@ Leftover trees stay on disk. From the parent repo: `git worktree remove <path>`,
 
 ## Security
 
-Extensions run with full access to your machine. Review this package before you install it. Child agents launch with `--no-extensions` and `DSTACK_NESTING=1` so they cannot spawn further children.
+Extensions run with full access to your machine. Review this package before you install it. Child agents launch with `--no-extensions` plus one explicit absolute `-e` path for dstack. dstack sets `DSTACK_NESTING=1` for root children and `2` for their terminal children.
 
 ## License
 

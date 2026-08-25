@@ -42,14 +42,15 @@ import {
 	suggestConfig,
 } from "./setup.ts";
 import {
-	assertNotNested,
 	buildChildArgv,
 	capOutput,
+	childDepthFor,
 	childEnv,
 	formatUsageStats,
 	mapWithConcurrency,
 	parseTaskRequest,
 	resolveAgent,
+	spawnableDepth,
 	runChildProcess,
 	type ChildResult,
 	MAX_CONCURRENCY,
@@ -62,7 +63,7 @@ import {
 	saveTodos,
 	todoFilePath,
 } from "./todo.ts";
-import { MODE_ENTRY, type ModeState, type TaskSpec, type TodoState } from "./types.ts";
+import { MODE_ENTRY, type ChildDepth, type ModeState, type TaskSpec, type TodoState } from "./types.ts";
 import { createWorktree, WorktreeError } from "./worktree.ts";
 
 const TaskItem = Type.Object({
@@ -118,6 +119,10 @@ const ConfigParams = Type.Object({
 
 function skillPath(): string {
 	return join(packageRoot(), "skills/dmode/SKILL.md");
+}
+
+function extensionPath(): string {
+	return join(packageRoot(), "extensions/dstack.ts");
 }
 
 function textResult(text: string, details: unknown = {}, isError = false) {
@@ -356,7 +361,7 @@ export default function dstack(pi: ExtensionAPI) {
 		name: "dstack_task",
 		label: "dstack task",
 		description:
-			"Spawn an isolated child Pi process. Modes: single (agent+task), parallel (tasks), chain (chain). Children cannot spawn children.",
+			"Spawn an isolated child Pi process. Modes: single (agent+task), parallel (tasks), chain (chain). Depth-1 children may spawn terminal depth-2 children.",
 		parameters: TaskParams,
 		renderResult(result, _options, theme) {
 			const text = result.content.find((part) => part.type === "text")?.text ?? "(no output)";
@@ -368,8 +373,9 @@ export default function dstack(pi: ExtensionAPI) {
 			return new Text(`${text}\n${usage}`, 0, 0);
 		},
 		async execute(_id, params, signal, _onUpdate, ctx) {
+			let childDepth: ChildDepth;
 			try {
-				assertNotNested();
+				childDepth = childDepthFor(spawnableDepth());
 			} catch (err) {
 				if (err instanceof NestingError) {
 					return textResult(err.message, {}, true);
@@ -405,13 +411,14 @@ export default function dstack(pi: ExtensionAPI) {
 					});
 				}
 				const promptParts = [agent.systemPrompt.trim()];
-				if (resolved.dmode) promptParts.push(dmodeReminder(skillPath()));
+				if (resolved.dmode) promptParts.push(dmodeReminder(skillPath(), childDepth));
 				let tmp: { dir: string; filePath: string } | undefined;
 				const system = promptParts.filter(Boolean).join("\n\n");
 				if (system) tmp = await writeTempPrompt(system);
 				try {
 					const args = buildChildArgv({
 						task: spec.task,
+						extensionPath: extensionPath(),
 						model: model.model,
 						omitModel: model.omitModel,
 						tools: resolved.tools ?? agent.tools?.join(","),
@@ -420,7 +427,7 @@ export default function dstack(pi: ExtensionAPI) {
 					const child = await runChildProcess({
 						args,
 						cwd,
-						env: childEnv(),
+						env: childEnv(childDepth),
 						signal,
 					});
 					return {

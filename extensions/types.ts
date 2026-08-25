@@ -48,6 +48,10 @@ export type DstackConfig = {
 
 export type BuiltInAgent = "poteto-agent" | "general-purpose" | "comment-sicko";
 
+export type NestingDepth = 0 | 1 | 2;
+export type SpawnableDepth = 0 | 1;
+export type ChildDepth = 1 | 2;
+
 export type TaskSpec = {
 	agent: string;
 	task: string;

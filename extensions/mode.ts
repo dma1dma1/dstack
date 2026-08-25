@@ -1,4 +1,4 @@
-import { MODE_ENTRY, type ModeState } from "./types.ts";
+import { MODE_ENTRY, type ModeState, type NestingDepth } from "./types.ts";
 
 export type SessionEntryLike = {
 	type: string;
@@ -34,8 +34,18 @@ export function modeStatusText(state: ModeState): string | undefined {
 	return state.on ? "dmode" : undefined;
 }
 
-export function dmodeReminder(skillPath: string): string {
-	return `dmode is on. Read ${skillPath}. Casual turns stay short. Do not dump the playbook into the system prompt.`;
+export function dmodeNestingGuidance(depth: NestingDepth): string {
+	if (depth === 0) {
+		return "You are at root depth 0. Parallelize independent tasks early. Give each concurrent writer a distinct checkout. Depth-1 children may spawn terminal depth-2 workers.";
+	}
+	if (depth === 1) {
+		return "You are at depth 1. Use your final fan-out level for independent tasks. Give each concurrent writer a distinct checkout. Depth-2 workers are terminal.";
+	}
+	return "You are a terminal depth-2 worker. Do not call dstack_task. Complete the assigned scope directly.";
+}
+
+export function dmodeReminder(skillPath: string, depth: NestingDepth = 0): string {
+	return `dmode is on. Read ${skillPath}. Casual turns stay short. Do not dump the playbook into the system prompt. ${dmodeNestingGuidance(depth)}`;
 }
 
 export function sameModeCommands(): readonly string[] {
