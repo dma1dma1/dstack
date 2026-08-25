@@ -14,11 +14,21 @@ reminder: New task? Playbook match or rigor needed -> apply /dmode. Casual turn 
 
 ## Non-negotiables
 
-**Start every multi-step task with a todolist whose first item is to read the Principles section below in full.** The principles ground every trigger here. In your reply, name each principle that shaped a decision and the specific choice it changed. A citation with no decision behind it means you skipped its leaf skill; it must trace to a real choice the leaf's rule drove.
+**Run the proportionality gate before matching a playbook.** Estimate risk, reversibility, scope, and uncertainty. Use the fast path only when the task is low-risk, reversible, documented, confined to configuration, installation, or one file, and has no real architecture, ownership, or runtime-flow uncertainty. The fast path is inspect, apply the smallest change, smoke-test the real artifact, and report. Do not invoke a playbook, delegate, or start an architecture workflow. Stop when the documented behavior works and no known conflict remains.
+
+**The narrowest workflow wins.** A package installation or configuration change does not become a Feature task because it changes behavior. Use the fast path unless the proportionality gate rejects it.
+
+**Keep ceremony cheaper than the work.** Planning, delegation, and workflow setup should not take longer than the likely implementation. Remove ceremony when it would, unless risk or irreversibility justifies the cost.
+
+**Start tasks with at least three meaningful work phases with a todolist whose first item is to read the Principles section below in full.** Setup, reading instructions, and one final verification do not create extra phases. The principles ground every trigger here.
+
+**Use principles prospectively.** Read a leaf skill when its rule changes a choice. Do not select or cite principles afterward to justify work already done. In your reply, name each principle that shaped a decision and the specific choice it changed.
+
+**Match verification to risk.** Use the smallest direct check that exercises the real artifact. A fresh-process smoke test is enough for a low-risk configuration change. Expand verification when failure is costly or the change crosses system boundaries.
 
 Remaining triggers:
 
-- Nontrivial change, architecture decision, or "are we sure?" → the **how** skill.
+- Architecture decisions, ownership or layering questions, and consequential runtime-flow uncertainty → the **how** skill. A generic "are we sure?" does not trigger it when the answer comes from a low-risk, reversible check.
 - About to `dstack_ask` on a "which approach", "how should I", or "what should this do" fork → classify it before you ask. If the answer is a fact you could observe by running something (behavior, timing, layout, output, perf, even whether an eval separates), it is not the human's to answer. Sketch it via the Prototype playbook (`playbooks/prototype.md`) and let the result decide. If the task is a read-only Investigation whose deliverable is a cited answer, stay in it and answer from the evidence rather than building a sketch. Reserve the question for a genuine product or preference call no experiment can settle. The ask is the slow path. A throwaway probe usually answers faster, and it hands the human a result to react to instead of a decision to make.
 - Any code → name the data shape first, and choose its organizing structure per **principle-model-the-domain**.
 - Code crossing a function boundary → the **architect** skill, parallel design exploration before implementing.
@@ -113,7 +123,7 @@ Comments follow the same rule as the reply. Write them clean as you go; a flat "
 
 ## Playbooks
 
-Your first todolist actions are the matched playbook's steps, copied in verbatim, before any task-specific todos and before you reason about the task. The failure mode is reading a playbook then writing a bespoke plan that drops its named steps (`architect`, the throughput checkpoint). A step you choose not to do stays in the list with a one-line `skip: <reason>`; skipping silently is not allowed. Match the task to a playbook below, open its file, and copy its steps in verbatim.
+If the proportionality gate selects the fast path, do not open a playbook. Otherwise, read the Principles section first. Then copy the matched playbook's steps into the todolist verbatim before any task-specific todos and before reasoning about the task. The failure mode is reading a playbook then writing a bespoke plan that drops its named steps (`architect`, the throughput checkpoint). A step you choose not to do stays in the list with a one-line `skip: <reason>`; skipping silently is not allowed.
 
 A large or cross-cutting effort (a migration across many call sites, an ambitious multi-part change), or work the user steps away from to trust later, routes to the **figure-it-out** skill even when a narrower playbook like Feature fits. Use **figure-it-out** whenever no bundled playbook fits. It designs a bespoke, rigorous playbook for the task. A standing project-scale program (multi-day, many stacked PRs, a fleet of subagents under one coordinator) routes to **Orchestrate** instead; figure-it-out designs one bespoke run, orchestrate runs the program.
 
