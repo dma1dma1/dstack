@@ -9,6 +9,13 @@ import { discoverAgents, packageRoot } from "./agents.ts";
 import { richerAskPresent, parseAskParams } from "./ask.ts";
 import { compactDetails, compactInstructions } from "./compact.ts";
 import {
+	continuationPrompt,
+	latestActiveTodoTasks,
+	shouldArmContinuation,
+	type TodoBranchEntry,
+	type TodoSnapshot,
+} from "./continuation.ts";
+import {
 	defaultConfigPath,
 	emptyConfig,
 	formatConfigError,
@@ -152,6 +159,17 @@ function branchEntries(ctx: ExtensionContext): SessionEntryLike[] {
 	return ctx.sessionManager.getBranch() as SessionEntryLike[];
 }
 
+function continuationControlState(ctx: ExtensionContext): { isIdle: boolean; hasPendingMessages: boolean } {
+	const control = ctx as unknown as {
+		isIdle?: () => boolean;
+		hasPendingMessages?: () => boolean;
+	};
+	return {
+		isIdle: control.isIdle?.() ?? false,
+		hasPendingMessages: control.hasPendingMessages?.() ?? true,
+	};
+}
+
 async function writeTempPrompt(text: string): Promise<{ dir: string; filePath: string }> {
 	const dir = await mkdtemp(join(tmpdir(), "dstack-"));
 	const filePath = join(dir, "prompt.md");
@@ -177,6 +195,7 @@ export default function dstack(pi: ExtensionAPI) {
 	let playbook: string | undefined;
 	let todos: TodoState = { items: [] };
 	let sessionId = "unknown";
+	let pendingContinuation: { sessionId: string; tasks: TodoSnapshot[] } | undefined;
 
 	function persistMode() {
 		pi.appendEntry(MODE_ENTRY, mode);
@@ -198,6 +217,7 @@ export default function dstack(pi: ExtensionAPI) {
 	let fallbacks = false;
 
 	pi.on("session_start", async (_event, ctx) => {
+		pendingContinuation = undefined;
 		mode = restoreMode(branchEntries(ctx));
 		sessionId = ctx.sessionManager.getSessionId();
 		await refreshTodos();
@@ -224,10 +244,42 @@ export default function dstack(pi: ExtensionAPI) {
 		};
 	});
 
-	pi.on("session_before_compact", async () => {
+	pi.on("session_before_compact", async (_event, ctx) => {
+		const richTasks = latestActiveTodoTasks(ctx.sessionManager.getBranch() as TodoBranchEntry[]);
+		const fallbackTasks: TodoSnapshot[] = todos.items.flatMap((task) => {
+			if (task.status !== "pending" && task.status !== "in_progress") return [];
+			return [{ id: task.id, subject: task.content, status: task.status }];
+		});
+		const tasks = richTasks.length > 0 ? richTasks : fallbackTasks;
+		pendingContinuation = shouldArmContinuation(tasks, continuationControlState(ctx))
+			? { sessionId: ctx.sessionManager.getSessionId(), tasks }
+			: undefined;
+
 		const details = compactDetails({ playbook, todos });
 		pi.appendEntry("dstack-compact-context", details);
 		return undefined;
+	});
+
+	pi.on("session_compact", async (event, ctx) => {
+		const continuation = pendingContinuation;
+		pendingContinuation = undefined;
+		if (!continuation || event.willRetry) return;
+		if (ctx.sessionManager.getSessionId() !== continuation.sessionId) return;
+		const control = continuationControlState(ctx);
+		if (!control.isIdle || control.hasPendingMessages) return;
+		pi.sendMessage(
+			{
+				customType: "dstack-post-compact-continuation",
+				content: continuationPrompt(continuation.tasks),
+				display: false,
+				details: { tasks: continuation.tasks },
+			},
+			{ deliverAs: "followUp", triggerTurn: true },
+		);
+	});
+
+	pi.on("session_shutdown", async () => {
+		pendingContinuation = undefined;
 	});
 
 	pi.on("session_before_tree", async () => {

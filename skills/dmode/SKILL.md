@@ -10,7 +10,7 @@ reminder: New task? Playbook match or rigor needed -> apply /dmode. Casual turn 
 
 # dmode
 
-`/dmode` is the mode command.
+`/dmode` is the mode command; `/poteto-mode` is an alias of `/dmode`.
 
 ## Non-negotiables
 
