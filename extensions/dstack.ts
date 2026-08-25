@@ -52,6 +52,8 @@ import {
 	resolveAgent,
 	spawnableDepth,
 	runChildProcess,
+	type ChildContentPart,
+	type ChildMessage,
 	type ChildResult,
 	MAX_CONCURRENCY,
 	NestingError,
@@ -158,6 +160,120 @@ function taskUsageRows(details: unknown): TaskUsageRow[] {
 		});
 	}
 	return rows;
+}
+
+type TaskResult = ChildResult & {
+	agent: string;
+	cwd: string;
+	task: string;
+	step?: number;
+};
+
+type TaskDetails = {
+	mode: "single" | "parallel" | "chain";
+	results: TaskResult[];
+};
+
+function isChildContentPart(value: unknown): value is ChildContentPart {
+	if (!isRecord(value) || typeof value.type !== "string") return false;
+	if (value.type === "text") return typeof value.text === "string";
+	if (value.type === "toolCall") return typeof value.name === "string" && isRecord(value.arguments);
+	if (value.type === "toolUpdate") {
+		return (
+			typeof value.id === "string" &&
+			typeof value.name === "string" &&
+			typeof value.text === "string" &&
+			Array.isArray(value.agents)
+		);
+	}
+	return false;
+}
+
+function isChildMessage(value: unknown): value is ChildMessage {
+	return isRecord(value) && typeof value.role === "string" && Array.isArray(value.content) && value.content.every(isChildContentPart);
+}
+
+function parseTaskDetails(value: unknown): TaskDetails | undefined {
+	if (!isRecord(value) || !["single", "parallel", "chain"].includes(String(value.mode)) || !Array.isArray(value.results)) {
+		return undefined;
+	}
+	const results: TaskResult[] = [];
+	for (const result of value.results) {
+		if (
+			!isRecord(result) ||
+			typeof result.agent !== "string" ||
+			typeof result.cwd !== "string" ||
+			typeof result.task !== "string" ||
+			typeof result.text !== "string" ||
+			typeof result.exitCode !== "number" ||
+			typeof result.stderr !== "string" ||
+			!Array.isArray(result.messages) ||
+			!result.messages.every(isChildMessage) ||
+			!isChildUsage(result.usage)
+		) return undefined;
+		results.push(result as TaskResult);
+	}
+	return { mode: value.mode as TaskDetails["mode"], results };
+}
+
+function cloneDetails(details: TaskDetails): TaskDetails {
+	return {
+		mode: details.mode,
+		results: details.results.map((result) => ({
+			...result,
+			messages: result.messages.map((message) => ({ ...message, content: [...message.content] })),
+			usage: { ...result.usage },
+		})),
+	};
+}
+
+function emptyTaskResult(spec: TaskSpec, cwd: string, step?: number): TaskResult {
+	return {
+		agent: spec.agent,
+		cwd,
+		task: spec.task,
+		text: "",
+		exitCode: -1,
+		stderr: "",
+		messages: [],
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+		step,
+	};
+}
+
+function progressText(details: TaskDetails): string {
+	const done = details.results.filter((result) => result.exitCode !== -1).length;
+	return `${details.mode}: ${done}/${details.results.length} done, ${details.results.length - done} running...`;
+}
+
+function formatToolCall(part: Extract<ChildContentPart, { type: "toolCall" }>): string {
+	const args = JSON.stringify(part.arguments);
+	return `${part.name} ${args.length > 100 ? `${args.slice(0, 97)}...` : args}`;
+}
+
+function formatToolUpdate(part: Extract<ChildContentPart, { type: "toolUpdate" }>): string {
+	const lines = [`↳ ${part.name}: ${part.text}`];
+	for (const agent of part.agents) {
+		const icon = agent.exitCode === -1 ? "⏳" : agent.exitCode === 0 ? "✓" : "✗";
+		const preview = agent.text.split("\n")[0];
+		lines.push(`  ${icon} ${agent.agent}${preview ? ` ${preview.slice(0, 80)}` : ""}`);
+	}
+	return lines.join("\n");
+}
+
+function activityLines(result: TaskResult, expanded: boolean): string[] {
+	const parts = result.messages.flatMap((message) =>
+		message.role === "assistant" || message.role === "activity" ? message.content : [],
+	);
+	const shown = expanded ? parts : parts.slice(-5);
+	const lines: string[] = [];
+	if (!expanded && parts.length > shown.length) lines.push(`... ${parts.length - shown.length} earlier items`);
+	for (const part of shown) {
+		if (part.type === "toolCall") lines.push(`→ ${formatToolCall(part)}`);
+		else if (part.type === "toolUpdate") lines.push(formatToolUpdate(part));
+		else lines.push(...part.text.split("\n").slice(0, expanded ? undefined : 3));
+	}
+	return lines;
 }
 
 function branchEntries(ctx: ExtensionContext): SessionEntryLike[] {
@@ -363,16 +479,38 @@ export default function dstack(pi: ExtensionAPI) {
 		description:
 			"Spawn an isolated child Pi process. Modes: single (agent+task), parallel (tasks), chain (chain). Depth-1 children may spawn terminal depth-2 children.",
 		parameters: TaskParams,
-		renderResult(result, _options, theme) {
-			const text = result.content.find((part) => part.type === "text")?.text ?? "(no output)";
-			const rows = taskUsageRows(result.details);
-			if (rows.length === 0) return new Text(text, 0, 0);
-			const usage = rows
-				.map((row) => theme.fg("dim", `${row.agent}: ${formatUsageStats(row.usage, row.model)}`))
-				.join("\n");
-			return new Text(`${text}\n${usage}`, 0, 0);
+		renderCall(params, theme) {
+			const request = parseTaskRequest(params);
+			if ("error" in request) return new Text(theme.fg("error", request.error), 0, 0);
+			const label = request.kind === "single" ? request.spec.agent : `${request.specs.length} agents`;
+			return new Text(`${theme.fg("toolTitle", theme.bold("dstack_task"))} ${theme.fg("accent", label)}`, 0, 0);
 		},
-		async execute(_id, params, signal, _onUpdate, ctx) {
+		renderResult(result, { expanded, isPartial }, theme) {
+			const details = parseTaskDetails(result.details);
+			if (!details) {
+				const text = result.content.find((part) => part.type === "text")?.text ?? "(no output)";
+				return new Text(text, 0, 0);
+			}
+			const rows: string[] = [];
+			const done = details.results.filter((task) => task.exitCode !== -1).length;
+			const failed = details.results.filter((task) => task.exitCode > 0).length;
+			const headerIcon = isPartial || done < details.results.length ? "⏳" : failed ? "✗" : "✓";
+			rows.push(`${headerIcon} ${details.mode} ${done}/${details.results.length}${failed ? `, ${failed} failed` : ""}`);
+			for (const task of details.results) {
+				const icon = task.exitCode === -1 ? "⏳" : task.exitCode === 0 ? "✓" : "✗";
+				const step = task.step ? `Step ${task.step}: ` : "";
+				rows.push(`\n─── ${step}${task.agent} ${icon}`);
+				if (expanded) rows.push(`Task: ${task.task}`, `cwd: ${task.cwd}`);
+				const activity = activityLines(task, expanded);
+				if (activity.length) rows.push(...activity);
+				else rows.push(task.exitCode === -1 ? "(running...)" : task.text || "(no output)");
+				const usage = formatUsageStats(task.usage, task.model);
+				if (usage) rows.push(`${task.agent}: ${usage}`);
+			}
+			if (!expanded) rows.push("\n(expand for details)");
+			return new Text(rows.join("\n"), 0, 0);
+		},
+		async execute(_id, params, signal, onUpdate, ctx) {
 			let childDepth: ChildDepth;
 			try {
 				childDepth = childDepthFor(spawnableDepth());
@@ -389,18 +527,26 @@ export default function dstack(pi: ExtensionAPI) {
 			const loaded = await loadConfig(defaultConfigPath());
 			const config = loaded.ok ? loaded.value : emptyConfig();
 			const agents = discoverAgents();
-			const runOne = async (spec: TaskSpec) => {
+			const specs = request.kind === "single" ? [request.spec] : request.specs;
+			const details: TaskDetails = {
+				mode: request.kind,
+				results: specs.map((spec, index) =>
+					emptyTaskResult(spec, spec.cwd ?? ctx.cwd, request.kind === "chain" ? index + 1 : undefined),
+				),
+			};
+			const publish = () => {
+				const snapshot = cloneDetails(details);
+				onUpdate?.(textResult(progressText(snapshot), snapshot));
+			};
+			publish();
+			const runOne = async (spec: TaskSpec, index: number): Promise<TaskResult> => {
 				const resolved = resolveAgent(spec);
-				const agent = agents.find((a) => a.name === resolved.agent);
+				const agent = agents.find((candidate) => candidate.name === resolved.agent);
 				if (!agent) {
-					const available = agents.map((a) => a.name).join(", ") || "none";
+					const available = agents.map((candidate) => candidate.name).join(", ") || "none";
 					throw new Error(`Unknown agent "${resolved.agent}". Available: ${available}.`);
 				}
-				const model = resolveModel({
-					explicit: spec.model,
-					role: spec.role,
-					roles: config.roles,
-				});
+				const model = resolveModel({ explicit: spec.model, role: spec.role, roles: config.roles });
 				let cwd = spec.cwd ?? ctx.cwd;
 				if (spec.worktree) {
 					cwd = await createWorktree({
@@ -410,6 +556,8 @@ export default function dstack(pi: ExtensionAPI) {
 						from: config.worktree.from,
 					});
 				}
+				details.results[index] = { ...details.results[index], agent: resolved.agent, cwd, task: spec.task } as TaskResult;
+				publish();
 				const promptParts = [agent.systemPrompt.trim()];
 				if (resolved.dmode) promptParts.push(dmodeReminder(skillPath(), childDepth));
 				let tmp: { dir: string; filePath: string } | undefined;
@@ -429,50 +577,52 @@ export default function dstack(pi: ExtensionAPI) {
 						cwd,
 						env: childEnv(childDepth),
 						signal,
+						onUpdate: (partial) => {
+							details.results[index] = { ...partial, agent: resolved.agent, cwd, task: spec.task, step: details.results[index]?.step };
+							publish();
+						},
 					});
-					return {
+					const completed: TaskResult = {
+						...child,
 						agent: resolved.agent,
 						cwd,
+						task: spec.task,
 						text: capOutput(child.text),
-						exitCode: child.exitCode,
-						model: child.model,
-						usage: child.usage,
-						stopReason: child.stopReason,
-						errorMessage: child.errorMessage,
+						step: details.results[index]?.step,
 					};
+					details.results[index] = completed;
+					publish();
+					return completed;
 				} finally {
 					if (tmp) await removeTemp(tmp.dir, tmp.filePath);
 				}
 			};
-
-			const specs =
-				request.kind === "single" ? [request.spec] : request.kind === "parallel" ? request.specs : request.specs;
 			try {
 				if (request.kind === "chain") {
-					const results = [];
+					const results: TaskResult[] = [];
 					let previous = "";
-					for (const spec of specs) {
+					for (const [index, spec] of specs.entries()) {
 						const task = spec.task.replace(/\{previous\}/g, previous);
-						const result = await runOne({ ...spec, task });
+						const result = await runOne({ ...spec, task }, index);
 						results.push(result);
 						if (result.exitCode !== 0) {
-							return textResult(`Chain stopped (${spec.agent}): ${result.text}`, { results }, true);
+							return textResult(`Chain stopped (${spec.agent}): ${result.text}`, cloneDetails(details), true);
 						}
 						previous = result.text;
 					}
 					const last = results[results.length - 1];
-					return textResult(last?.text ?? "(no output)", { results });
+					return textResult(last?.text ?? "(no output)", cloneDetails(details));
 				}
-				const results = await mapWithConcurrency(specs, MAX_CONCURRENCY, (spec) => runOne(spec));
+				const results = await mapWithConcurrency(specs, MAX_CONCURRENCY, (spec, index) => runOne(spec, index));
 				if (request.kind === "single") {
 					const result = results[0];
 					if (!result) return textResult("(no output)");
-					return textResult(result.text, { results }, result.exitCode !== 0);
+					return textResult(result.text, cloneDetails(details), result.exitCode !== 0);
 				}
 				const text = results
-					.map((r, i) => `### [${r.agent}] ${r.exitCode === 0 ? "completed" : "failed"}\n\n${r.text}`)
+					.map((task) => `### [${task.agent}] ${task.exitCode === 0 ? "completed" : "failed"}\n\n${task.text}`)
 					.join("\n\n---\n\n");
-				return textResult(text, { results });
+				return textResult(text, cloneDetails(details));
 			} catch (err) {
 				if (err instanceof WorktreeError) {
 					return textResult(err.message, {}, true);

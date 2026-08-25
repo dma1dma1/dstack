@@ -84,6 +84,7 @@ test("child telemetry reports the concrete provider model", () => {
 		text: "",
 		exitCode: 0,
 		stderr: "",
+		messages: [],
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 	};
 	applyJsonEvent(
@@ -100,6 +101,60 @@ test("child telemetry reports the concrete provider model", () => {
 		{ messages: [], result },
 	);
 	assert.equal(result.model, "router/concrete-model");
+});
+
+test("child JSON events retain live text, tools, and nested agent updates", () => {
+	const result: ChildResult = {
+		text: "",
+		exitCode: -1,
+		stderr: "",
+		messages: [],
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+	};
+	const state = { messages: result.messages, result };
+	assert.equal(
+		applyJsonEvent(
+			{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [
+						{ type: "text", text: "Checking the repository" },
+						{ type: "toolCall", name: "read", arguments: { path: "README.md" } },
+					],
+				},
+			},
+			state,
+		),
+		true,
+	);
+	assert.equal(result.text, "Checking the repository");
+	assert.deepEqual(result.messages[0]?.content[1], {
+		type: "toolCall",
+		name: "read",
+		arguments: { path: "README.md" },
+	});
+	const nestedUpdate = (exitCode: number, text: string) => ({
+		type: "tool_execution_update",
+		toolCallId: "nested-1",
+		toolName: "dstack_task",
+		partialResult: {
+			content: [{ type: "text", text: "parallel: 1/2 done, 1 running..." }],
+			details: { results: [{ agent: "poteto-agent", exitCode, text }] },
+		},
+	});
+	assert.equal(applyJsonEvent(nestedUpdate(-1, "Inspecting files"), state), true);
+	assert.equal(result.messages.length, 2);
+	assert.equal(applyJsonEvent(nestedUpdate(0, "Done"), state), true);
+	assert.equal(result.messages.length, 2);
+	assert.deepEqual(result.messages[1]?.content[0], {
+		type: "toolUpdate",
+		id: "nested-1",
+		name: "dstack_task",
+		text: "parallel: 1/2 done, 1 running...",
+		agents: [{ agent: "poteto-agent", exitCode: 0, text: "Done" }],
+	});
+	assert.equal(applyJsonEvent({ type: "message_update" }, state), false);
 });
 
 test("child usage reports model, tokens, context, turns, and cost", () => {

@@ -165,24 +165,32 @@ export function getPiInvocation(args: string[]): { command: string; args: string
 	return { command: "pi", args };
 }
 
-export type JsonLineEvent = {
-	type?: string;
-	message?: {
-		role?: string;
-		content?: Array<{ type?: string; text?: string }>;
-		stopReason?: string;
-		errorMessage?: string;
-		provider?: string;
-		model?: string;
-		responseModel?: string;
-		usage?: {
-			input?: number;
-			output?: number;
-			cacheRead?: number;
-			cacheWrite?: number;
-			totalTokens?: number;
-			cost?: { total?: number };
-		};
+export type ChildContentPart =
+	| { type: "text"; text: string }
+	| { type: "toolCall"; name: string; arguments: Record<string, unknown> }
+	| {
+			type: "toolUpdate";
+			id: string;
+			name: string;
+			text: string;
+			agents: Array<{ agent: string; exitCode: number; text: string }>;
+	  };
+
+export type ChildMessage = {
+	role: string;
+	content: ChildContentPart[];
+	stopReason?: string;
+	errorMessage?: string;
+	provider?: string;
+	model?: string;
+	responseModel?: string;
+	usage?: {
+		input?: number;
+		output?: number;
+		cacheRead?: number;
+		cacheWrite?: number;
+		totalTokens?: number;
+		cost?: { total?: number };
 	};
 };
 
@@ -190,6 +198,7 @@ export type ChildResult = {
 	text: string;
 	exitCode: number;
 	stderr: string;
+	messages: ChildMessage[];
 	stopReason?: string;
 	errorMessage?: string;
 	model?: string;
@@ -224,42 +233,133 @@ export function formatUsageStats(usage: ChildResult["usage"], model?: string): s
 	return parts.join(" ");
 }
 
-function lastAssistantText(messages: Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }>): string {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg?.role !== "assistant") continue;
-		for (const part of msg.content ?? []) {
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function optionalString(value: unknown): string | undefined {
+	return typeof value === "string" ? value : undefined;
+}
+
+function optionalNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function parseContentPart(value: unknown): ChildContentPart | undefined {
+	if (!isRecord(value)) return undefined;
+	if (value.type === "text" && typeof value.text === "string") return { type: "text", text: value.text };
+	if (value.type === "toolCall" && typeof value.name === "string" && isRecord(value.arguments)) {
+		return { type: "toolCall", name: value.name, arguments: value.arguments };
+	}
+	return undefined;
+}
+
+function parseMessage(value: unknown): ChildMessage | undefined {
+	if (!isRecord(value) || typeof value.role !== "string" || !Array.isArray(value.content)) return undefined;
+	const content = value.content.map(parseContentPart).filter((part): part is ChildContentPart => part !== undefined);
+	const rawUsage = isRecord(value.usage) ? value.usage : undefined;
+	const rawCost = rawUsage && isRecord(rawUsage.cost) ? rawUsage.cost : undefined;
+	return {
+		role: value.role,
+		content,
+		stopReason: optionalString(value.stopReason),
+		errorMessage: optionalString(value.errorMessage),
+		provider: optionalString(value.provider),
+		model: optionalString(value.model),
+		responseModel: optionalString(value.responseModel),
+		usage: rawUsage
+			? {
+					input: optionalNumber(rawUsage.input),
+					output: optionalNumber(rawUsage.output),
+					cacheRead: optionalNumber(rawUsage.cacheRead),
+					cacheWrite: optionalNumber(rawUsage.cacheWrite),
+					totalTokens: optionalNumber(rawUsage.totalTokens),
+					cost: rawCost ? { total: optionalNumber(rawCost.total) } : undefined,
+				}
+			: undefined,
+	};
+}
+
+function parseToolUpdate(event: Record<string, unknown>): Extract<ChildContentPart, { type: "toolUpdate" }> | undefined {
+	if (event.type !== "tool_execution_update") return undefined;
+	if (typeof event.toolCallId !== "string" || typeof event.toolName !== "string") return undefined;
+	const partialResult = isRecord(event.partialResult) ? event.partialResult : undefined;
+	if (!partialResult) return undefined;
+	const content = Array.isArray(partialResult.content) ? partialResult.content : [];
+	const textPart = content.find((part) => isRecord(part) && part.type === "text" && typeof part.text === "string");
+	const details = isRecord(partialResult.details) ? partialResult.details : undefined;
+	const rawResults = details && Array.isArray(details.results) ? details.results : [];
+	const agents = rawResults.flatMap((value) => {
+		if (!isRecord(value) || typeof value.agent !== "string" || typeof value.exitCode !== "number") return [];
+		const text = typeof value.text === "string" ? value.text : typeof value.errorMessage === "string" ? value.errorMessage : "";
+		return [{ agent: value.agent, exitCode: value.exitCode, text }];
+	});
+	return {
+		type: "toolUpdate",
+		id: event.toolCallId,
+		name: event.toolName,
+		text: textPart && isRecord(textPart) && typeof textPart.text === "string" ? textPart.text : "(working...)",
+		agents,
+	};
+}
+
+function lastAssistantText(messages: ChildMessage[]): string {
+	for (let i = messages.length - 1; i >= 0; i -= 1) {
+		const message = messages[i];
+		if (message?.role !== "assistant") continue;
+		for (const part of message.content) {
 			if (part.type === "text" && part.text) return part.text;
 		}
 	}
 	return "";
 }
 
-export function applyJsonEvent(
-	event: JsonLineEvent,
-	state: { messages: NonNullable<JsonLineEvent["message"]>[]; result: ChildResult },
-): void {
-	if (event.type !== "message_end" || !event.message) return;
-	const msg = event.message;
-	state.messages.push(msg);
-	if (msg.role !== "assistant") return;
+export function applyJsonEvent(event: unknown, state: { messages: ChildMessage[]; result: ChildResult }): boolean {
+	if (!isRecord(event)) return false;
+	const toolUpdate = parseToolUpdate(event);
+	if (toolUpdate) {
+		for (let messageIndex = state.messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+			const message = state.messages[messageIndex];
+			if (!message) continue;
+			const partIndex = message.content.findIndex((part) => part.type === "toolUpdate" && part.id === toolUpdate.id);
+			if (partIndex !== -1) {
+				message.content[partIndex] = toolUpdate;
+				state.result.messages = state.messages;
+				return true;
+			}
+		}
+		state.messages.push({ role: "activity", content: [toolUpdate] });
+		state.result.messages = state.messages;
+		return true;
+	}
+	if (event.type !== "message_end" && event.type !== "tool_result_end") return false;
+	const message = parseMessage(event.message);
+	if (!message) return false;
+	state.messages.push(message);
+	state.result.messages = state.messages;
+	if (message.role !== "assistant") return true;
 	state.result.usage.turns += 1;
-	const usage = msg.usage;
+	const usage = message.usage;
 	if (usage) {
-		state.result.usage.input += usage.input || 0;
-		state.result.usage.output += usage.output || 0;
-		state.result.usage.cacheRead += usage.cacheRead || 0;
-		state.result.usage.cacheWrite += usage.cacheWrite || 0;
-		state.result.usage.cost += usage.cost?.total || 0;
-		state.result.usage.contextTokens = usage.totalTokens || 0;
+		state.result.usage.input += usage.input ?? 0;
+		state.result.usage.output += usage.output ?? 0;
+		state.result.usage.cacheRead += usage.cacheRead ?? 0;
+		state.result.usage.cacheWrite += usage.cacheWrite ?? 0;
+		state.result.usage.cost += usage.cost?.total ?? 0;
+		state.result.usage.contextTokens = usage.totalTokens ?? state.result.usage.contextTokens;
 	}
-	const reportedModel = msg.responseModel ?? msg.model;
+	const reportedModel = message.responseModel ?? message.model;
 	if (!state.result.model && reportedModel) {
-		state.result.model = msg.provider ? `${msg.provider}/${reportedModel}` : reportedModel;
+		state.result.model = message.provider ? `${message.provider}/${reportedModel}` : reportedModel;
 	}
-	if (msg.stopReason) state.result.stopReason = msg.stopReason;
-	if (msg.errorMessage) state.result.errorMessage = msg.errorMessage;
+	if (message.stopReason) state.result.stopReason = message.stopReason;
+	if (message.errorMessage) state.result.errorMessage = message.errorMessage;
 	state.result.text = lastAssistantText(state.messages);
+	return true;
+}
+
+function snapshotChildResult(result: ChildResult): ChildResult {
+	return { ...result, messages: [...result.messages], usage: { ...result.usage } };
 }
 
 export async function runChildProcess(input: {
@@ -267,15 +367,17 @@ export async function runChildProcess(input: {
 	cwd: string;
 	env: Record<string, string>;
 	signal?: AbortSignal;
+	onUpdate?: (result: ChildResult) => void;
 }): Promise<ChildResult> {
 	const invocation = getPiInvocation(input.args);
 	const result: ChildResult = {
 		text: "",
-		exitCode: 0,
+		exitCode: -1,
 		stderr: "",
+		messages: [],
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 	};
-	const state = { messages: [] as NonNullable<JsonLineEvent["message"]>[], result };
+	const state = { messages: result.messages, result };
 
 	result.exitCode = await new Promise<number>((resolve) => {
 		const proc = spawn(invocation.command, invocation.args, {
@@ -285,10 +387,12 @@ export async function runChildProcess(input: {
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		let buffer = "";
+		let wasAborted = false;
 		const processLine = (line: string) => {
 			if (!line.trim()) return;
 			try {
-				applyJsonEvent(JSON.parse(line) as JsonLineEvent, state);
+				const event: unknown = JSON.parse(line);
+				if (applyJsonEvent(event, state)) input.onUpdate?.(snapshotChildResult(result));
 			} catch {
 				return;
 			}
@@ -304,14 +408,22 @@ export async function runChildProcess(input: {
 		});
 		proc.on("close", (code) => {
 			if (buffer.trim()) processLine(buffer);
-			resolve(code ?? 0);
+			if (wasAborted) {
+				result.stopReason = "aborted";
+				result.errorMessage = "Child agent was aborted";
+			}
+			resolve(code ?? (wasAborted ? 1 : 0));
 		});
-		proc.on("error", () => resolve(1));
+		proc.on("error", (error) => {
+			result.errorMessage = error.message;
+			resolve(1);
+		});
 		if (input.signal) {
 			const killProc = () => {
+				wasAborted = true;
 				proc.kill("SIGTERM");
 				setTimeout(() => {
-					if (!proc.killed) proc.kill("SIGKILL");
+					if (proc.exitCode === null) proc.kill("SIGKILL");
 				}, 5000);
 			};
 			if (input.signal.aborted) killProc();
