@@ -285,7 +285,7 @@ async function main() {
 	await pi.fire("session_start", ctx);
 	assert(
 		"tools-registered",
-		["dstack_task", "dstack_todo", "dstack_ask", "dstack_sessions", "dstack_config"].every((n) => pi.tools.has(n)),
+		["dstack_task", "dstack_result", "dstack_todo", "dstack_ask", "dstack_sessions", "dstack_config"].every((n) => pi.tools.has(n)),
 		[...pi.tools.keys()].join(","),
 	);
 	assert("status-off-at-start", ctx.status.dstack === undefined || ctx.status.dstack === "" || ctx.status.dstack === "off" || ctx.status.dstack === null, String(ctx.status.dstack));
@@ -440,6 +440,9 @@ async function main() {
 		malformedDepth.content[0].text,
 	);
 
+	// Root groups now launch through the background-task companion. Keep these
+	// child-process assertions on the unchanged depth-1 synchronous path.
+	process.env.DSTACK_NESTING = "1";
 	const single = await pi.tools.get("dstack_task").execute(
 		"11",
 		{ agent: "general-purpose", task: "list tools you have", tools: "read,grep,find,ls" },
@@ -462,7 +465,7 @@ async function main() {
 	const lastKid = JSON.parse(readFileSync(join(process.env.DSTACK_VALIDATE_DIR, kids.at(-1)), "utf8"));
 	assert("child-no-extensions", lastKid.noExtensions === true);
 	assert("child-explicit-dstack", lastKid.explicitExtension === join(root, "extensions/dstack.ts"), String(lastKid.explicitExtension));
-	assert("child-nesting-env", lastKid.nesting === "1");
+	assert("child-nesting-env", lastKid.nesting === "2");
 	assert("child-tools-allowlist", lastKid.tools === "read,grep,find,ls", String(lastKid.tools));
 
 	const parallel = await pi.tools.get("dstack_task").execute(
@@ -553,6 +556,7 @@ async function main() {
 	);
 	assert("worktree-fail-closed", failedWt.isError === true && failedWt.content[0].text.includes("worktree add failed"), failedWt.content[0].text);
 	assert("worktree-fail-stays-out-of-cwd", readdirSync(notGit).length === 0, readdirSync(notGit).join(","));
+	delete process.env.DSTACK_NESTING;
 
 	const { resolveAgent, buildChildArgv } = await import(join(root, "extensions/spawn.ts"));
 	const forced = resolveAgent({ agent: "poteto-agent", task: "x", dmode: false });
