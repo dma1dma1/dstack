@@ -61,6 +61,8 @@ The first `/setup-dstack` also writes `~/.pi/agent/extensions/pi-permission-syst
 | `dstack_sessions` | `SessionManager.list(cwd)`. |
 | `dstack_config` | Get / set / list `models.json`. |
 
+While `dstack_task` runs, a small agent dock below the editor shows one status line per child. The transcript keeps the tool card compact. Press Ctrl+O to show the full child activity and output.
+
 Nesting has three depths. An unset `DSTACK_NESTING` or `0` is root depth 0. Root children run at depth 1 and may spawn depth-2 children. Depth 2 is terminal. dstack rejects malformed values instead of guessing. Parallel writers should each set `worktree: true`.
 
 `worktree: true` on `dstack_task` creates `~/.dma/worktrees/<repo>/<slug>` on branch `dma/<slug>` and runs the child there. The default base is `HEAD`, so the child sees the parent's current commit, not `origin/main`, unless `worktree.from` in `models.json` is `origin/main`. If `git worktree add` fails, the child does not run in the parent tree. Uncommitted parent diffs stay invisible either way.
