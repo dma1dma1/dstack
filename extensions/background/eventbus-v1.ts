@@ -6,12 +6,6 @@ const REQUEST_SCHEMA = "pi-background-tasks.extension-request.v1";
 const RESPONSE_SCHEMA = "pi-background-tasks.extension-response.v1";
 
 const TASK_STATUSES = ["running", "completed", "failed", "killed"] as const;
-const TASK_KEYS = new Set([
-	"id", "name", "command", "description", "status", "outputPath", "cwd", "startTime",
-	"endTime", "exitCode", "signal", "pid", "bytesWritten", "isAgent", "error", "notified",
-	"notifyOnCompletion", "triggerOnCompletion", "timeoutSeconds", "contextUsage", "tokenUsage",
-	"toolUsage", "model", "telemetryUnavailableReason", "attestationPath", "delegate", "fusion",
-]);
 
 export type DstackTaskId = string & { readonly __brand: "DstackTaskId" };
 export type CompanionStatus = (typeof TASK_STATUSES)[number];
@@ -64,10 +58,10 @@ function requireRecord(value: unknown, label: string): JsonRecord {
 	return Object.fromEntries(Object.entries(value));
 }
 
-function assertClosed(record: JsonRecord, keys: ReadonlySet<string>, label: string): void {
-	for (const key of Object.keys(record)) {
-		if (!keys.has(key)) throw new Error(`${label} contains unknown key ${key}`);
-	}
+function attributableRequestId(value: unknown): string | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	const descriptor = Object.getOwnPropertyDescriptor(value, "request_id");
+	return typeof descriptor?.value === "string" ? descriptor.value : undefined;
 }
 
 function requireString(value: unknown, label: string): string {
@@ -94,7 +88,6 @@ function parseStatus(value: unknown): CompanionStatus {
 
 function parseTask(value: unknown): CompanionTaskState {
 	const task = requireRecord(value, "task");
-	assertClosed(task, TASK_KEYS, "task");
 	const status = parseStatus(task["status"]);
 	const nameValue = task["name"];
 	if (nameValue !== undefined && typeof nameValue !== "string") throw new Error("task.name must be a string");
@@ -110,7 +103,6 @@ function parseTask(value: unknown): CompanionTaskState {
 
 function parseCapabilities(value: unknown): BackgroundCapabilitiesV1 {
 	const result = requireRecord(value, "capabilities result");
-	assertClosed(result, new Set(["api_version", "run", "run_is_agent", "run_completion_trigger", "status", "logs", "logs_bounded", "kill"]), "capabilities result");
 	if (result["api_version"] !== 1) throw new Error("unsupported background task API version");
 	for (const key of ["run", "run_is_agent", "run_completion_trigger", "status", "logs", "logs_bounded", "kill"] as const) {
 		if (!requireBoolean(result[key], `capabilities.${key}`)) throw new Error(`capabilities.${key} is unavailable`);
@@ -120,14 +112,12 @@ function parseCapabilities(value: unknown): BackgroundCapabilitiesV1 {
 
 function parseTaskList(value: unknown): readonly CompanionTaskState[] {
 	const result = requireRecord(value, "status result");
-	assertClosed(result, new Set(["tasks"]), "status result");
 	if (!Array.isArray(result["tasks"])) throw new Error("status result.tasks must be an array");
 	return result["tasks"].map(parseTask);
 }
 
 function parseKill(value: unknown): CompanionTaskState {
 	const result = requireRecord(value, "kill result");
-	assertClosed(result, new Set(["task", "message"]), "kill result");
 	requireString(result["message"], "kill result.message");
 	return parseTask(result["task"]);
 }
@@ -158,15 +148,13 @@ export function createEventBusV1Port(options: Readonly<{
 			const onAbort = () => finish({ kind: "reject", error: signal?.reason ?? new Error("background task request aborted") });
 			const stop = () => finish({ kind: "reject", error: new Error("background task port is closed") });
 			const offResponse = options.events.on(RESPONSE_CHANNEL, (raw: unknown) => {
+				if (attributableRequestId(raw) !== requestId) return;
 				try {
 					const frame = requireRecord(raw, "response frame");
-					if (frame["request_id"] !== requestId) return;
 					if (frame["schema_version"] !== RESPONSE_SCHEMA || frame["operation"] !== operation || typeof frame["ok"] !== "boolean") throw new Error("malformed background task response");
 					if (frame["ok"]) {
-						assertClosed(frame, new Set(["schema_version", "request_id", "operation", "ok", "result"]), "response frame");
 						finish({ kind: "resolve", value: parse(frame["result"]) });
 					} else {
-						assertClosed(frame, new Set(["schema_version", "request_id", "operation", "ok", "error"]), "response frame");
 						throw new Error(requireString(frame["error"], "response error"));
 					}
 				} catch (error) {
