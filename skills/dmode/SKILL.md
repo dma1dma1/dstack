@@ -90,6 +90,8 @@ Read the leaf skill in full for any principle you apply. Each entry names when i
 
 ## Subagents
 
+**Root depth 0 is an orchestrator.** Preserve its context by delegating repository-context-intensive work instead of implementing that work directly. Keep direct local work as a narrow escape hatch for trivial, low-context mechanical actions. This restriction is root-only. Terminal depth-2 workers complete their assigned scope directly.
+
 **Use `agent: "poteto-agent"` for any subagent you spawn inside a playbook step** (code-writing delegates, ad-hoc helpers). `/dmode` and `poteto-agent` route through the same wrapper. Routed workflow skills (`how`, `why`, `interrogate`, `reflect`, `swarm`) set their own `agent` for diverse-model review; respect what the skill prescribes, don't override to `poteto-agent`.
 
 At root depth 0 and child depth 1, identify independent work early and dispatch it together with one parallel `dstack_task` call. Parallelize independent readers freely. Give each concurrent writer a distinct checkout with `worktree: true` or an explicit distinct `cwd`; one checkout has one writer. Integrate overlapping work serially. Depth-1 children should use their final fan-out level when it shortens the critical path. Depth-2 workers are terminal and complete their assigned scope without calling `dstack_task`. Keep trivial work local instead of building an agent tree around it.
