@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { spawn, type ChildProcessByStdio } from "node:child_process";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { spawn, type ChildProcess, type ChildProcessByStdio } from "node:child_process";
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,11 +10,21 @@ import type { Readable, Writable } from "node:stream";
 import { toAbsolutePath } from "../extensions/background/artifacts.ts";
 import {
 	acquireChildSlot,
+	proveStaticallyNonNesting,
 	MAX_ACTIVE_CHILDREN,
+	__schedulerInternalsForTesting as internals,
 	type ChildDepth,
+	type NonNestingProof,
 } from "../extensions/background/scheduler.ts";
 
 const workerPath = fileURLToPath(new URL("./fixtures/background-scheduler-worker.ts", import.meta.url));
+
+const LOCK_SCHEMA = "dstack.scheduler.lock.v2";
+const CLAIM_SCHEMA = "dstack.scheduler.lockclaim.v1";
+const LEASE_SCHEMA = "dstack.scheduler.lease.v2";
+const TICKET_SCHEMA = "dstack.scheduler.ticket.v2";
+/** Well-formed but never matching any real process start token. */
+const MISMATCHED_TOKEN = "posix-lstart:proven-dead-token-mismatch";
 
 async function temporaryRoot(t: TestContext): Promise<string> {
 	const path = await mkdtemp(join(tmpdir(), "dstack-scheduler-test-"));
@@ -35,7 +45,9 @@ type SpawnOptions = Readonly<{
 	root: string;
 	childId: string;
 	depth: ChildDepth;
-	canNest?: boolean;
+	nonNesting?: boolean;
+	cycles?: number;
+	holdMs?: number;
 }>;
 
 function spawnWorker(t: TestContext, options: SpawnOptions): Worker {
@@ -50,7 +62,9 @@ function spawnWorker(t: TestContext, options: SpawnOptions): Worker {
 		"--depth",
 		String(options.depth),
 	];
-	if (options.canNest === true) args.push("--can-nest");
+	if (options.nonNesting === true) args.push("--non-nesting");
+	if (options.cycles !== undefined) args.push("--cycles", String(options.cycles));
+	if (options.holdMs !== undefined) args.push("--hold-ms", String(options.holdMs));
 	const child: ChildProcessByStdio<Writable, Readable, null> = spawn(process.execPath, args, {
 		stdio: ["pipe", "pipe", "inherit"],
 	});
@@ -161,17 +175,68 @@ async function acquireWorkers(t: TestContext, root: string, specs: readonly Spaw
 	return workers;
 }
 
+type CraftedOwner = Readonly<{ pid: number; startToken: string }>;
+
+async function craftLease(
+	root: string,
+	input: Readonly<{ childId: string; owner: CraftedOwner; child?: CraftedOwner; seq?: number }>,
+): Promise<string> {
+	const nonce = `crafted-${input.childId}`;
+	const record: Record<string, unknown> = {
+		schemaVersion: LEASE_SCHEMA,
+		seq: input.seq ?? 1,
+		nonce,
+		workflowId: "wf-crafted",
+		childId: input.childId,
+		depth: 1,
+		capacityClass: "terminal",
+		owner: input.owner,
+		acquiredAt: new Date().toISOString(),
+	};
+	if (input.child !== undefined) {
+		record.child = input.child;
+		record.childBoundAt = new Date().toISOString();
+	}
+	const path = join(root, "leases", `${nonce}.json`);
+	await writeFile(path, JSON.stringify(record), { mode: 0o600 });
+	// Crafted records need a consistent sequence file or the scheduler fails closed.
+	await writeFile(join(root, "seq"), "10", { mode: 0o600 });
+	return path;
+}
+
+async function initializedRoot(t: TestContext): Promise<string> {
+	const root = await temporaryRoot(t);
+	await internals.ensureSchedulerDirs(toAbsolutePath(root));
+	return root;
+}
+
+async function selfOwner(): Promise<CraftedOwner> {
+	return { pid: process.pid, startToken: await internals.currentStartToken() };
+}
+
+function acquireTerminal(root: string, childId: string, signal?: AbortSignal) {
+	return acquireChildSlot({
+		schedulerRoot: toAbsolutePath(root),
+		workflowId: "wf-inproc",
+		childId,
+		work: { depth: 2 },
+		signal: signal ?? new AbortController().signal,
+	});
+}
+
+// --- Capacity, FIFO, and reserve -------------------------------------------
+
 test("four slots cap admission; releasing one admits the fifth waiter", async (t) => {
 	const root = await temporaryRoot(t);
 	const holders = await acquireWorkers(t, root, [
-		{ root, childId: "w1", depth: 1, canNest: true },
-		{ root, childId: "w2", depth: 1, canNest: true },
-		{ root, childId: "w3", depth: 1, canNest: true },
-		{ root, childId: "w4", depth: 1 },
+		{ root, childId: "w1", depth: 1 },
+		{ root, childId: "w2", depth: 1 },
+		{ root, childId: "w3", depth: 1 },
+		{ root, childId: "w4", depth: 1, nonNesting: true },
 	]);
 	assert.equal((await leaseFiles(root)).length, MAX_ACTIVE_CHILDREN);
 
-	const fifth = spawnWorker(t, { root, childId: "w5", depth: 1 });
+	const fifth = spawnWorker(t, { root, childId: "w5", depth: 1, nonNesting: true });
 	await waitForState("the fifth waiter to enqueue a ticket", async () =>
 		(await ticketFiles(root)).length === 1 ? true : undefined,
 	);
@@ -193,17 +258,17 @@ test("four slots cap admission; releasing one admits the fifth waiter", async (t
 	assert.deepEqual(await leaseFiles(root), []);
 });
 
-test("a depth-2 ticket bypasses a blocked nesting-capable depth-1 ticket", async (t) => {
+test("the nesting reserve holds and terminal tickets bypass a blocked reserved ticket", async (t) => {
 	const root = await temporaryRoot(t);
 	const holders = await acquireWorkers(t, root, [
-		{ root, childId: "n1", depth: 1, canNest: true },
-		{ root, childId: "n2", depth: 1, canNest: true },
-		{ root, childId: "n3", depth: 1, canNest: true },
+		{ root, childId: "n1", depth: 1 },
+		{ root, childId: "n2", depth: 1 },
+		{ root, childId: "n3", depth: 1 },
 	]);
 
-	// The nesting reserve blocks a fourth nesting-capable depth-1 child even
-	// though one slot is free.
-	const blocked = spawnWorker(t, { root, childId: "n4", depth: 1, canNest: true });
+	// The nesting reserve blocks a fourth reserved depth-1 child even though
+	// one slot is free.
+	const blocked = spawnWorker(t, { root, childId: "n4", depth: 1 });
 	await waitForState("the blocked depth-1 ticket to enqueue", async () =>
 		(await ticketFiles(root)).length === 1 ? true : undefined,
 	);
@@ -222,13 +287,95 @@ test("a depth-2 ticket bypasses a blocked nesting-capable depth-1 ticket", async
 	assert.deepEqual(await ticketFiles(root), []);
 });
 
+test("a proven non-nesting depth-1 child may take slot four past a blocked reserved ticket", async (t) => {
+	const root = await temporaryRoot(t);
+	await acquireWorkers(t, root, [
+		{ root, childId: "r1", depth: 1 },
+		{ root, childId: "r2", depth: 1 },
+		{ root, childId: "r3", depth: 1 },
+	]);
+	const blocked = spawnWorker(t, { root, childId: "r4", depth: 1 });
+	await waitForState("the blocked reserved ticket to enqueue", async () =>
+		(await ticketFiles(root)).length === 1 ? true : undefined,
+	);
+	const proven = spawnWorker(t, { root, childId: "t1", depth: 1, nonNesting: true });
+	await proven.waitForLine("acquired");
+	assert.deepEqual(await leaseChildIds(root), ["r1", "r2", "r3", "t1"]);
+	assert.equal((await ticketFiles(root)).length, 1);
+	void blocked;
+});
+
+test("FIFO order holds under contention", async (t) => {
+	const root = await temporaryRoot(t);
+	const holders = await acquireWorkers(t, root, [
+		{ root, childId: "f1", depth: 1, nonNesting: true },
+		{ root, childId: "f2", depth: 1, nonNesting: true },
+		{ root, childId: "f3", depth: 1, nonNesting: true },
+		{ root, childId: "f4", depth: 1, nonNesting: true },
+	]);
+	const waiters: Worker[] = [];
+	for (const [index, childId] of ["q1", "q2", "q3"].entries()) {
+		waiters.push(spawnWorker(t, { root, childId, depth: 1, nonNesting: true }));
+		await waitForState(`waiter ${childId} to enqueue`, async () =>
+			(await ticketFiles(root)).length === index + 1 ? true : undefined,
+		);
+	}
+	for (const [index, waiter] of waiters.entries()) {
+		const holder = holders[index];
+		assert.ok(holder !== undefined);
+		holder.send("release");
+		await holder.waitForLine("released");
+		await waiter.waitForLine("acquired");
+		const ids = await leaseChildIds(root);
+		assert.ok(ids.includes(waiter.childId), `waiter ${waiter.childId} must be admitted in FIFO order`);
+		for (const later of waiters.slice(index + 1)) {
+			assert.ok(!ids.includes(later.childId), `waiter ${later.childId} must not jump the queue`);
+		}
+	}
+});
+
+test("stress: peak concurrency never exceeds four across many real worker processes", async (t) => {
+	const root = await temporaryRoot(t);
+	const specs: SpawnOptions[] = [
+		{ root, childId: "s1", depth: 1, cycles: 3, holdMs: 25 },
+		{ root, childId: "s2", depth: 1, cycles: 3, holdMs: 25 },
+		{ root, childId: "s3", depth: 1, cycles: 3, holdMs: 25 },
+		{ root, childId: "s4", depth: 1, nonNesting: true, cycles: 3, holdMs: 25 },
+		{ root, childId: "s5", depth: 1, nonNesting: true, cycles: 3, holdMs: 25 },
+		{ root, childId: "s6", depth: 1, nonNesting: true, cycles: 3, holdMs: 25 },
+		{ root, childId: "s7", depth: 2, cycles: 3, holdMs: 25 },
+		{ root, childId: "s8", depth: 2, cycles: 3, holdMs: 25 },
+	];
+	const workers = specs.map((spec) => spawnWorker(t, spec));
+	let done = false;
+	let peak = 0;
+	const monitor = (async () => {
+		while (!done) {
+			peak = Math.max(peak, (await leaseFiles(root)).length);
+			await sleep(5);
+		}
+	})();
+	for (const worker of workers) {
+		await worker.waitForLine("all-cycles-done");
+		assert.equal(await worker.exited, 0);
+	}
+	done = true;
+	await monitor;
+	assert.ok(peak <= MAX_ACTIVE_CHILDREN, `observed ${peak} concurrent leases`);
+	assert.ok(peak >= 1, "the monitor must observe at least one lease");
+	assert.deepEqual(await leaseFiles(root), []);
+	assert.deepEqual(await ticketFiles(root), []);
+});
+
+// --- Abort ------------------------------------------------------------------
+
 test("aborting a queued waiter removes its ticket and leaves holders untouched", async (t) => {
 	const root = await temporaryRoot(t);
 	await acquireWorkers(t, root, [
 		{ root, childId: "h1", depth: 1 },
 		{ root, childId: "h2", depth: 1 },
 		{ root, childId: "h3", depth: 1 },
-		{ root, childId: "h4", depth: 1 },
+		{ root, childId: "h4", depth: 1, nonNesting: true },
 	]);
 
 	const waiter = spawnWorker(t, { root, childId: "h5", depth: 1 });
@@ -244,10 +391,34 @@ test("aborting a queued waiter removes its ticket and leaves holders untouched",
 	assert.deepEqual(await leaseChildIds(root), ["h1", "h2", "h3", "h4"]);
 });
 
+test("an abort that races admission releases the just-granted lease and rejects", async (t) => {
+	const root = await temporaryRoot(t);
+	const controller = new AbortController();
+	await assert.rejects(
+		acquireChildSlot({
+			schedulerRoot: toAbsolutePath(root),
+			workflowId: "wf-abort-race",
+			childId: "raced",
+			work: { depth: 2 },
+			signal: controller.signal,
+			__testHooks: {
+				afterAdmission: () => {
+					controller.abort(new Error("raced abort"));
+				},
+			},
+		}),
+		/raced abort/,
+	);
+	assert.deepEqual(await leaseFiles(root), []);
+	assert.deepEqual(await ticketFiles(root), []);
+});
+
+// --- Lease reclamation and liveness -----------------------------------------
+
 test("a provably dead owner's stale lease is reclaimed", async (t) => {
 	const root = await temporaryRoot(t);
 	const [dead] = await acquireWorkers(t, root, [
-		{ root, childId: "dead", depth: 1 },
+		{ root, childId: "dead", depth: 1, nonNesting: true },
 		{ root, childId: "live1", depth: 1 },
 		{ root, childId: "live2", depth: 1 },
 		{ root, childId: "live3", depth: 1 },
@@ -258,9 +429,96 @@ test("a provably dead owner's stale lease is reclaimed", async (t) => {
 	// The dead worker's lease file survives its process.
 	assert.deepEqual(await leaseChildIds(root), ["dead", "live1", "live2", "live3"]);
 
-	const successor = spawnWorker(t, { root, childId: "successor", depth: 1 });
+	const successor = spawnWorker(t, { root, childId: "successor", depth: 1, nonNesting: true });
 	await successor.waitForLine("acquired");
 	assert.deepEqual(await leaseChildIds(root), ["live1", "live2", "live3", "successor"]);
+});
+
+test("a dead runner's lease survives while its bound child is still alive", async (t) => {
+	const root = await temporaryRoot(t);
+	const sleeper: ChildProcess = spawn(process.execPath, ["-e", "setTimeout(() => {}, 600000)"], {
+		stdio: "ignore",
+	});
+	const sleeperExited = new Promise<void>((resolve) => sleeper.on("exit", () => resolve()));
+	t.after(() => sleeper.kill("SIGKILL"));
+	assert.ok(typeof sleeper.pid === "number");
+
+	const [runner] = await acquireWorkers(t, root, [{ root, childId: "owner", depth: 1, nonNesting: true }]);
+	assert.ok(runner !== undefined);
+	runner.send(`bind ${sleeper.pid}`);
+	await runner.waitForLine("bound");
+	runner.send("exit-holding");
+	assert.equal(await runner.exited, 0);
+
+	// Fill the remaining three slots; the dead-runner lease must still count.
+	await acquireWorkers(t, root, [
+		{ root, childId: "l1", depth: 1 },
+		{ root, childId: "l2", depth: 1 },
+		{ root, childId: "l3", depth: 1 },
+	]);
+	const waiter = spawnWorker(t, { root, childId: "waiter", depth: 1, nonNesting: true });
+	await waitForState("the waiter to enqueue", async () =>
+		(await ticketFiles(root)).length === 1 ? true : undefined,
+	);
+	await sleep(400);
+	assert.equal((await ticketFiles(root)).length, 1, "the waiter must stay queued while the child lives");
+	assert.ok((await leaseChildIds(root)).includes("owner"), "the owner-dead child-live lease must survive");
+
+	sleeper.kill("SIGKILL");
+	await sleeperExited;
+	await waiter.waitForLine("acquired");
+	assert.ok(!(await leaseChildIds(root)).includes("owner"));
+});
+
+test("PID reuse: a live pid with a mismatched start token is proven dead and reclaimed", async (t) => {
+	const root = await initializedRoot(t);
+	const crafted = await craftLease(root, {
+		childId: "reused-pid",
+		owner: { pid: process.pid, startToken: MISMATCHED_TOKEN },
+	});
+	const lease = await acquireTerminal(root, "claimant");
+	assert.ok(!(await leaseChildIds(root)).includes("reused-pid"), "the token-mismatch lease must be reclaimed");
+	await assert.rejects(readFile(crafted, "utf8"), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+	await lease.release();
+});
+
+test("unknown owner liveness occupies the slot and blocks a fifth admission", async (t) => {
+	const root = await initializedRoot(t);
+	await craftLease(root, {
+		childId: "unknown-owner",
+		owner: { pid: process.pid, startToken: "unprovable" },
+	});
+	const held = await Promise.all([
+		acquireTerminal(root, "k1"),
+		acquireTerminal(root, "k2"),
+		acquireTerminal(root, "k3"),
+	]);
+	await assert.rejects(
+		acquireTerminal(root, "k4", AbortSignal.timeout(500)),
+		(error: Error) => error.name === "TimeoutError" || error.name === "AbortError",
+	);
+	assert.ok((await leaseChildIds(root)).includes("unknown-owner"), "unknown liveness must keep occupying the slot");
+	for (const lease of held) await lease.release();
+});
+
+test("a dead runner with an unknown-liveness bound child still occupies the slot", async (t) => {
+	const root = await initializedRoot(t);
+	await craftLease(root, {
+		childId: "dead-runner-unknown-child",
+		owner: { pid: process.pid, startToken: MISMATCHED_TOKEN },
+		child: { pid: process.pid, startToken: "unprovable" },
+	});
+	const held = await Promise.all([
+		acquireTerminal(root, "u1"),
+		acquireTerminal(root, "u2"),
+		acquireTerminal(root, "u3"),
+	]);
+	await assert.rejects(
+		acquireTerminal(root, "u4", AbortSignal.timeout(500)),
+		(error: Error) => error.name === "TimeoutError" || error.name === "AbortError",
+	);
+	assert.ok((await leaseChildIds(root)).includes("dead-runner-unknown-child"));
+	for (const lease of held) await lease.release();
 });
 
 test("live owners' leases survive a blocked waiter byte for byte", async (t) => {
@@ -269,7 +527,7 @@ test("live owners' leases survive a blocked waiter byte for byte", async (t) => 
 		{ root, childId: "p1", depth: 1 },
 		{ root, childId: "p2", depth: 1 },
 		{ root, childId: "p3", depth: 1 },
-		{ root, childId: "p4", depth: 1 },
+		{ root, childId: "p4", depth: 1, nonNesting: true },
 	]);
 	const leaseDir = join(root, "leases");
 	const before = new Map<string, string>();
@@ -278,8 +536,8 @@ test("live owners' leases survive a blocked waiter byte for byte", async (t) => 
 	}
 	assert.equal(before.size, MAX_ACTIVE_CHILDREN);
 
-	const waiter = spawnWorker(t, { root, childId: "p5", depth: 1 });
-	const [first, ...rest] = holders;
+	const waiter = spawnWorker(t, { root, childId: "p5", depth: 1, nonNesting: true });
+	const [first] = holders;
 	assert.ok(first !== undefined);
 	first.send("release");
 	await first.waitForLine("released");
@@ -288,7 +546,6 @@ test("live owners' leases survive a blocked waiter byte for byte", async (t) => 
 
 	const after = await leaseFiles(root);
 	assert.equal(after.length, MAX_ACTIVE_CHILDREN);
-	const firstLease = [...before.keys()].find((name) => !after.includes(name));
 	for (const name of after) {
 		if (before.has(name)) {
 			assert.equal(await readFile(join(leaseDir, name), "utf8"), before.get(name));
@@ -297,18 +554,15 @@ test("live owners' leases survive a blocked waiter byte for byte", async (t) => 
 	// Exactly one lease (the released holder's) left; exactly one (the waiter's) arrived.
 	assert.equal([...before.keys()].filter((name) => !after.includes(name)).length, 1);
 	assert.equal(after.filter((name) => !before.has(name)).length, 1);
-	assert.ok(firstLease !== undefined);
-	void rest;
 });
 
-test("release is idempotent within and across calls", async (t) => {
+test("release is idempotent and binding after release fails", async (t) => {
 	const root = await temporaryRoot(t);
 	const lease = await acquireChildSlot({
 		schedulerRoot: toAbsolutePath(root),
 		workflowId: "wf-idempotent",
 		childId: "solo",
-		depth: 1,
-		canNest: false,
+		work: { depth: 1 },
 		signal: new AbortController().signal,
 	});
 	assert.equal((await leaseFiles(root)).length, 1);
@@ -319,6 +573,7 @@ test("release is idempotent within and across calls", async (t) => {
 	await first;
 	await lease.release();
 	assert.deepEqual(await leaseFiles(root), []);
+	await assert.rejects(lease.bindChild(process.pid), /released/);
 
 	// A worker double-release over the wire is also idempotent.
 	const worker = spawnWorker(t, { root, childId: "again", depth: 1 });
@@ -330,16 +585,175 @@ test("release is idempotent within and across calls", async (t) => {
 	assert.deepEqual(await leaseFiles(root), []);
 });
 
-test("depth-2 tickets must be terminal", async () => {
+// --- Lock hardening -----------------------------------------------------------
+
+test("a corrupt scheduler lock fails closed: no wedge, no reset, no deletion", async (t) => {
+	const root = await initializedRoot(t);
+	const lockPath = join(root, "scheduler.lock");
+	await writeFile(lockPath, "{ this is a torn or corrupt lock rec", { mode: 0o600 });
+	await assert.rejects(acquireTerminal(root, "victim"), /corrupt/);
+	assert.equal(await readFile(lockPath, "utf8"), "{ this is a torn or corrupt lock rec");
+});
+
+test("a stale lock held by a proven-dead owner is broken and acquisition proceeds", async (t) => {
+	const root = await initializedRoot(t);
+	const deadLock = JSON.stringify({
+		schemaVersion: LOCK_SCHEMA,
+		nonce: "dead-lock-nonce",
+		owner: { pid: process.pid, startToken: MISMATCHED_TOKEN },
+	});
+	assert.ok(await internals.publishExclusive(join(root, "scheduler.lock"), deadLock));
+	const lease = await acquireTerminal(root, "after-stale-lock");
+	await lease.release();
+	assert.deepEqual(await listJsonFiles(join(root, "lock-claims")), []);
+});
+
+test("a breaker never removes a live lock that replaced the proven-dead one", async (t) => {
+	const root = await initializedRoot(t);
+	const rootAbs = toAbsolutePath(root);
+	const lockPath = join(root, "scheduler.lock");
+	const deadLock = JSON.stringify({
+		schemaVersion: LOCK_SCHEMA,
+		nonce: "lock-n1",
+		owner: { pid: process.pid, startToken: MISMATCHED_TOKEN },
+	});
+	const liveLock = JSON.stringify({
+		schemaVersion: LOCK_SCHEMA,
+		nonce: "lock-n2",
+		owner: await selfOwner(),
+	});
+	assert.ok(await internals.publishExclusive(lockPath, deadLock));
+	await internals.tryBreakDeadLock(rootAbs, {
+		afterDeadProof: async () => {
+			// Another breaker wins in the window between proof and action.
+			await rm(lockPath, { force: true });
+			assert.ok(await internals.publishExclusive(lockPath, liveLock));
+		},
+	});
+	assert.equal(await readFile(lockPath, "utf8"), liveLock, "the new live lock must survive");
+	assert.deepEqual(await listJsonFiles(join(root, "lock-claims")), []);
+});
+
+test("a live recovery claim blocks every other breaker; only the claim holder may act", async (t) => {
+	const root = await initializedRoot(t);
+	const rootAbs = toAbsolutePath(root);
+	const lockPath = join(root, "scheduler.lock");
+	const claimPath = join(root, "lock-claims", "lock-n1.json");
+	const deadLock = JSON.stringify({
+		schemaVersion: LOCK_SCHEMA,
+		nonce: "lock-n1",
+		owner: { pid: process.pid, startToken: MISMATCHED_TOKEN },
+	});
+	assert.ok(await internals.publishExclusive(lockPath, deadLock));
+	const liveClaim = JSON.stringify({
+		schemaVersion: CLAIM_SCHEMA,
+		lockNonce: "lock-n1",
+		owner: await selfOwner(),
+	});
+	assert.ok(await internals.publishExclusive(claimPath, liveClaim));
+	await internals.tryBreakDeadLock(rootAbs);
+	assert.equal(await readFile(lockPath, "utf8"), deadLock, "a live claim must block other breakers");
+	assert.equal(await readFile(claimPath, "utf8"), liveClaim, "a live claim must not be stolen");
+	await rm(claimPath, { force: true });
+	await internals.tryBreakDeadLock(rootAbs);
+	await assert.rejects(readFile(lockPath, "utf8"), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+});
+
+test("a recovery claim held by a proven-dead claimer is taken over exactly once", async (t) => {
+	const root = await initializedRoot(t);
+	const rootAbs = toAbsolutePath(root);
+	const lockPath = join(root, "scheduler.lock");
+	const claimPath = join(root, "lock-claims", "lock-n1.json");
+	const deadLock = JSON.stringify({
+		schemaVersion: LOCK_SCHEMA,
+		nonce: "lock-n1",
+		owner: { pid: process.pid, startToken: MISMATCHED_TOKEN },
+	});
+	const deadClaim = JSON.stringify({
+		schemaVersion: CLAIM_SCHEMA,
+		lockNonce: "lock-n1",
+		owner: { pid: process.pid, startToken: MISMATCHED_TOKEN },
+	});
+	assert.ok(await internals.publishExclusive(lockPath, deadLock));
+	assert.ok(await internals.publishExclusive(claimPath, deadClaim));
+	// First pass retires the dead claim; second pass claims and breaks the lock.
+	await internals.tryBreakDeadLock(rootAbs);
+	await assert.rejects(readFile(claimPath, "utf8"), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+	assert.equal(await readFile(lockPath, "utf8"), deadLock);
+	await internals.tryBreakDeadLock(rootAbs);
+	await assert.rejects(readFile(lockPath, "utf8"), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+	assert.deepEqual(await listJsonFiles(join(root, "lock-claims")), []);
+});
+
+// --- Sequence hardening -------------------------------------------------------
+
+test("a corrupt sequence file fails closed and is never reset", async (t) => {
+	const root = await temporaryRoot(t);
+	const lease = await acquireTerminal(root, "init");
+	await lease.release();
+	const seqPath = join(root, "seq");
+	await writeFile(seqPath, "garbage", { mode: 0o600 });
+	await assert.rejects(acquireTerminal(root, "victim"), /corrupt/);
+	assert.equal(await readFile(seqPath, "utf8"), "garbage", "corruption must never be reset");
+	await writeFile(seqPath, "0", { mode: 0o600 });
+	await assert.rejects(acquireTerminal(root, "victim2"), /corrupt/);
+});
+
+test("a missing sequence file alongside existing records fails closed", async (t) => {
+	const root = await initializedRoot(t);
+	const owner = await selfOwner();
+	const ticket = {
+		schemaVersion: TICKET_SCHEMA,
+		seq: 7,
+		nonce: "orphan-nonce",
+		workflowId: "wf-orphan",
+		childId: "orphan",
+		depth: 1,
+		capacityClass: "terminal",
+		owner,
+		createdAt: new Date().toISOString(),
+	};
+	await writeFile(join(root, "tickets", "000000000007-orphan-nonce.json"), JSON.stringify(ticket), {
+		mode: 0o600,
+	});
+	await assert.rejects(acquireTerminal(root, "victim"), /corrupt/);
+});
+
+// --- Symlink containment --------------------------------------------------------
+
+test("a symlinked scheduler root is rejected", async (t) => {
+	const base = await temporaryRoot(t);
+	const realDir = join(base, "real");
+	const linkPath = join(base, "link");
+	await mkdir(realDir, { recursive: true });
+	await symlink(realDir, linkPath);
+	await assert.rejects(acquireTerminal(linkPath, "victim"), /symlink/);
+});
+
+test("a symlinked scheduler subdirectory is rejected", async (t) => {
+	const base = await temporaryRoot(t);
+	const root = join(base, "root");
+	const outside = join(base, "outside");
+	await mkdir(root, { recursive: true });
+	await mkdir(outside, { recursive: true });
+	await symlink(outside, join(root, "leases"));
+	await assert.rejects(acquireTerminal(root, "victim"), /symlink|escapes/);
+});
+
+// --- Capacity class construction ----------------------------------------------
+
+test("non-nesting proofs require a reason and forged proofs are rejected", async (t) => {
+	assert.throws(() => proveStaticallyNonNesting("   "), /reason/);
+	const root = await temporaryRoot(t);
+	const forged = { mark: "forged", reason: "nope" } as unknown as NonNestingProof;
 	await assert.rejects(
 		acquireChildSlot({
-			schedulerRoot: toAbsolutePath(tmpdir()),
-			workflowId: "wf-invalid",
-			childId: "bad",
-			depth: 2,
-			canNest: true,
+			schedulerRoot: toAbsolutePath(root),
+			workflowId: "wf-forged",
+			childId: "forged",
+			work: { depth: 1, nonNesting: forged },
 			signal: new AbortController().signal,
 		}),
-		/terminal/,
+		/proof/,
 	);
 });

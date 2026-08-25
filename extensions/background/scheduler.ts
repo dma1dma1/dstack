@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { link, lstat, mkdir, open, readdir, readFile, realpath, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
@@ -12,49 +13,105 @@ import type { AbsolutePath } from "./artifacts.ts";
  * Coordination happens through plain files under one scheduler root shared by
  * every runner process in the session:
  *
- *   <root>/scheduler.lock   short exclusive lock (O_EXCL create, removed on exit)
- *   <root>/seq              monotonic FIFO ticket counter, mutated under the lock
- *   <root>/tickets/*.json   one file per waiting acquisition
- *   <root>/leases/*.json    one file per admitted child slot
+ *   <root>/scheduler.lock    short exclusive lock, atomically published via
+ *                            temp file + fsync + link so a partial record is
+ *                            never visible
+ *   <root>/lock-claims/*.json nonce-specific recovery claims: exactly one
+ *                            proven-dead-lock breaker may remove a dead lock
+ *   <root>/seq               monotonic FIFO ticket counter, mutated under the
+ *                            lock; corruption fails closed and never resets
+ *   <root>/tickets/*.json    one file per waiting acquisition
+ *   <root>/leases/*.json     one file per admitted child slot
  *
- * Admission rules:
+ * Admission rules (safety before fairness):
  *   - at most MAX_ACTIVE_CHILDREN leases exist at once;
- *   - at most MAX_NESTING_CAPABLE_CHILDREN leases belong to depth-1 children
- *     that can nest, reserving capacity for terminal work (depth-2 children
- *     and non-nesting depth-1 children) so nesting cannot deadlock;
- *   - tickets are served FIFO by sequence number, except a depth-2 ticket may
- *     bypass an earlier depth-1 nesting-capable ticket that is currently
- *     blocked by the nesting reserve.
+ *   - work is admitted by internal capacity class. Depth-1 work is "reserved"
+ *     (nesting-capable) unless the caller supplies a NonNestingProof; at most
+ *     MAX_NESTING_CAPABLE_CHILDREN reserved leases exist at once so nesting
+ *     cannot deadlock. Depth-2 work and statically proven non-nesting depth-1
+ *     work is "terminal" and may use the fourth slot;
+ *   - tickets are served FIFO by sequence number, except a terminal ticket may
+ *     bypass an earlier reserved ticket that is currently blocked by the
+ *     nesting reserve.
  *
- * A lease or ticket is reclaimed only after proving its owner is dead: the
- * PID must be gone, or the process occupying the PID must carry a different
- * start token. Unknown liveness fails closed and keeps the record, blocking
- * admission rather than granting an extra slot.
+ * A lease records the runner owner and, once bound, the actual spawned child
+ * (PID plus process start token). Callers must bind the spawned child before
+ * it does any useful work. A lease is reclaimed only after proving that every
+ * recorded owner is dead: each PID must be gone, or the process occupying the
+ * PID must carry a different start token. Unknown liveness (including
+ * unsupported platforms such as Windows) fails closed and keeps the record,
+ * occupying the slot rather than granting an extra one.
+ *
+ * Corrupt scheduler state (unparsable lock, claim, or sequence file) fails
+ * closed with an error. It is never deleted or reset.
  */
 
 export const MAX_ACTIVE_CHILDREN = 4;
 export const MAX_NESTING_CAPABLE_CHILDREN = 3;
 
-const TICKET_SCHEMA = "dstack.scheduler.ticket.v1";
-const LEASE_SCHEMA = "dstack.scheduler.lease.v1";
-const LOCK_SCHEMA = "dstack.scheduler.lock.v1";
+const TICKET_SCHEMA = "dstack.scheduler.ticket.v2";
+const LEASE_SCHEMA = "dstack.scheduler.lease.v2";
+const LOCK_SCHEMA = "dstack.scheduler.lock.v2";
+const CLAIM_SCHEMA = "dstack.scheduler.lockclaim.v1";
 const UNPROVABLE_START_TOKEN = "unprovable";
 const POLL_INTERVAL_MS = 40;
 const LOCK_RETRY_MS = 10;
 
 export type ChildDepth = 1 | 2;
 
+/** Internal capacity classes derived from the work shape, never caller-set. */
+export type CapacityClass = "reserved" | "terminal";
+
+const NON_NESTING_PROOF_MARK = "dstack.scheduler.non-nesting-proof.v1";
+
+/**
+ * Evidence that a depth-1 child cannot spawn further children. Obtainable only
+ * through {@link proveStaticallyNonNesting}; the constructor documents the
+ * caller's obligation and a forged object is rejected at acquire time.
+ */
+export type NonNestingProof = Readonly<{ mark: typeof NON_NESTING_PROOF_MARK; reason: string }>;
+
+/**
+ * Assert that a depth-1 child is statically incapable of nesting (for example
+ * its tool set contains no child-spawning tool). Callers own this proof: work
+ * admitted under it may occupy the fourth slot outside the nesting reserve.
+ */
+export function proveStaticallyNonNesting(reason: string): NonNestingProof {
+	if (reason.trim() === "") throw new Error("a non-nesting proof requires a concrete reason");
+	return Object.freeze({ mark: NON_NESTING_PROOF_MARK, reason });
+}
+
+export type ChildWork =
+	| Readonly<{ depth: 2 }>
+	| Readonly<{ depth: 1; nonNesting?: NonNestingProof }>;
+
+function capacityClassOf(work: ChildWork): CapacityClass {
+	if (work.depth === 2) return "terminal";
+	if (work.nonNesting === undefined) return "reserved";
+	if (work.nonNesting.mark !== NON_NESTING_PROOF_MARK) {
+		throw new Error("invalid non-nesting proof: use proveStaticallyNonNesting()");
+	}
+	return "terminal";
+}
+
 export type AcquireChildSlotInput = Readonly<{
 	schedulerRoot: AbsolutePath;
 	workflowId: string;
 	childId: string;
-	depth: ChildDepth;
-	canNest: boolean;
+	work: ChildWork;
 	signal: AbortSignal;
+	/** Test-only seam; production callers must not set this. */
+	__testHooks?: Readonly<{ afterAdmission?: () => void | Promise<void> }>;
 }>;
 
 export type ChildSlotLease = Readonly<{
 	leaseId: string;
+	/**
+	 * Record the actual spawned child on the lease. Must be called before the
+	 * child does any useful work; until then the runner is the only recorded
+	 * owner and runner death makes the slot reclaimable.
+	 */
+	bindChild: (pid: number) => Promise<void>;
 	/** Idempotent: repeated calls return the same settled promise. */
 	release: () => Promise<void>;
 }>;
@@ -71,7 +128,7 @@ type TicketRecord = Readonly<{
 	workflowId: string;
 	childId: string;
 	depth: ChildDepth;
-	canNest: boolean;
+	capacityClass: CapacityClass;
 	owner: OwnerIdentity;
 	createdAt: string;
 }>;
@@ -83,15 +140,26 @@ type LeaseRecord = Readonly<{
 	workflowId: string;
 	childId: string;
 	depth: ChildDepth;
-	canNest: boolean;
+	capacityClass: CapacityClass;
 	owner: OwnerIdentity;
 	acquiredAt: string;
+	child?: OwnerIdentity;
+	childBoundAt?: string;
 }>;
+
+type LockRecord = Readonly<{ nonce: string; owner: OwnerIdentity }>;
+type ClaimRecord = Readonly<{ lockNonce: string; owner: OwnerIdentity }>;
 
 type Liveness = "live" | "dead" | "unknown";
 type LivenessCache = Map<string, Liveness>;
 
 const execFileAsync = promisify(execFile);
+
+function corruptStateError(what: string): Error {
+	return new Error(
+		`scheduler state is corrupt: ${what}; failing closed without resetting or deleting state`,
+	);
+}
 
 function errnoCode(error: unknown): string | undefined {
 	if (typeof error === "object" && error !== null && "code" in error && typeof error.code === "string") {
@@ -141,6 +209,7 @@ async function probeStartToken(pid: number): Promise<StartTokenProbe> {
 		if (startTime === undefined || !/^\d+$/u.test(startTime)) return { kind: "unknown" };
 		return { kind: "token", token: `linux-starttime:${startTime}` };
 	}
+	// Unsupported liveness (e.g. Windows) fails closed as unknown.
 	if (process.platform === "win32") return { kind: "unknown" };
 	try {
 		const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "lstart="]);
@@ -186,6 +255,13 @@ async function ownerLiveness(owner: OwnerIdentity, cache: LivenessCache): Promis
 	return liveness;
 }
 
+/** A lease is reclaimable only when every recorded owner is proven dead. */
+async function leaseIsReclaimable(lease: LeaseRecord, cache: LivenessCache): Promise<boolean> {
+	if (await ownerLiveness(lease.owner, cache) !== "dead") return false;
+	if (lease.child === undefined) return true;
+	return await ownerLiveness(lease.child, cache) === "dead";
+}
+
 // --- Record parsing (files cross process boundaries) ----------------------
 
 function parseOwner(value: unknown): OwnerIdentity | undefined {
@@ -200,27 +276,33 @@ function parseDepth(value: unknown): ChildDepth | undefined {
 	return value === 1 || value === 2 ? value : undefined;
 }
 
+function parseCapacityClass(value: unknown): CapacityClass | undefined {
+	return value === "reserved" || value === "terminal" ? value : undefined;
+}
+
 type RecordBody = Readonly<{
 	seq: number;
 	nonce: string;
 	workflowId: string;
 	childId: string;
 	depth: ChildDepth;
-	canNest: boolean;
+	capacityClass: CapacityClass;
 	owner: OwnerIdentity;
 }>;
 
 function parseRecordBody(value: Record<string, unknown>): RecordBody | undefined {
 	const owner = parseOwner(value.owner);
 	const depth = parseDepth(value.depth);
-	const { seq, nonce, workflowId, childId, canNest } = value;
-	if (owner === undefined || depth === undefined) return undefined;
+	const capacityClass = parseCapacityClass(value.capacityClass);
+	const { seq, nonce, workflowId, childId } = value;
+	if (owner === undefined || depth === undefined || capacityClass === undefined) return undefined;
+	// Depth-2 work is terminal by construction; a reserved depth-2 record is corrupt.
+	if (depth === 2 && capacityClass !== "terminal") return undefined;
 	if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq <= 0) return undefined;
 	if (typeof nonce !== "string" || nonce === "") return undefined;
 	if (typeof workflowId !== "string" || workflowId === "") return undefined;
 	if (typeof childId !== "string" || childId === "") return undefined;
-	if (typeof canNest !== "boolean") return undefined;
-	return { seq, nonce, workflowId, childId, depth, canNest, owner };
+	return { seq, nonce, workflowId, childId, depth, capacityClass, owner };
 }
 
 function parseTicket(value: unknown): TicketRecord | undefined {
@@ -234,10 +316,14 @@ function parseLease(value: unknown): LeaseRecord | undefined {
 	if (!isRecord(value) || value.schemaVersion !== LEASE_SCHEMA) return undefined;
 	const body = parseRecordBody(value);
 	if (body === undefined || typeof value.acquiredAt !== "string") return undefined;
-	return { schemaVersion: LEASE_SCHEMA, ...body, acquiredAt: value.acquiredAt };
+	const base: LeaseRecord = { schemaVersion: LEASE_SCHEMA, ...body, acquiredAt: value.acquiredAt };
+	if (value.child === undefined) return base;
+	const child = parseOwner(value.child);
+	if (child === undefined || typeof value.childBoundAt !== "string") return undefined;
+	return { ...base, child, childBoundAt: value.childBoundAt };
 }
 
-function parseLockOwner(raw: string): OwnerIdentity | undefined {
+function parseLockRecord(raw: string): LockRecord | undefined {
 	let value: unknown;
 	try {
 		value = JSON.parse(raw);
@@ -245,15 +331,102 @@ function parseLockOwner(raw: string): OwnerIdentity | undefined {
 		return undefined;
 	}
 	if (!isRecord(value) || value.schemaVersion !== LOCK_SCHEMA) return undefined;
-	return parseOwner(value);
+	const owner = parseOwner(value.owner);
+	if (owner === undefined || typeof value.nonce !== "string" || value.nonce === "") return undefined;
+	return { nonce: value.nonce, owner };
+}
+
+function parseClaimRecord(raw: string): ClaimRecord | undefined {
+	let value: unknown;
+	try {
+		value = JSON.parse(raw);
+	} catch {
+		return undefined;
+	}
+	if (!isRecord(value) || value.schemaVersion !== CLAIM_SCHEMA) return undefined;
+	const owner = parseOwner(value.owner);
+	if (owner === undefined || typeof value.lockNonce !== "string" || value.lockNonce === "") return undefined;
+	return { lockNonce: value.lockNonce, owner };
 }
 
 // --- Filesystem primitives -------------------------------------------------
 
-async function atomicWriteFile(path: string, content: string): Promise<void> {
+/** Write the complete content, fsync it, then atomically rename into place. */
+async function writeFileAtomic(path: string, content: string): Promise<void> {
 	const temporary = `${path}.tmp-${randomBytes(6).toString("hex")}`;
-	await writeFile(temporary, content, { mode: 0o600 });
+	const handle = await open(temporary, "wx", 0o600);
+	try {
+		await handle.writeFile(content);
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
 	await rename(temporary, path);
+}
+
+/**
+ * Atomically publish a complete record at `path` only if nothing exists there.
+ * Uses temp file + fsync + hard link so a partial record is never observable.
+ * Returns false when the path is already occupied.
+ */
+async function publishExclusive(path: string, content: string): Promise<boolean> {
+	const temporary = `${path}.pub-${randomBytes(6).toString("hex")}`;
+	const handle = await open(temporary, "wx", 0o600);
+	try {
+		await handle.writeFile(content);
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+	try {
+		await link(temporary, path);
+		return true;
+	} catch (error) {
+		if (errnoCode(error) === "EEXIST") return false;
+		throw error;
+	} finally {
+		await rm(temporary, { force: true });
+	}
+}
+
+type TextRead =
+	| Readonly<{ kind: "text"; text: string }>
+	| Readonly<{ kind: "missing" }>
+	| Readonly<{ kind: "unreadable" }>;
+
+/** Read a file without following a symlinked final component. */
+async function readTextNoFollow(path: string): Promise<TextRead> {
+	const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+	let handle;
+	try {
+		handle = await open(path, constants.O_RDONLY | noFollow);
+	} catch (error) {
+		if (errnoCode(error) === "ENOENT") return { kind: "missing" };
+		return { kind: "unreadable" };
+	}
+	try {
+		return { kind: "text", text: await handle.readFile({ encoding: "utf8" }) };
+	} catch {
+		return { kind: "unreadable" };
+	} finally {
+		await handle.close();
+	}
+}
+
+type JsonFileRead =
+	| Readonly<{ kind: "value"; value: unknown }>
+	| Readonly<{ kind: "missing" }>
+	| Readonly<{ kind: "invalid" }>;
+
+async function readJsonFile(path: string): Promise<JsonFileRead> {
+	const read = await readTextNoFollow(path);
+	if (read.kind === "missing") return { kind: "missing" };
+	if (read.kind === "unreadable") return { kind: "invalid" };
+	try {
+		return { kind: "value", value: JSON.parse(read.text) };
+	} catch {
+		return { kind: "invalid" };
+	}
 }
 
 async function readDirOrEmpty(path: string): Promise<readonly string[]> {
@@ -265,53 +438,99 @@ async function readDirOrEmpty(path: string): Promise<readonly string[]> {
 	}
 }
 
-type JsonFileRead =
-	| Readonly<{ kind: "value"; value: unknown }>
-	| Readonly<{ kind: "missing" }>
-	| Readonly<{ kind: "invalid" }>;
+const SCHEDULER_SUBDIRS = ["tickets", "leases", "lock-claims"] as const;
 
-async function readJsonFile(path: string): Promise<JsonFileRead> {
-	let raw: string;
-	try {
-		raw = await readFile(path, "utf8");
-	} catch (error) {
-		if (errnoCode(error) === "ENOENT") return { kind: "missing" };
-		return { kind: "invalid" };
-	}
-	try {
-		return { kind: "value", value: JSON.parse(raw) };
-	} catch {
-		return { kind: "invalid" };
-	}
-}
-
+/**
+ * Create scheduler directories and validate realpath containment: the root
+ * itself and every subdirectory must be real directories, not symlinks, and
+ * each subdirectory must resolve inside the resolved root.
+ */
 async function ensureSchedulerDirs(root: AbsolutePath): Promise<void> {
-	await mkdir(join(root, "tickets"), { recursive: true, mode: 0o700 });
-	await mkdir(join(root, "leases"), { recursive: true, mode: 0o700 });
+	let rootStat;
+	try {
+		rootStat = await lstat(root);
+	} catch (error) {
+		if (errnoCode(error) !== "ENOENT") throw error;
+	}
+	if (rootStat === undefined) {
+		await mkdir(root, { recursive: true, mode: 0o700 });
+	} else if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+		throw new Error("scheduler root must be a real directory, not a symlink");
+	}
+	const realRoot = await realpath(root);
+	for (const name of SCHEDULER_SUBDIRS) {
+		const dir = join(root, name);
+		await mkdir(dir, { recursive: true, mode: 0o700 });
+		const stat = await lstat(dir);
+		if (stat.isSymbolicLink() || !stat.isDirectory()) {
+			throw new Error(`scheduler ${name} directory must be a real directory, not a symlink`);
+		}
+		if (await realpath(dir) !== join(realRoot, name)) {
+			throw new Error(`scheduler ${name} directory escapes the scheduler root`);
+		}
+	}
 }
 
 // --- Short exclusive scheduler lock ----------------------------------------
 
-async function breakLockIfOwnerDead(lockPath: string, cache: LivenessCache): Promise<void> {
-	let raw: string;
-	try {
-		raw = await readFile(lockPath, "utf8");
-	} catch {
+type BreakHooks = Readonly<{ afterDeadProof?: () => void | Promise<void> }>;
+
+/**
+ * Break a scheduler lock whose owner is proven dead. Exactly one breaker may
+ * act: it must first win the nonce-specific recovery claim, then re-verify
+ * the lock still carries the proven-dead nonce before removing it. A claim
+ * held by a live (or unknown-liveness) claimer blocks everyone else. A claim
+ * whose claimer is proven dead is retired via unique rename so takeover never
+ * deletes a freshly created claim.
+ */
+async function tryBreakDeadLock(root: AbsolutePath, hooks?: BreakHooks): Promise<void> {
+	const lockPath = join(root, "scheduler.lock");
+	const read = await readTextNoFollow(lockPath);
+	if (read.kind === "missing") return;
+	if (read.kind === "unreadable") throw corruptStateError("scheduler.lock is unreadable");
+	const record = parseLockRecord(read.text);
+	if (record === undefined) throw corruptStateError("scheduler.lock does not parse as a lock record");
+	const cache: LivenessCache = new Map();
+	if (await ownerLiveness(record.owner, cache) !== "dead") return;
+	await hooks?.afterDeadProof?.();
+	const claimPath = join(root, "lock-claims", `${record.nonce}.json`);
+	const claimBody = JSON.stringify({
+		schemaVersion: CLAIM_SCHEMA,
+		lockNonce: record.nonce,
+		owner: { pid: process.pid, startToken: await currentStartToken() },
+	});
+	if (!(await publishExclusive(claimPath, claimBody))) {
+		const claimRead = await readTextNoFollow(claimPath);
+		if (claimRead.kind === "missing") return;
+		if (claimRead.kind === "unreadable") throw corruptStateError("a lock recovery claim is unreadable");
+		const claim = parseClaimRecord(claimRead.text);
+		if (claim === undefined) throw corruptStateError("a lock recovery claim does not parse");
+		// Live or unknown-liveness claimer keeps exclusive breaking rights.
+		if (await ownerLiveness(claim.owner, cache) !== "dead") return;
+		const graveyard = `${claimPath}.gc-${randomBytes(6).toString("hex")}`;
+		try {
+			await rename(claimPath, graveyard);
+		} catch (error) {
+			if (errnoCode(error) === "ENOENT") return;
+			throw error;
+		}
+		await rm(graveyard, { force: true });
 		return;
 	}
-	const owner = parseLockOwner(raw);
-	// Malformed content may be a write in flight; fail closed and keep waiting.
-	if (owner === undefined) return;
-	if (await ownerLiveness(owner, cache) !== "dead") return;
-	// Confirm the exact dead owner still holds the lock before breaking it.
-	let confirm: string;
 	try {
-		confirm = await readFile(lockPath, "utf8");
-	} catch {
-		return;
+		// Holding the claim, confirm the lock still carries the proven-dead
+		// nonce. A different nonce means the dead lock was already broken and
+		// a new live lock exists; it must not be touched.
+		const confirm = await readTextNoFollow(lockPath);
+		if (confirm.kind === "missing") return;
+		if (confirm.kind === "unreadable") throw corruptStateError("scheduler.lock is unreadable");
+		const current = parseLockRecord(confirm.text);
+		if (current === undefined) throw corruptStateError("scheduler.lock does not parse as a lock record");
+		if (current.nonce !== record.nonce) return;
+		await rm(lockPath, { force: true });
+	} finally {
+		await rm(claimPath, { force: true });
 	}
-	if (confirm !== raw) return;
-	await rm(lockPath, { force: true });
 }
 
 async function withSchedulerLock<T>(
@@ -322,24 +541,20 @@ async function withSchedulerLock<T>(
 	const lockPath = join(root, "scheduler.lock");
 	const body = JSON.stringify({
 		schemaVersion: LOCK_SCHEMA,
-		pid: process.pid,
-		startToken: await currentStartToken(),
 		nonce: randomBytes(8).toString("hex"),
+		owner: { pid: process.pid, startToken: await currentStartToken() },
 	});
 	for (;;) {
 		signal.throwIfAborted();
-		try {
-			await writeFile(lockPath, body, { flag: "wx", mode: 0o600 });
-			break;
-		} catch (error) {
-			if (errnoCode(error) !== "EEXIST") throw error;
-		}
-		await breakLockIfOwnerDead(lockPath, new Map());
+		if (await publishExclusive(lockPath, body)) break;
+		await tryBreakDeadLock(root);
 		await sleep(LOCK_RETRY_MS, undefined, { signal });
 	}
 	try {
 		return await fn();
 	} finally {
+		// Safe blind removal: a live owner's lock is never broken, so the path
+		// still holds this process's lock record.
 		await rm(lockPath, { force: true });
 	}
 }
@@ -370,7 +585,7 @@ async function collectLeases(root: AbsolutePath, cache: LivenessCache): Promise<
 			opaqueCount += 1;
 			continue;
 		}
-		if (await ownerLiveness(lease.owner, cache) === "dead") {
+		if (await leaseIsReclaimable(lease, cache)) {
 			await rm(path, { force: true });
 			continue;
 		}
@@ -410,26 +625,42 @@ function ticketFileName(ticket: TicketRecord): string {
 	return `${String(ticket.seq).padStart(12, "0")}-${ticket.nonce}.json`;
 }
 
+/**
+ * Advance the FIFO sequence. A missing file with no existing records means a
+ * fresh scheduler root; a missing file alongside records, or an unparsable or
+ * non-positive value, is corruption and fails closed. It never resets.
+ */
 async function nextSequence(root: AbsolutePath): Promise<number> {
 	const path = join(root, "seq");
-	let current = 0;
-	try {
-		const raw = await readFile(path, "utf8");
-		const parsed = Number.parseInt(raw.trim(), 10);
-		if (Number.isSafeInteger(parsed) && parsed > 0) current = parsed;
-	} catch (error) {
-		if (errnoCode(error) !== "ENOENT") throw error;
+	const read = await readTextNoFollow(path);
+	let current: number;
+	if (read.kind === "missing") {
+		const tickets = await jsonFileNames(join(root, "tickets"));
+		const leases = await jsonFileNames(join(root, "leases"));
+		if (tickets.length > 0 || leases.length > 0) {
+			throw corruptStateError("the sequence file is missing while tickets or leases exist");
+		}
+		current = 0;
+	} else if (read.kind === "unreadable") {
+		throw corruptStateError("the sequence file is unreadable");
+	} else {
+		const trimmed = read.text.trim();
+		const parsed = Number.parseInt(trimmed, 10);
+		if (!/^\d+$/u.test(trimmed) || !Number.isSafeInteger(parsed) || parsed <= 0) {
+			throw corruptStateError("the sequence file does not hold a positive integer");
+		}
+		current = parsed;
 	}
 	const next = current + 1;
-	await atomicWriteFile(path, String(next));
+	await writeFileAtomic(path, String(next));
 	return next;
 }
 
 // --- Admission --------------------------------------------------------------
 
-function makeRelease(root: AbsolutePath, nonce: string): () => Promise<void> {
+function makeLease(root: AbsolutePath, nonce: string): ChildSlotLease {
 	let released: Promise<void> | undefined;
-	return () => {
+	const release = (): Promise<void> => {
 		released ??= (async () => {
 			const detached = new AbortController();
 			await withSchedulerLock(root, detached.signal, async () => {
@@ -438,6 +669,33 @@ function makeRelease(root: AbsolutePath, nonce: string): () => Promise<void> {
 		})();
 		return released;
 	};
+	const bindChild = async (pid: number): Promise<void> => {
+		if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("child pid must be a positive integer");
+		if (released !== undefined) throw new Error("cannot bind a child to a released lease");
+		const probe = await probeStartToken(pid);
+		// An unprovable start token records unknown liveness, which occupies
+		// the slot until an explicit release. Fail closed, never fail open.
+		const startToken = probe.kind === "token" ? probe.token : UNPROVABLE_START_TOKEN;
+		const detached = new AbortController();
+		await withSchedulerLock(root, detached.signal, async () => {
+			const path = join(root, "leases", `${nonce}.json`);
+			const read = await readJsonFile(path);
+			if (read.kind !== "value") {
+				throw new Error("cannot bind a child: the lease record is missing or corrupt");
+			}
+			const lease = parseLease(read.value);
+			if (lease === undefined || lease.nonce !== nonce) {
+				throw new Error("cannot bind a child: the lease record is missing or corrupt");
+			}
+			const updated: LeaseRecord = {
+				...lease,
+				child: { pid, startToken },
+				childBoundAt: new Date().toISOString(),
+			};
+			await writeFileAtomic(path, JSON.stringify(updated));
+		});
+	};
+	return { leaseId: nonce, bindChild, release };
 }
 
 async function tryAdmit(root: AbsolutePath, ticket: TicketRecord): Promise<ChildSlotLease | undefined> {
@@ -451,15 +709,18 @@ async function tryAdmit(root: AbsolutePath, ticket: TicketRecord): Promise<Child
 	}
 	// Opaque leases fail closed: they occupy a slot and the nesting reserve.
 	const activeCount = leases.active.length + leases.opaqueCount;
-	const nestingHeld =
-		leases.active.filter((lease) => lease.depth === 1 && lease.canNest).length + leases.opaqueCount;
-	const admissible = (candidate: Readonly<{ depth: ChildDepth; canNest: boolean }>): boolean =>
+	const reservedHeld =
+		leases.active.filter((lease) => lease.capacityClass === "reserved").length + leases.opaqueCount;
+	const admissible = (candidate: Readonly<{ capacityClass: CapacityClass }>): boolean =>
 		activeCount < MAX_ACTIVE_CHILDREN &&
-		!(candidate.depth === 1 && candidate.canNest && nestingHeld >= MAX_NESTING_CAPABLE_CHILDREN);
+		!(candidate.capacityClass === "reserved" && reservedHeld >= MAX_NESTING_CAPABLE_CHILDREN);
 	if (!admissible(ticket)) return undefined;
 	for (const earlier of tickets.pending) {
 		if (earlier.seq >= ticket.seq) break;
-		const bypassable = ticket.depth === 2 && earlier.depth === 1 && earlier.canNest && !admissible(earlier);
+		const bypassable =
+			ticket.capacityClass === "terminal" &&
+			earlier.capacityClass === "reserved" &&
+			!admissible(earlier);
 		if (bypassable) continue;
 		return undefined;
 	}
@@ -470,13 +731,13 @@ async function tryAdmit(root: AbsolutePath, ticket: TicketRecord): Promise<Child
 		workflowId: ticket.workflowId,
 		childId: ticket.childId,
 		depth: ticket.depth,
-		canNest: ticket.canNest,
+		capacityClass: ticket.capacityClass,
 		owner: ticket.owner,
 		acquiredAt: new Date().toISOString(),
 	};
-	await atomicWriteFile(join(root, "leases", `${ticket.nonce}.json`), JSON.stringify(lease));
+	await writeFileAtomic(join(root, "leases", `${ticket.nonce}.json`), JSON.stringify(lease));
 	await rm(join(root, "tickets", ticketFileName(ticket)), { force: true });
-	return { leaseId: ticket.nonce, release: makeRelease(root, ticket.nonce) };
+	return makeLease(root, ticket.nonce);
 }
 
 async function removeTicketBestEffort(root: AbsolutePath, ticket: TicketRecord): Promise<void> {
@@ -491,13 +752,14 @@ async function removeTicketBestEffort(root: AbsolutePath, ticket: TicketRecord):
 /**
  * Acquire one session-wide child Pi slot, waiting FIFO behind earlier tickets.
  * Resolves with an idempotent release once a slot is granted; rejects with the
- * abort reason if the signal fires first, removing the queued ticket.
+ * abort reason if the signal fires first, removing the queued ticket. An abort
+ * that races admission releases the just-granted lease and still rejects.
  */
 export async function acquireChildSlot(input: AcquireChildSlotInput): Promise<ChildSlotLease> {
-	const { schedulerRoot, workflowId, childId, depth, canNest, signal } = input;
+	const { schedulerRoot, workflowId, childId, work, signal } = input;
 	if (workflowId === "") throw new Error("workflowId must not be empty");
 	if (childId === "") throw new Error("childId must not be empty");
-	if (depth === 2 && canNest) throw new Error("depth-2 children are terminal and cannot nest");
+	const capacityClass = capacityClassOf(work);
 	signal.throwIfAborted();
 	await ensureSchedulerDirs(schedulerRoot);
 	const owner: OwnerIdentity = { pid: process.pid, startToken: await currentStartToken() };
@@ -510,18 +772,27 @@ export async function acquireChildSlot(input: AcquireChildSlotInput): Promise<Ch
 			nonce,
 			workflowId,
 			childId,
-			depth,
-			canNest,
+			depth: work.depth,
+			capacityClass,
 			owner,
 			createdAt: new Date().toISOString(),
 		};
-		await atomicWriteFile(join(schedulerRoot, "tickets", ticketFileName(record)), JSON.stringify(record));
+		await writeFileAtomic(join(schedulerRoot, "tickets", ticketFileName(record)), JSON.stringify(record));
 		return record;
 	});
 	try {
 		for (;;) {
 			const admitted = await withSchedulerLock(schedulerRoot, signal, () => tryAdmit(schedulerRoot, ticket));
-			if (admitted !== undefined) return admitted;
+			if (admitted !== undefined) {
+				await input.__testHooks?.afterAdmission?.();
+				// Recheck the signal after admission: an abort that raced the
+				// grant must not leak the lease.
+				if (signal.aborted) {
+					await admitted.release();
+					signal.throwIfAborted();
+				}
+				return admitted;
+			}
 			await sleep(POLL_INTERVAL_MS, undefined, { signal });
 		}
 	} catch (error) {
@@ -529,3 +800,11 @@ export async function acquireChildSlot(input: AcquireChildSlotInput): Promise<Ch
 		throw error;
 	}
 }
+
+/** Test-only access to internal primitives. Production code must not use it. */
+export const __schedulerInternalsForTesting = {
+	ensureSchedulerDirs,
+	tryBreakDeadLock,
+	publishExclusive,
+	currentStartToken,
+} as const;
