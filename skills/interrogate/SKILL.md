@@ -33,7 +33,7 @@ Write one clear paragraph. Reviewers challenge whether the work achieves the int
 
 ## Step 3, Spawn Reviewers
 
-Launch all reviewers in a single message using the dstack_task tool. Use the `interrogate reviewers` list from `~/.pi/agent/dstack/models.json` when present, one reviewer per entry, extending or shrinking the Reviewer A/B/C/D labels below to the configured entry count; otherwise use the table defaults.
+Launch all reviewers in one parallel `dstack_task` call. Use the `interrogate reviewers` list from `~/.pi/agent/dstack/models.json` when present, one reviewer per entry, extending or shrinking the Reviewer A/B/C/D labels below to the configured entry count; otherwise use the table defaults.
 
 | Subagent | Default model |
 |----------|---------------|
@@ -47,6 +47,8 @@ For each reviewer:
 - `model`: the configured `interrogate reviewers` entry, or the table default with no configured line
 - `dmode: false`
 - `tools: "read,grep,find,ls"`
+
+`dstack_task` returns a `taskId` immediately; the parent may do independent work.
 
 If a model slug is rejected as unresolvable when you try to spawn the subagent, check the valid slugs in the dstack_task tool's error message, pick the closest equivalent (prefer the highest-reasoning tier of the same family), spawn with the valid slug, and open a separate PR to update the configured value or default table. Do not block the review on the slug issue. If the configured value is `inherit-parent` or `auto`, omit `model` instead; never treat those aliases as broken slugs or enter this fallback for them.
 
@@ -62,7 +64,7 @@ Each reviewer produces structured findings as described in the prompt template.
 
 ## Step 4, Synthesize
 
-As results come back, build a unified picture:
+Wait for the background completion notification without polling, then call `dstack_result` once with `taskId`. As results come back, build a unified picture:
 
 1. **Parse all findings** from the reviewers
 2. **Identify consensus**. Findings raised by 2+ models independently are highest signal.

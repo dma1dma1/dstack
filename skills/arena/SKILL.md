@@ -30,7 +30,7 @@ The N candidates will receive the same prompt, so the prompt is the contract. Ge
 
 ## Phase B: Fan out
 
-Spawn all N children in one message with `dstack_task`, each with the task, the path to the shared grounding, its own output path, and instructions to produce both the artifact and a short rationale.
+Spawn all N children in one parallel `dstack_task` call, each with the task, the path to the shared grounding, its own output path, and instructions to produce both the artifact and a short rationale. `dstack_task` returns a `taskId` immediately; the parent may do independent work.
 
 The rationale is mandatory. Without it, the parent cannot tell whether a candidate's structure is principled or accidental, which makes Phase E grafting unreliable. Each rationale names the alternatives the candidate considered and what it rejected.
 
@@ -38,7 +38,7 @@ If a candidate fails to produce output, proceed with N-1 and note the dropout in
 
 ## Phase C: Cross-judge
 
-After all Phase B candidates complete, choose one model from the `arena cross-judge pool` in `~/.pi/agent/dstack/models.json` when present. Otherwise use inherit-parent, inherit-parent, inherit-parent, inherit-parent. Prefer a different model family from the parent's. Spawn one readonly judge subagent on that model. It sees the rubric and the candidates by path label, scores each criterion, and recommends a base with rationale. It runs in parallel with the parent's reading in Phase D, not with the candidates themselves. Spawning while candidates are still writing means the judge sees partial or empty outputs and reports them as dropouts.
+After all Phase B candidates complete (wait for the background completion notification without polling, then call `dstack_result` once with `taskId` if needed), choose one model from the `arena cross-judge pool` in `~/.pi/agent/dstack/models.json` when present. Otherwise use inherit-parent, inherit-parent, inherit-parent, inherit-parent. Prefer a different model family from the parent's. Spawn one readonly judge subagent on that model with `dstack_task`. `dstack_task` returns a `taskId` immediately; the parent may do independent work in Phase D. Wait for the background completion notification without polling, then call `dstack_result` once with `taskId`. It sees the rubric and the candidates by path label, scores each criterion, and recommends a base with rationale. It runs in parallel with the parent's reading in Phase D, not with the candidates themselves. Spawning while candidates are still writing means the judge sees partial or empty outputs and reports them as dropouts.
 
 ## Phase D: Pick a base
 

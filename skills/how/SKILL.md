@@ -42,12 +42,14 @@ Decompose the question into 2-4 parallel exploration angles, each a distinct sli
 
 The right decomposition depends on the question. Use your judgment. Narrow questions: 2 explorers is fine. Broad subsystems: up to 4.
 
-Spawn all explorers in a single message:
+Spawn all explorers in one parallel `dstack_task` call:
 
 - `agent`: `general-purpose`
 - `model`: your configured how-explorer model (or inherit-parent if unset)
 - `dmode: false`
 - `tools: "read,grep,find,ls"`
+
+`dstack_task` returns a `taskId` immediately; the parent may do independent work.
 
 Each explorer gets the same base prompt from `references/explorer-prompt.md` plus a specific exploration angle naming its slice. Each explorer should:
 - Start broad: Glob for relevant directories, Grep for key types/interfaces/class names
@@ -62,12 +64,14 @@ Then proceed to Step 3.
 
 ### Step 2b. Direct Explain (simple questions)
 
-Spawn a single dstack_task subagent that explores and explains in one pass:
+Spawn a single `dstack_task` subagent that explores and explains in one pass:
 
 - `agent`: `general-purpose`
 - `model`: your configured how-explainer model (or inherit-parent if unset)
 - `dmode: false`
 - `tools: "read,grep,find,ls"`
+
+`dstack_task` returns a `taskId` immediately; the parent may do independent work. Wait for the background completion notification without polling, then call `dstack_result` once with `taskId`.
 
 The agent does its own exploration (Glob, Grep, Read) and writes the explanation directly. Read `references/explainer-prompt.md` for the communication style and output format. Same structure, just no explorer findings as input.
 
@@ -75,12 +79,14 @@ Proceed to Step 4.
 
 ### Step 3. Synthesize (complex questions only)
 
-Once all explorers return, spawn a single dstack_task subagent to synthesize their findings into one coherent explanation:
+Wait for the background completion notification from Step 2a without polling, then call `dstack_result` once with `taskId`. Spawn a single `dstack_task` subagent to synthesize their findings into one coherent explanation:
 
 - `agent`: `general-purpose`
 - `model`: your configured how-explainer model (or inherit-parent if unset)
 - `dmode: false`
 - `tools: "read,grep,find,ls"`
+
+`dstack_task` returns a `taskId` immediately; the parent may do independent work. Wait for the background completion notification without polling, then call `dstack_result` once with `taskId`.
 
 The explainer gets all explorers' findings and writes the human-facing explanation (output format below). Read `references/explainer-prompt.md` for the full prompt template. The explainer reconciles overlapping findings, resolves contradictions, and weaves the slices into a unified picture.
 
@@ -112,13 +118,15 @@ Run the full explain flow above (Steps 1-4). You must understand the architectur
 
 ### Step 2. Spawn Critics
 
-After the explanation is complete, spawn one architectural critic per model in your configured how-critics list (defaults the list for that role in models.json), all in a single message.
+After the explanation is complete, spawn one architectural critic per model in your configured how-critics list (defaults the list for that role in models.json), all in one parallel `dstack_task` call.
 
 For each critic:
 - `agent`: `general-purpose`
 - `model`: one model from the configured how-critics list. These are minimum reasoning levels. The lead should escalate any model when the architecture warrants deeper analysis.
 - `dmode: false`
 - `tools: "read,grep,find,ls"`
+
+`dstack_task` returns a `taskId` immediately; the parent may do independent work. Wait for the background completion notification without polling, then call `dstack_result` once with `taskId`.
 
 Read `references/critic-prompt.md` for the prompt template. Each critic gets:
 1. The explanation from Step 1 (so they don't re-explore)
