@@ -162,14 +162,14 @@ function taskUsageRows(details: unknown): TaskUsageRow[] {
 	return rows;
 }
 
-type TaskResult = ChildResult & {
+export type TaskResult = ChildResult & {
 	agent: string;
 	cwd: string;
 	task: string;
 	step?: number;
 };
 
-type TaskDetails = {
+export type TaskDetails = {
 	mode: "single" | "parallel" | "chain";
 	results: TaskResult[];
 };
@@ -261,17 +261,43 @@ function formatToolUpdate(part: Extract<ChildContentPart, { type: "toolUpdate" }
 	return lines.join("\n");
 }
 
-function activityLines(result: TaskResult, expanded: boolean): string[] {
-	const parts = result.messages.flatMap((message) =>
+function activityParts(result: TaskResult): ChildContentPart[] {
+	return result.messages.flatMap((message) =>
 		message.role === "assistant" || message.role === "activity" ? message.content : [],
 	);
-	const shown = expanded ? parts : parts.slice(-5);
+}
+
+function activityLines(result: TaskResult): string[] {
 	const lines: string[] = [];
-	if (!expanded && parts.length > shown.length) lines.push(`... ${parts.length - shown.length} earlier items`);
-	for (const part of shown) {
+	for (const part of activityParts(result)) {
 		if (part.type === "toolCall") lines.push(`→ ${formatToolCall(part)}`);
 		else if (part.type === "toolUpdate") lines.push(formatToolUpdate(part));
-		else lines.push(...part.text.split("\n").slice(0, expanded ? undefined : 3));
+		else lines.push(...part.text.split("\n"));
+	}
+	return lines;
+}
+
+function oneLine(text: string, limit = 100): string {
+	const line = text.split("\n").find((candidate) => candidate.trim())?.trim() ?? "";
+	return line.length > limit ? `${line.slice(0, limit - 3)}...` : line;
+}
+
+export function latestActivity(result: TaskResult): string {
+	const part = activityParts(result).at(-1);
+	if (!part) return result.exitCode === -1 ? "running" : oneLine(result.text) || "no output";
+	if (part.type === "toolCall") return `→ ${formatToolCall(part)}`;
+	if (part.type === "toolUpdate") return `↳ ${part.name}: ${oneLine(part.text, 72)}`;
+	return oneLine(part.text) || (result.exitCode === -1 ? "running" : "no output");
+}
+
+export function agentDockLines(runs: Iterable<TaskDetails>): string[] {
+	const details = [...runs];
+	const results = details.flatMap((run) => run.results);
+	const running = results.filter((result) => result.exitCode === -1).length;
+	const lines = [`dstack agents  ${running} running`];
+	for (const result of results) {
+		const icon = result.exitCode === -1 ? "⏳" : result.exitCode === 0 ? "✓" : "✗";
+		lines.push(`  ${icon} ${result.agent}  ${latestActivity(result)}`);
 	}
 	return lines;
 }
@@ -317,6 +343,16 @@ export default function dstack(pi: ExtensionAPI) {
 	let todos: TodoState = { items: [] };
 	let sessionId = "unknown";
 	let pendingContinuation: { sessionId: string; tasks: TodoSnapshot[] } | undefined;
+	const activeTaskRuns = new Map<string, TaskDetails>();
+
+	function updateAgentDock(ctx: ExtensionContext) {
+		if (ctx.mode !== "tui") return;
+		ctx.ui.setWidget(
+			"dstack-agents",
+			activeTaskRuns.size > 0 ? agentDockLines(activeTaskRuns.values()) : undefined,
+			{ placement: "belowEditor" },
+		);
+	}
 
 	function persistMode() {
 		pi.appendEntry(MODE_ENTRY, mode);
@@ -399,8 +435,10 @@ export default function dstack(pi: ExtensionAPI) {
 		);
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (_event, ctx) => {
 		pendingContinuation = undefined;
+		activeTaskRuns.clear();
+		updateAgentDock(ctx);
 	});
 
 	pi.on("session_before_tree", async () => {
@@ -499,15 +537,20 @@ export default function dstack(pi: ExtensionAPI) {
 			for (const task of details.results) {
 				const icon = task.exitCode === -1 ? "⏳" : task.exitCode === 0 ? "✓" : "✗";
 				const step = task.step ? `Step ${task.step}: ` : "";
-				rows.push(`\n─── ${step}${task.agent} ${icon}`);
-				if (expanded) rows.push(`Task: ${task.task}`, `cwd: ${task.cwd}`);
-				const activity = activityLines(task, expanded);
+				if (!expanded) {
+					const usage = formatUsageStats(task.usage, task.model);
+					const summary = task.exitCode !== -1 && usage ? `: ${usage}` : `  ${latestActivity(task)}`;
+					rows.push(`${icon} ${step}${task.agent}${summary}`);
+					continue;
+				}
+				rows.push(`\n─── ${step}${task.agent} ${icon}`, `Task: ${task.task}`, `cwd: ${task.cwd}`);
+				const activity = activityLines(task);
 				if (activity.length) rows.push(...activity);
 				else rows.push(task.exitCode === -1 ? "(running...)" : task.text || "(no output)");
 				const usage = formatUsageStats(task.usage, task.model);
 				if (usage) rows.push(`${task.agent}: ${usage}`);
 			}
-			if (!expanded) rows.push("\n(expand for details)");
+			if (!expanded) rows.push("(Ctrl+O for details)");
 			return new Text(rows.join("\n"), 0, 0);
 		},
 		async execute(_id, params, signal, onUpdate, ctx) {
@@ -536,6 +579,8 @@ export default function dstack(pi: ExtensionAPI) {
 			};
 			const publish = () => {
 				const snapshot = cloneDetails(details);
+				activeTaskRuns.set(_id, snapshot);
+				updateAgentDock(ctx);
 				onUpdate?.(textResult(progressText(snapshot), snapshot));
 			};
 			publish();
@@ -628,6 +673,9 @@ export default function dstack(pi: ExtensionAPI) {
 					return textResult(err.message, {}, true);
 				}
 				return textResult(err instanceof Error ? err.message : String(err), {}, true);
+			} finally {
+				activeTaskRuns.delete(_id);
+				updateAgentDock(ctx);
 			}
 		},
 	});
