@@ -126,6 +126,16 @@ function spawnWorker(t: TestContext, options: SpawnOptions): Worker {
 	};
 }
 
+function deferred(): Readonly<{ promise: Promise<void>; resolve: () => void }> {
+	let resolve = (): void => {
+		throw new Error("deferred promise initialized without a resolver");
+	};
+	const promise = new Promise<void>((settle) => {
+		resolve = settle;
+	});
+	return { promise, resolve };
+}
+
 /** Poll for a state to appear. Deterministic: waits for events, never asserts on elapsed time. */
 async function waitForState<T>(what: string, probe: () => Promise<T | undefined>): Promise<T> {
 	const deadline = Date.now() + 30_000;
@@ -659,7 +669,75 @@ test("a live recovery claim blocks every other breaker; only the claim holder ma
 	await assert.rejects(readFile(lockPath, "utf8"), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
 });
 
-test("a recovery claim held by a proven-dead claimer is taken over exactly once", async (t) => {
+test("two stale claim observers cannot steal a replacement claim or admit a fifth lease", async (t) => {
+	const root = await temporaryRoot(t);
+	const held = await Promise.all([
+		acquireTerminal(root, "held-1"),
+		acquireTerminal(root, "held-2"),
+		acquireTerminal(root, "held-3"),
+		acquireTerminal(root, "held-4"),
+	]);
+	assert.equal(held.length, MAX_ACTIVE_CHILDREN);
+
+	const rootAbs = toAbsolutePath(root);
+	const lockPath = join(root, "scheduler.lock");
+	const claimPath = join(root, "lock-claims", "lock-n1.json");
+	const deadLock = JSON.stringify({
+		schemaVersion: LOCK_SCHEMA,
+		nonce: "lock-n1",
+		owner: { pid: process.pid, startToken: MISMATCHED_TOKEN },
+	});
+	const staleClaim = JSON.stringify({
+		schemaVersion: CLAIM_SCHEMA,
+		lockNonce: "lock-n1",
+		owner: { pid: process.pid, startToken: MISMATCHED_TOKEN },
+	});
+	assert.ok(await internals.publishExclusive(lockPath, deadLock));
+	assert.ok(await internals.publishExclusive(claimPath, staleClaim));
+
+	const firstObserved = deferred();
+	const releaseFirst = deferred();
+	const secondObserved = deferred();
+	const releaseSecond = deferred();
+	const first = internals.tryBreakDeadLock(rootAbs, {
+		afterClaimObserved: () => {
+			firstObserved.resolve();
+			return releaseFirst.promise;
+		},
+	});
+	const second = internals.tryBreakDeadLock(rootAbs, {
+		afterClaimObserved: () => {
+			secondObserved.resolve();
+			return releaseSecond.promise;
+		},
+	});
+	await Promise.all([firstObserved.promise, secondObserved.promise]);
+
+	// Both breakers observed the old claim. Let one return, then model the
+	// accepted explicit cleanup and a new breaker claiming the same lock.
+	releaseFirst.resolve();
+	await first;
+	await rm(claimPath);
+	const liveClaim = JSON.stringify({
+		schemaVersion: CLAIM_SCHEMA,
+		lockNonce: "lock-n1",
+		owner: await selfOwner(),
+	});
+	assert.ok(await internals.publishExclusive(claimPath, liveClaim));
+
+	releaseSecond.resolve();
+	await second;
+	assert.equal(await readFile(claimPath, "utf8"), liveClaim, "the replacement claim must survive");
+	assert.equal(await readFile(lockPath, "utf8"), deadLock, "the claimed lock must survive");
+	await assert.rejects(
+		acquireTerminal(root, "fifth", AbortSignal.timeout(300)),
+		(error: Error) => error.name === "TimeoutError" || error.name === "AbortError",
+	);
+	assert.equal((await leaseFiles(root)).length, MAX_ACTIVE_CHILDREN);
+	assert.deepEqual(await leaseChildIds(root), ["held-1", "held-2", "held-3", "held-4"]);
+});
+
+test("a corrupt recovery claim fails closed without changing the claim or lock", async (t) => {
 	const root = await initializedRoot(t);
 	const rootAbs = toAbsolutePath(root);
 	const lockPath = join(root, "scheduler.lock");
@@ -669,20 +747,13 @@ test("a recovery claim held by a proven-dead claimer is taken over exactly once"
 		nonce: "lock-n1",
 		owner: { pid: process.pid, startToken: MISMATCHED_TOKEN },
 	});
-	const deadClaim = JSON.stringify({
-		schemaVersion: CLAIM_SCHEMA,
-		lockNonce: "lock-n1",
-		owner: { pid: process.pid, startToken: MISMATCHED_TOKEN },
-	});
+	const corruptClaim = "{ corrupt claim";
 	assert.ok(await internals.publishExclusive(lockPath, deadLock));
-	assert.ok(await internals.publishExclusive(claimPath, deadClaim));
-	// First pass retires the dead claim; second pass claims and breaks the lock.
-	await internals.tryBreakDeadLock(rootAbs);
-	await assert.rejects(readFile(claimPath, "utf8"), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+	assert.ok(await internals.publishExclusive(claimPath, corruptClaim));
+
+	await assert.rejects(internals.tryBreakDeadLock(rootAbs), /corrupt/);
+	assert.equal(await readFile(claimPath, "utf8"), corruptClaim);
 	assert.equal(await readFile(lockPath, "utf8"), deadLock);
-	await internals.tryBreakDeadLock(rootAbs);
-	await assert.rejects(readFile(lockPath, "utf8"), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
-	assert.deepEqual(await listJsonFiles(join(root, "lock-claims")), []);
 });
 
 // --- Sequence hardening -------------------------------------------------------

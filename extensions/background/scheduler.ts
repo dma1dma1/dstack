@@ -17,7 +17,8 @@ import type { AbsolutePath } from "./artifacts.ts";
  *                            temp file + fsync + link so a partial record is
  *                            never visible
  *   <root>/lock-claims/*.json nonce-specific recovery claims: exactly one
- *                            proven-dead-lock breaker may remove a dead lock
+ *                            proven-dead-lock breaker may remove a dead lock;
+ *                            existing claims require explicit cleanup
  *   <root>/seq               monotonic FIFO ticket counter, mutated under the
  *                            lock; corruption fails closed and never resets
  *   <root>/tickets/*.json    one file per waiting acquisition
@@ -473,15 +474,17 @@ async function ensureSchedulerDirs(root: AbsolutePath): Promise<void> {
 
 // --- Short exclusive scheduler lock ----------------------------------------
 
-type BreakHooks = Readonly<{ afterDeadProof?: () => void | Promise<void> }>;
+type BreakHooks = Readonly<{
+	afterDeadProof?: () => void | Promise<void>;
+	afterClaimObserved?: () => void | Promise<void>;
+}>;
 
 /**
  * Break a scheduler lock whose owner is proven dead. Exactly one breaker may
  * act: it must first win the nonce-specific recovery claim, then re-verify
- * the lock still carries the proven-dead nonce before removing it. A claim
- * held by a live (or unknown-liveness) claimer blocks everyone else. A claim
- * whose claimer is proven dead is retired via unique rename so takeover never
- * deletes a freshly created claim.
+ * the lock still carries the proven-dead nonce before removing it. Any
+ * existing claim blocks every contender, regardless of owner liveness. A
+ * crashed breaker therefore requires explicit cleanup.
  */
 async function tryBreakDeadLock(root: AbsolutePath, hooks?: BreakHooks): Promise<void> {
 	const lockPath = join(root, "scheduler.lock");
@@ -505,16 +508,7 @@ async function tryBreakDeadLock(root: AbsolutePath, hooks?: BreakHooks): Promise
 		if (claimRead.kind === "unreadable") throw corruptStateError("a lock recovery claim is unreadable");
 		const claim = parseClaimRecord(claimRead.text);
 		if (claim === undefined) throw corruptStateError("a lock recovery claim does not parse");
-		// Live or unknown-liveness claimer keeps exclusive breaking rights.
-		if (await ownerLiveness(claim.owner, cache) !== "dead") return;
-		const graveyard = `${claimPath}.gc-${randomBytes(6).toString("hex")}`;
-		try {
-			await rename(claimPath, graveyard);
-		} catch (error) {
-			if (errnoCode(error) === "ENOENT") return;
-			throw error;
-		}
-		await rm(graveyard, { force: true });
+		await hooks?.afterClaimObserved?.();
 		return;
 	}
 	try {
