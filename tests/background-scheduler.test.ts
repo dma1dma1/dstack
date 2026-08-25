@@ -10,11 +10,9 @@ import type { Readable, Writable } from "node:stream";
 import { toAbsolutePath } from "../extensions/background/artifacts.ts";
 import {
 	acquireChildSlot,
-	proveStaticallyNonNesting,
 	MAX_ACTIVE_CHILDREN,
 	__schedulerInternalsForTesting as internals,
 	type ChildDepth,
-	type NonNestingProof,
 } from "../extensions/background/scheduler.ts";
 
 const workerPath = fileURLToPath(new URL("./fixtures/background-scheduler-worker.ts", import.meta.url));
@@ -297,9 +295,9 @@ test("the nesting reserve holds and terminal tickets bypass a blocked reserved t
 	assert.deepEqual(await ticketFiles(root), []);
 });
 
-test("a proven non-nesting depth-1 child may take slot four past a blocked reserved ticket", async (t) => {
+test("a depth-1 allowlist without dstack_task may take slot four past a nested-capable ticket", async (t) => {
 	const root = await temporaryRoot(t);
-	await acquireWorkers(t, root, [
+	const holders = await acquireWorkers(t, root, [
 		{ root, childId: "r1", depth: 1 },
 		{ root, childId: "r2", depth: 1 },
 		{ root, childId: "r3", depth: 1 },
@@ -312,7 +310,17 @@ test("a proven non-nesting depth-1 child may take slot four past a blocked reser
 	await proven.waitForLine("acquired");
 	assert.deepEqual(await leaseChildIds(root), ["r1", "r2", "r3", "t1"]);
 	assert.equal((await ticketFiles(root)).length, 1);
-	void blocked;
+	proven.send("release");
+	await proven.waitForLine("released");
+	const [first, ...rest] = holders;
+	assert.ok(first !== undefined);
+	first.send("release");
+	await first.waitForLine("released");
+	await blocked.waitForLine("acquired");
+	for (const worker of [...rest, blocked]) {
+		worker.send("release");
+		await worker.waitForLine("released");
+	}
 });
 
 test("FIFO order holds under contention", async (t) => {
@@ -813,18 +821,18 @@ test("a symlinked scheduler subdirectory is rejected", async (t) => {
 
 // --- Capacity class construction ----------------------------------------------
 
-test("non-nesting proofs require a reason and forged proofs are rejected", async (t) => {
-	assert.throws(() => proveStaticallyNonNesting("   "), /reason/);
+test("capacity class comes from validated depth and tools, not a caller boolean", async (t) => {
 	const root = await temporaryRoot(t);
-	const forged = { mark: "forged", reason: "nope" } as unknown as NonNestingProof;
-	await assert.rejects(
-		acquireChildSlot({
-			schedulerRoot: toAbsolutePath(root),
-			workflowId: "wf-forged",
-			childId: "forged",
-			work: { depth: 1, nonNesting: forged },
-			signal: new AbortController().signal,
-		}),
-		/proof/,
-	);
+	for (const tools of [[], ["read", ""], ["read", "read"], ["read,grep"]]) {
+		await assert.rejects(
+			acquireChildSlot({
+				schedulerRoot: toAbsolutePath(root),
+				workflowId: "wf-invalid-tools",
+				childId: "invalid",
+				work: { depth: 1, tools },
+				signal: new AbortController().signal,
+			}),
+			/allowlist/,
+		);
+	}
 });

@@ -420,6 +420,7 @@ export async function runChildProcess(input: {
 	env: Record<string, string>;
 	invocation?: ChildInvocation;
 	signal?: AbortSignal;
+	onSpawn?: (pid: number) => void | Promise<void>;
 	onUpdate?: (result: ChildResult) => void;
 	onStdout?: (chunk: Buffer) => void;
 }): Promise<ChildResult> {
@@ -435,7 +436,7 @@ export async function runChildProcess(input: {
 	};
 	const state = { messages: result.messages, result };
 
-	result.exitCode = await new Promise<number>((resolve) => {
+	result.exitCode = await new Promise<number>((resolve, reject) => {
 		const proc = spawn(invocation.command, invocation.args, {
 			cwd: input.cwd,
 			env: input.env,
@@ -443,7 +444,38 @@ export async function runChildProcess(input: {
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		let buffer = "";
-		let wasAborted = false;
+		let wasAborted = input.signal?.aborted === true;
+		let spawnBoundarySettled = false;
+		let closeCode: number | null | undefined;
+		let boundaryError: unknown;
+		let killTimer: NodeJS.Timeout | undefined;
+		proc.stdout.pause();
+
+		const terminate = () => {
+			proc.kill("SIGTERM");
+			killTimer ??= setTimeout(() => {
+				if (proc.exitCode === null) proc.kill("SIGKILL");
+			}, 5000);
+		};
+		const finish = () => {
+			if (!spawnBoundarySettled || closeCode === undefined) return;
+			if (killTimer !== undefined) clearTimeout(killTimer);
+			input.signal?.removeEventListener("abort", abortChild);
+			if (boundaryError !== undefined) {
+				reject(boundaryError);
+				return;
+			}
+			if (buffer.trim()) processLine(buffer);
+			if (wasAborted) {
+				result.stopReason = "aborted";
+				result.errorMessage = "Child agent was aborted";
+			}
+			resolve(closeCode ?? (wasAborted ? 1 : 0));
+		};
+		const abortChild = () => {
+			wasAborted = true;
+			if (spawnBoundarySettled && boundaryError === undefined) terminate();
+		};
 		const processLine = (line: string) => {
 			if (!line.trim()) return;
 			try {
@@ -463,29 +495,41 @@ export async function runChildProcess(input: {
 		proc.stderr.on("data", (data: Buffer) => {
 			result.stderr += data.toString();
 		});
-		proc.on("close", (code) => {
-			if (buffer.trim()) processLine(buffer);
-			if (wasAborted) {
-				result.stopReason = "aborted";
-				result.errorMessage = "Child agent was aborted";
+		proc.on("spawn", () => {
+			const pid = proc.pid;
+			if (pid === undefined) {
+				boundaryError = new Error("spawned child did not expose a pid");
+				spawnBoundarySettled = true;
+				terminate();
+				finish();
+				return;
 			}
-			resolve(code ?? (wasAborted ? 1 : 0));
+			Promise.resolve().then(() => input.onSpawn?.(pid)).then(
+				() => {
+					spawnBoundarySettled = true;
+					if (wasAborted) terminate();
+					else proc.stdout.resume();
+					finish();
+				},
+				(error: unknown) => {
+					boundaryError = error;
+					spawnBoundarySettled = true;
+					terminate();
+					finish();
+				},
+			);
+		});
+		proc.on("close", (code) => {
+			closeCode = code;
+			finish();
 		});
 		proc.on("error", (error) => {
 			result.errorMessage = error.message;
-			resolve(1);
+			spawnBoundarySettled = true;
+			closeCode ??= 1;
+			finish();
 		});
-		if (input.signal) {
-			const killProc = () => {
-				wasAborted = true;
-				proc.kill("SIGTERM");
-				setTimeout(() => {
-					if (proc.exitCode === null) proc.kill("SIGKILL");
-				}, 5000);
-			};
-			if (input.signal.aborted) killProc();
-			else input.signal.addEventListener("abort", killProc, { once: true });
-		}
+		input.signal?.addEventListener("abort", abortChild, { once: true });
 	});
 
 	if (!result.text) result.text = result.errorMessage || result.stderr || "(no output)";

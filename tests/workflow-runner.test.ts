@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { test, type TestContext } from "node:test";
 import { freezePiChildLaunch, type ChildResult } from "../extensions/spawn.ts";
@@ -15,6 +16,7 @@ import {
 	readCommittedWorkflowResult,
 } from "../extensions/background/runner.ts";
 import {
+	createLocalSlotAcquirer,
 	executeWorkflow,
 	type ResolvedChildSpec,
 	type SlotAcquirer,
@@ -88,6 +90,9 @@ test("manifest validation rejects malformed launch facts and mode shapes", async
 	assert.throws(() => parseWorkflowManifest({ ...good, childDepth: 2 }), /childDepth/);
 	assert.throws(() => parseWorkflowManifest({ ...good, piChildLaunch: { executable: "pi", argvPrefix: [] } }), /absolute/);
 	assert.throws(() => parseWorkflowManifest({ ...good, mode: "single", specs: [spec(cwd, "a"), spec(cwd, "b")] }), /one spec/);
+	assert.throws(() => parseWorkflowManifest({ ...good, specs: [spec(cwd, "bad", { tools: "read,,grep" })] }), /empty tool/);
+	assert.throws(() => parseWorkflowManifest({ ...good, specs: [spec(cwd, "bad", { tools: "read,read" })] }), /duplicate/);
+	assert.equal(parseWorkflowManifest({ ...good, specs: [spec(cwd, "ok", { tools: "read, grep" })] }).specs[0].tools, "read,grep");
 });
 
 test("parallel results retain manifest order when children finish in reverse order", async (t) => {
@@ -99,6 +104,7 @@ test("parallel results retain manifest order when children finish in reverse ord
 		"a".repeat(64),
 		new AbortController().signal,
 		{
+			slots: createLocalSlotAcquirer(4),
 			spawnChild: async ({ args }) => {
 				const id = Number(args.at(-1)?.replace("Task: ", ""));
 				await new Promise((resolve) => setTimeout(resolve, (2 - id) * 15));
@@ -169,15 +175,60 @@ test("chain creates worktrees only when their steps become runnable", async (t) 
 	assert.deepEqual(made, ["fail"]);
 });
 
+test("leases release once on child success, failure, spawn error, and binding error", async (t) => {
+	const cwd = await temporaryDirectory(t);
+	for (const scenario of ["success", "failure", "spawn-error", "binding-error"] as const) {
+		let releases = 0;
+		let binds = 0;
+		const slots: SlotAcquirer = {
+			async acquire() {
+				return {
+					bindChild() {
+						binds += 1;
+						if (scenario === "binding-error") throw new Error("binding failed");
+					},
+					release() { releases += 1; },
+				};
+			},
+		};
+		const running = executeWorkflow(
+			manifest({ artifactDir: join(cwd, scenario), cwd, specs: [spec(cwd, scenario)] }),
+			"9".repeat(64),
+			new AbortController().signal,
+			{
+				slots,
+				spawnChild: async (input) => {
+					if (scenario === "spawn-error") throw new Error("spawn failed");
+					await input.onSpawn?.(process.pid);
+					return child(scenario, scenario === "failure" ? 1 : 0);
+				},
+			},
+		);
+		if (scenario === "spawn-error") await assert.rejects(running, /spawn failed/);
+		else if (scenario === "binding-error") await assert.rejects(running, /binding failed/);
+		else await running;
+		assert.equal(binds, scenario === "spawn-error" ? 0 : 1);
+		assert.equal(releases, 1);
+	}
+});
+
 test("cancellation aborts active work, rejects queued slots, and commits cancellation", async (t) => {
 	const cwd = await temporaryDirectory(t);
 	const controller = new AbortController();
 	let active = 0;
+	let releases = 0;
+	let markAcquired = (): void => {
+		throw new Error("acquisition resolver was not initialized");
+	};
+	const acquired = new Promise<void>((resolve) => {
+		markAcquired = resolve;
+	});
 	const slots: SlotAcquirer = {
 		acquire: ({ signal }) => new Promise((resolve, reject) => {
 			if (active === 0) {
 				active += 1;
-				resolve({ release() { active -= 1; } });
+				resolve({ bindChild() {}, release() { active -= 1; releases += 1; } });
+				markAcquired();
 				return;
 			}
 			signal.addEventListener("abort", () => reject(new Error("queue cancelled")), { once: true });
@@ -191,11 +242,13 @@ test("cancellation aborts active work, rejects queued slots, and commits cancell
 			else signal?.addEventListener("abort", () => resolve(child("stopped", 1)), { once: true });
 		}),
 	});
-	await new Promise((resolve) => setTimeout(resolve, 10));
+	await acquired;
 	controller.abort(new Error("test cancellation"));
 	const index = await running;
 	assert.equal(index.outcome, "cancelled");
 	assert.deepEqual(index.children.map((entry) => entry.state), ["cancelled", "cancelled"]);
+	assert.equal(releases, 1);
+	assert.equal(active, 0);
 	await commitWorkflowResult(workflow, index);
 	assert.equal((await readCommittedWorkflowResult(workflow.artifactDir, "e".repeat(64), workflow.workflowId)).outcome, "cancelled");
 });
@@ -221,6 +274,77 @@ test("real runner launches from an unrelated cwd and exits zero after child fail
 	assert.equal(result.stderr, "");
 	const committed = await readCommittedWorkflowResult(artifactDir, sha(bytes), workflow.workflowId);
 	assert.equal(committed.outcome, "failed");
+});
+
+test("concurrent runner processes share one four-child scheduler", async (t) => {
+	const root = await temporaryDirectory(t);
+	const schedulerRoot = join(root, "scheduler");
+	const activeDir = join(root, "active");
+	await mkdir(activeDir, { recursive: true });
+	const fake = join(root, "fake-pi.mjs");
+	await writeFile(
+		fake,
+		[
+			`import { writeFileSync, unlinkSync } from "node:fs";`,
+			`import { join } from "node:path";`,
+			`const marker = join(process.env.DSTACK_TEST_ACTIVE_DIR, String(process.pid));`,
+			`writeFileSync(marker, "active");`,
+			`await new Promise((resolve) => setTimeout(resolve, 1000));`,
+			`const task = process.argv.at(-1).slice(6);`,
+			`process.stdout.write(JSON.stringify({type:"message_end",message:{role:"assistant",content:[{type:"text",text:task}]}}) + "\\n");`,
+			`unlinkSync(marker);`,
+		].join("\n"),
+		{ mode: 0o700 },
+	);
+	const extension = join(root, "extension.ts");
+	await writeFile(extension, "", { mode: 0o600 });
+	const node = await realpath(process.execPath);
+	const fakeReal = await realpath(fake);
+	const extensionReal = await realpath(extension);
+	const runnerCommands = await Promise.all(Array.from({ length: 3 }, async (_, runnerIndex) => {
+		const artifactDir = join(root, `artifacts-${runnerIndex}`);
+		await mkdir(artifactDir, { recursive: true, mode: 0o700 });
+		const tools = { tools: "read,grep" };
+		const specs: [ResolvedChildSpec, ...ResolvedChildSpec[]] = [
+			spec(root, `${runnerIndex}-0`, tools),
+			spec(root, `${runnerIndex}-1`, tools),
+			spec(root, `${runnerIndex}-2`, tools),
+			spec(root, `${runnerIndex}-3`, tools),
+		];
+		const workflow: WorkflowManifestV1 = {
+			...manifest({ artifactDir, cwd: root, mode: "parallel", executable: node, argvPrefix: [fakeReal], specs }),
+			workflowId: `wf-runner-${runnerIndex}-0123456789`,
+			schedulerRoot,
+			extensionPath: extensionReal,
+		};
+		const bytes = Buffer.from(`${JSON.stringify(workflow)}\n`);
+		const manifestPath = join(artifactDir, "manifest.json");
+		await writeFile(manifestPath, bytes, { mode: 0o600 });
+		return {
+			args: ["--experimental-strip-types", runnerPath, "--manifest", manifestPath, "--manifest-sha256", sha(bytes)],
+		};
+	}));
+	const running = runnerCommands.map(({ args }) =>
+		execFileAsync(node, args, { env: { ...process.env, DSTACK_TEST_ACTIVE_DIR: activeDir } }),
+	);
+	let complete = false;
+	let peak = 0;
+	const monitor = (async () => {
+		while (!complete) {
+			peak = Math.max(peak, (await readdir(activeDir)).length);
+			await sleep(2);
+		}
+	})();
+	let outputs: Awaited<(typeof running)[number]>[];
+	try {
+		outputs = await Promise.all(running);
+	} finally {
+		complete = true;
+		await monitor;
+	}
+	assert.equal(peak, 4);
+	for (const output of outputs) assert.equal(output.stderr, "");
+	assert.deepEqual(await readdir(activeDir), []);
 });
 
 test("committed result reader rejects index corruption", async (t) => {

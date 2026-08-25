@@ -38,6 +38,14 @@ function optionalString(value: unknown, label: string): string | undefined {
 	return value === undefined ? undefined : string(value, label);
 }
 
+function optionalToolsAllowlist(value: unknown, label: string): string | undefined {
+	if (value === undefined) return undefined;
+	const tools = string(value, label).split(",").map((tool) => tool.trim());
+	if (tools.some((tool) => tool === "")) throw new Error(`${label} contains an empty tool name`);
+	if (new Set(tools).size !== tools.length) throw new Error(`${label} contains a duplicate tool name`);
+	return tools.join(",");
+}
+
 function parseSpec(value: unknown, index: number) {
 	const spec = record(value, `manifest.specs[${index}]`);
 	const worktreeValue = spec["worktree"];
@@ -61,7 +69,7 @@ function parseSpec(value: unknown, index: number) {
 		cwd: absolutePath(spec["cwd"], `manifest.specs[${index}].cwd`),
 		model: optionalString(spec["model"], `manifest.specs[${index}].model`),
 		omitModel,
-		tools: optionalString(spec["tools"], `manifest.specs[${index}].tools`),
+		tools: optionalToolsAllowlist(spec["tools"], `manifest.specs[${index}].tools`),
 		systemPrompt: optionalString(spec["systemPrompt"], `manifest.specs[${index}].systemPrompt`),
 		worktree,
 	};

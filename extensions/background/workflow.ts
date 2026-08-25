@@ -6,6 +6,7 @@ import type { WorktreeFrom } from "../types.ts";
 import { MAX_CONCURRENCY, NESTING_ENV } from "../types.ts";
 import { createWorktree } from "../worktree.ts";
 import { atomicWriteFile, readOutputArtifact, toAbsolutePath, writeSealedArtifact, type OutputArtifactSeal } from "./artifacts.ts";
+import { acquireChildSlot } from "./scheduler.ts";
 
 export const ROOT_WORKFLOW_ENV = "DSTACK_ROOT_WORKFLOW";
 export const SCHEDULER_ROOT_ENV = "DSTACK_SCHEDULER_ROOT";
@@ -38,19 +39,16 @@ export type WorkflowManifestV1 = Readonly<{
 }>;
 
 export interface SlotLease {
+	bindChild(pid: number): void | Promise<void>;
 	release(): void | Promise<void>;
 }
 
+/** Test seam. Production execution always uses the shared file scheduler. */
 export interface SlotAcquirer {
 	acquire(input: Readonly<{ workflowId: string; childIndex: number; signal: AbortSignal }>): Promise<SlotLease>;
 }
 
-export const immediateSlotAcquirer: SlotAcquirer = {
-	async acquire() {
-		return { release() {} };
-	},
-};
-
+/** In-memory test seam. Never used by runner execution. */
 export function createLocalSlotAcquirer(capacity = MAX_CONCURRENCY): SlotAcquirer {
 	if (!Number.isSafeInteger(capacity) || capacity < 1) throw new Error("slot capacity must be a positive integer");
 	let active = 0;
@@ -62,6 +60,7 @@ export function createLocalSlotAcquirer(capacity = MAX_CONCURRENCY): SlotAcquire
 			active += 1;
 			let released = false;
 			waiter.admit({
+				bindChild() {},
 				release() {
 					if (released) return;
 					released = true;
@@ -184,13 +183,17 @@ function abortError(signal: AbortSignal): Error {
 	return signal.reason instanceof Error ? signal.reason : new Error("Workflow cancelled");
 }
 
+function resolvedToolsAllowlist(tools: string | undefined): readonly string[] | undefined {
+	if (tools === undefined) return undefined;
+	return tools.split(",");
+}
+
 export async function executeWorkflow(
 	manifest: WorkflowManifestV1,
 	manifestSha256: string,
 	signal: AbortSignal,
 	dependencies: WorkflowDependencies = {},
 ): Promise<WorkflowResultIndexV1> {
-	const slots = dependencies.slots ?? createLocalSlotAcquirer();
 	const spawnChild = dependencies.spawnChild ?? runChildProcess;
 	const makeWorktree = dependencies.createWorktree ?? createWorktree;
 	const states: (ChildState | "queued" | "running")[] = manifest.specs.map(() => "queued");
@@ -200,7 +203,15 @@ export async function executeWorkflow(
 
 	const runOne = async (spec: ResolvedChildSpec, index: number, task: string): Promise<{ state: ChildState; output: string }> => {
 		if (signal.aborted) throw abortError(signal);
-		const lease = await slots.acquire({ workflowId: manifest.workflowId, childIndex: index, signal });
+		const lease = dependencies.slots === undefined
+			? await acquireChildSlot({
+					schedulerRoot: toAbsolutePath(manifest.schedulerRoot),
+					workflowId: manifest.workflowId,
+					childId: String(index),
+					work: { depth: manifest.childDepth, tools: resolvedToolsAllowlist(spec.tools) },
+					signal,
+				})
+			: await dependencies.slots.acquire({ workflowId: manifest.workflowId, childIndex: index, signal });
 		try {
 			if (signal.aborted) throw abortError(signal);
 			states[index] = "running";
@@ -235,7 +246,14 @@ export async function executeWorkflow(
 			env[NESTING_ENV] = "1";
 			env[ROOT_WORKFLOW_ENV] = manifest.workflowId;
 			env[SCHEDULER_ROOT_ENV] = manifest.schedulerRoot;
-			const child = await spawnChild({ args, cwd, env, invocation, signal });
+			const child = await spawnChild({
+				args,
+				cwd,
+				env,
+				invocation,
+				signal,
+				onSpawn: (pid) => lease.bindChild(pid),
+			});
 			const state: ChildState = signal.aborted ? "cancelled" : child.exitCode === 0 ? "succeeded" : "failed";
 			const completed = taskResult(child, spec, cwd, task, manifest.mode === "chain" ? index + 1 : undefined);
 			results[index] = completed;

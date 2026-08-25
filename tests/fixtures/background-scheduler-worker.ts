@@ -10,11 +10,7 @@
 import { createInterface } from "node:readline";
 import { setTimeout as sleep } from "node:timers/promises";
 import { toAbsolutePath } from "../../extensions/background/artifacts.ts";
-import {
-	acquireChildSlot,
-	proveStaticallyNonNesting,
-	type ChildWork,
-} from "../../extensions/background/scheduler.ts";
+import { acquireChildSlot, type ChildWork } from "../../extensions/background/scheduler.ts";
 
 function argValue(flag: string): string | undefined {
 	const index = process.argv.indexOf(flag);
@@ -33,12 +29,10 @@ function required(flag: string): string {
 const schedulerRoot = toAbsolutePath(required("--root"));
 const workflowId = argValue("--workflow") ?? "wf-scheduler-test";
 const childId = required("--child");
-const work: ChildWork =
-	argValue("--depth") === "2"
-		? { depth: 2 }
-		: process.argv.includes("--non-nesting")
-			? { depth: 1, nonNesting: proveStaticallyNonNesting("test fixture spawns no children") }
-			: { depth: 1 };
+const work: ChildWork = {
+	depth: argValue("--depth") === "2" ? 2 : 1,
+	...(process.argv.includes("--non-nesting") ? { tools: ["read"] } : {}),
+};
 
 const cycles = Number.parseInt(argValue("--cycles") ?? "0", 10);
 const holdMs = Number.parseInt(argValue("--hold-ms") ?? "0", 10);

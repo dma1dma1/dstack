@@ -27,10 +27,10 @@ import type { AbsolutePath } from "./artifacts.ts";
  * Admission rules (safety before fairness):
  *   - at most MAX_ACTIVE_CHILDREN leases exist at once;
  *   - work is admitted by internal capacity class. Depth-1 work is "reserved"
- *     (nesting-capable) unless the caller supplies a NonNestingProof; at most
- *     MAX_NESTING_CAPABLE_CHILDREN reserved leases exist at once so nesting
- *     cannot deadlock. Depth-2 work and statically proven non-nesting depth-1
- *     work is "terminal" and may use the fourth slot;
+ *     (nesting-capable) unless its explicit tool allowlist excludes
+ *     `dstack_task`; at most MAX_NESTING_CAPABLE_CHILDREN reserved leases exist
+ *     at once so nesting cannot deadlock. Depth-2 work and depth-1 work whose
+ *     allowlist excludes `dstack_task` is "terminal" and may use slot four;
  *   - tickets are served FIFO by sequence number, except a terminal ticket may
  *     bypass an earlier reserved ticket that is currently blocked by the
  *     nesting reserve.
@@ -63,36 +63,31 @@ export type ChildDepth = 1 | 2;
 /** Internal capacity classes derived from the work shape, never caller-set. */
 export type CapacityClass = "reserved" | "terminal";
 
-const NON_NESTING_PROOF_MARK = "dstack.scheduler.non-nesting-proof.v1";
+export type ChildWork = Readonly<{
+	depth: ChildDepth;
+	/** Undefined means the child receives Pi's default tool set. */
+	tools?: readonly string[];
+}>;
 
-/**
- * Evidence that a depth-1 child cannot spawn further children. Obtainable only
- * through {@link proveStaticallyNonNesting}; the constructor documents the
- * caller's obligation and a forged object is rejected at acquire time.
- */
-export type NonNestingProof = Readonly<{ mark: typeof NON_NESTING_PROOF_MARK; reason: string }>;
-
-/**
- * Assert that a depth-1 child is statically incapable of nesting (for example
- * its tool set contains no child-spawning tool). Callers own this proof: work
- * admitted under it may occupy the fourth slot outside the nesting reserve.
- */
-export function proveStaticallyNonNesting(reason: string): NonNestingProof {
-	if (reason.trim() === "") throw new Error("a non-nesting proof requires a concrete reason");
-	return Object.freeze({ mark: NON_NESTING_PROOF_MARK, reason });
+function validatedTools(tools: readonly string[] | undefined): readonly string[] | undefined {
+	if (tools === undefined) return undefined;
+	if (tools.length === 0) throw new Error("an explicit tools allowlist must not be empty");
+	const seen = new Set<string>();
+	for (const tool of tools) {
+		if (typeof tool !== "string" || tool === "" || tool.trim() !== tool || tool.includes(",")) {
+			throw new Error("the resolved tools allowlist contains an invalid tool name");
+		}
+		if (seen.has(tool)) throw new Error(`the resolved tools allowlist repeats ${tool}`);
+		seen.add(tool);
+	}
+	return tools;
 }
 
-export type ChildWork =
-	| Readonly<{ depth: 2 }>
-	| Readonly<{ depth: 1; nonNesting?: NonNestingProof }>;
-
 function capacityClassOf(work: ChildWork): CapacityClass {
+	if (work.depth !== 1 && work.depth !== 2) throw new Error("child depth must be 1 or 2");
+	const tools = validatedTools(work.tools);
 	if (work.depth === 2) return "terminal";
-	if (work.nonNesting === undefined) return "reserved";
-	if (work.nonNesting.mark !== NON_NESTING_PROOF_MARK) {
-		throw new Error("invalid non-nesting proof: use proveStaticallyNonNesting()");
-	}
-	return "terminal";
+	return tools !== undefined && !tools.includes("dstack_task") ? "terminal" : "reserved";
 }
 
 export type AcquireChildSlotInput = Readonly<{
@@ -667,9 +662,10 @@ function makeLease(root: AbsolutePath, nonce: string): ChildSlotLease {
 		if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("child pid must be a positive integer");
 		if (released !== undefined) throw new Error("cannot bind a child to a released lease");
 		const probe = await probeStartToken(pid);
-		// An unprovable start token records unknown liveness, which occupies
-		// the slot until an explicit release. Fail closed, never fail open.
-		const startToken = probe.kind === "token" ? probe.token : UNPROVABLE_START_TOKEN;
+		if (probe.kind !== "token") {
+			throw new Error("cannot bind a child: its process start token could not be verified");
+		}
+		const startToken = probe.token;
 		const detached = new AbortController();
 		await withSchedulerLock(root, detached.signal, async () => {
 			const path = join(root, "leases", `${nonce}.json`);
@@ -681,6 +677,7 @@ function makeLease(root: AbsolutePath, nonce: string): ChildSlotLease {
 			if (lease === undefined || lease.nonce !== nonce) {
 				throw new Error("cannot bind a child: the lease record is missing or corrupt");
 			}
+			if (lease.child !== undefined) throw new Error("cannot bind a child: the lease is already bound");
 			const updated: LeaseRecord = {
 				...lease,
 				child: { pid, startToken },
