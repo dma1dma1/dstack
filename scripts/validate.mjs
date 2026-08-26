@@ -288,7 +288,7 @@ async function main() {
 		["dstack_task", "dstack_result", "dstack_todo", "dstack_ask", "dstack_sessions", "dstack_config"].every((n) => pi.tools.has(n)),
 		[...pi.tools.keys()].join(","),
 	);
-	assert("status-off-at-start", ctx.status.dstack === undefined || ctx.status.dstack === "" || ctx.status.dstack === "off" || ctx.status.dstack === null, String(ctx.status.dstack));
+	assert("status-on-at-start", ctx.status.dstack === "dmode", String(ctx.status.dstack));
 
 	await pi.commands.get("dmode").handler("", ctx);
 	assert("dmode-on", ctx.notifies.some((n) => n.message === "dmode on") && ctx.status.dstack === "dmode", ctx.status.dstack);

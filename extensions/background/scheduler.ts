@@ -50,6 +50,13 @@ import type { AbsolutePath } from "./artifacts.ts";
 export const MAX_ACTIVE_CHILDREN = 4;
 export const MAX_NESTING_CAPABLE_CHILDREN = 3;
 
+export type LeaseSnapshot = Readonly<{
+	workflowId: string;
+	childId: string;
+	depth: ChildDepth;
+	acquiredAt: string;
+}>;
+
 const TICKET_SCHEMA = "dstack.scheduler.ticket.v2";
 const LEASE_SCHEMA = "dstack.scheduler.lease.v2";
 const LOCK_SCHEMA = "dstack.scheduler.lock.v2";
@@ -581,6 +588,27 @@ async function collectLeases(root: AbsolutePath, cache: LivenessCache): Promise<
 		active.push(lease);
 	}
 	return { active, opaqueCount };
+}
+
+export async function snapshotActiveLeases(root: string | AbsolutePath): Promise<readonly LeaseSnapshot[]> {
+	const dir = join(root, "leases");
+	const cache: LivenessCache = new Map();
+	const active: LeaseSnapshot[] = [];
+	for (const name of await jsonFileNames(dir)) {
+		const path = join(dir, name);
+		const read = await readJsonFile(path);
+		if (read.kind !== "value") continue;
+		const lease = parseLease(read.value);
+		if (lease === undefined) continue;
+		if (await leaseIsReclaimable(lease, cache)) continue;
+		active.push({
+			workflowId: lease.workflowId,
+			childId: lease.childId,
+			depth: lease.depth,
+			acquiredAt: lease.acquiredAt,
+		});
+	}
+	return active;
 }
 
 async function collectTickets(root: AbsolutePath, cache: LivenessCache): Promise<CollectedTickets> {

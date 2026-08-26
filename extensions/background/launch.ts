@@ -24,7 +24,7 @@ export type BackgroundReceipt = Readonly<{
 	resultTool: "dstack_result";
 }>;
 
-function sessionRoot(sessionId: string): string {
+export function sessionRoot(sessionId: string): string {
 	return join(homedir(), ".pi", "agent", "dstack", "background", encodeURIComponent(sessionId));
 }
 
@@ -113,7 +113,14 @@ export async function launchTaskGroup(input: Readonly<{
 		createdAt: new Date().toISOString(),
 	};
 	const manifestSeal = await writeSealedArtifact(join(artifactDir, "manifest.json"), `${JSON.stringify(manifest)}\n`);
-	await atomicWriteFile(join(artifactDir, "progress.json"), `${JSON.stringify({ queued: specs.length, running: 0, complete: 0, total: specs.length })}\n`);
+	const initialChildren = resolvedSpecs.map((spec, index) => ({
+		index,
+		agent: spec.agent,
+		state: "queued",
+		role: spec.requestedRole,
+		assignment: spec.workflow?.assignment,
+	}));
+	await atomicWriteFile(join(artifactDir, "progress.json"), `${JSON.stringify({ queued: specs.length, running: 0, complete: 0, total: specs.length, children: initialChildren })}\n`);
 	const runnerPath = await realpath(input.runnerPath);
 	const command = [
 		shellQuote(process.execPath),

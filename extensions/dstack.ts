@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, writeFile, unlink, rmdir } from "node:fs/promises";
+import { mkdtemp, writeFile, unlink, rmdir, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -23,6 +23,7 @@ import {
 	loadConfig,
 	parseConfig,
 	resolveModel,
+	resolveNestedLaunchModel,
 	saveConfig,
 	slugsFromRegistry,
 	validateRoles,
@@ -68,11 +69,13 @@ import {
 } from "./todo.ts";
 import { ACTIVE_WORKFLOW_ENTRY, MODE_ENTRY, type ActiveWorkflow, type ChildDepth, type ModeState, type TaskSpec, type TodoState } from "./types.ts";
 import { createEventBusV1Port, type BackgroundTaskPort } from "./background/eventbus-v1.ts";
-import { createTaskResultFiles, launchTaskGroup } from "./background/launch.ts";
-import { toAbsolutePath } from "./background/artifacts.ts";
+import { createTaskResultFiles, launchTaskGroup, sessionRoot } from "./background/launch.ts";
+import { atomicWriteFile, toAbsolutePath } from "./background/artifacts.ts";
 import { readDstackResult } from "./background/result.ts";
 import { acquireChildSlot } from "./background/scheduler.ts";
-import { ROOT_WORKFLOW_ENV, SCHEDULER_ROOT_ENV } from "./background/workflow.ts";
+import { DSTACK_ARTIFACT_DIR_ENV, DSTACK_CHILD_INDEX_ENV, ROOT_WORKFLOW_ENV, SCHEDULER_ROOT_ENV } from "./background/workflow.ts";
+import { activityLines, buildTreeSnapshot, latestActivity, parseTreeSnapshot, renderTreeLines, taskPreviewOf, type SpawnChildV1, type SpawnRecordV1, type TreeSnapshot } from "./background/tree.ts";
+import { AgentInspector, renderAmbientWidgetLine, type AgentInspectorResult } from "./background/inspector.ts";
 import { createWorktree, WorktreeError } from "./worktree.ts";
 import { workflowSystemPrompt } from "./workflow-context.ts";
 
@@ -300,49 +303,7 @@ function progressText(details: TaskDetails): string {
 	return `${details.mode}: ${done}/${details.results.length} done, ${details.results.length - done} running...`;
 }
 
-function formatToolCall(part: Extract<ChildContentPart, { type: "toolCall" }>): string {
-	const args = JSON.stringify(part.arguments);
-	return `${part.name} ${args.length > 100 ? `${args.slice(0, 97)}...` : args}`;
-}
-
-function formatToolUpdate(part: Extract<ChildContentPart, { type: "toolUpdate" }>): string {
-	const lines = [`↳ ${part.name}: ${part.text}`];
-	for (const agent of part.agents) {
-		const icon = agent.exitCode === -1 ? "⏳" : agent.exitCode === 0 ? "✓" : "✗";
-		const preview = agent.text.split("\n")[0];
-		lines.push(`  ${icon} ${agent.agent}${preview ? ` ${preview.slice(0, 80)}` : ""}`);
-	}
-	return lines.join("\n");
-}
-
-function activityParts(result: TaskResult): ChildContentPart[] {
-	return result.messages.flatMap((message) =>
-		message.role === "assistant" || message.role === "activity" ? message.content : [],
-	);
-}
-
-function activityLines(result: TaskResult): string[] {
-	const lines: string[] = [];
-	for (const part of activityParts(result)) {
-		if (part.type === "toolCall") lines.push(`→ ${formatToolCall(part)}`);
-		else if (part.type === "toolUpdate") lines.push(formatToolUpdate(part));
-		else lines.push(...part.text.split("\n"));
-	}
-	return lines;
-}
-
-function oneLine(text: string, limit = 100): string {
-	const line = text.split("\n").find((candidate) => candidate.trim())?.trim() ?? "";
-	return line.length > limit ? `${line.slice(0, limit - 3)}...` : line;
-}
-
-export function latestActivity(result: TaskResult): string {
-	const part = activityParts(result).at(-1);
-	if (!part) return result.exitCode === -1 ? "running" : oneLine(result.text) || "no output";
-	if (part.type === "toolCall") return `→ ${formatToolCall(part)}`;
-	if (part.type === "toolUpdate") return `↳ ${part.name}: ${oneLine(part.text, 72)}`;
-	return oneLine(part.text) || (result.exitCode === -1 ? "running" : "no output");
-}
+export { latestActivity };
 
 function branchEntries(ctx: ExtensionContext): SessionEntryLike[] {
 	return ctx.sessionManager.getBranch() as SessionEntryLike[];
@@ -386,6 +347,114 @@ export default function dstack(pi: ExtensionAPI) {
 	let sessionId = "unknown";
 	let pendingContinuation: { sessionId: string; tasks: TodoSnapshot[] } | undefined;
 	let eventBusPort: BackgroundTaskPort | undefined;
+	let treeTimer: NodeJS.Timeout | undefined;
+	let treeSnapshot: TreeSnapshot | undefined;
+	let inspectorOpen = false;
+	let treeWidgetVisible = true;
+	let treeLastTaskId: string | undefined;
+	let treeLastWorkflowId: string | undefined;
+	let treeArtifactDir: string | undefined;
+	let treeSchedulerRoot: string | undefined;
+	let lastContext: ExtensionContext | undefined;
+
+	function stopTreeTimer() {
+		if (treeTimer !== undefined) {
+			clearInterval(treeTimer);
+			treeTimer = undefined;
+		}
+	}
+
+	function updateTreeWidget(ctx: ExtensionContext) {
+		lastContext = ctx;
+		if (!treeWidgetVisible || !treeSnapshot || !ctx.hasUI || inspectorOpen) {
+			if (ctx.hasUI) {
+				ctx.ui.setWidget("dstack-tree", undefined);
+			}
+			return;
+		}
+		ctx.ui.setWidget("dstack-tree", (_tui, theme) => ({
+			render(width: number) {
+				if (!treeSnapshot || inspectorOpen || !treeWidgetVisible) return [];
+				return renderAmbientWidgetLine(treeSnapshot, width, theme);
+			},
+			invalidate() {},
+		}));
+	}
+
+	async function openInspector(ctx: ExtensionContext, taskId?: string): Promise<void> {
+		lastContext = ctx;
+		if (!ctx.hasUI) {
+			ctx.ui.notify(
+				"dstack agent inspector requires an interactive Pi UI. Use /dtree for a static in-chat snapshot.",
+				"error",
+			);
+			return;
+		}
+		if (inspectorOpen) return;
+		inspectorOpen = true;
+		updateTreeWidget(ctx);
+		try {
+			await ctx.ui.custom<AgentInspectorResult>(
+				(tui, theme, _keybindings, done) => {
+					return new AgentInspector(tui, theme, done, {
+						sessionId,
+						initialTaskId: taskId,
+						todoPath: todoFilePath(sessionId),
+					});
+				},
+				{
+					overlay: true,
+					overlayOptions: {
+						anchor: "bottom-center",
+						width: "96%",
+						minWidth: 64,
+						maxHeight: "60%",
+						margin: { bottom: 1, left: 1, right: 1 },
+					},
+				},
+			);
+		} finally {
+			inspectorOpen = false;
+			updateTreeWidget(ctx);
+		}
+	}
+
+	async function pollTreeTick() {
+		if (!treeArtifactDir || !treeSchedulerRoot || !treeLastTaskId || !treeLastWorkflowId) return;
+		try {
+			const snapshot = await buildTreeSnapshot({
+				taskId: treeLastTaskId,
+				workflowId: treeLastWorkflowId,
+				artifactDir: treeArtifactDir,
+				schedulerRoot: treeSchedulerRoot,
+				todoPath: todoFilePath(sessionId),
+				playbook: activeWorkflow?.playbook,
+			});
+			if (!snapshot) return;
+			treeSnapshot = snapshot;
+			if (lastContext) {
+				updateTreeWidget(lastContext);
+			}
+			if (snapshot.committed) {
+				stopTreeTimer();
+			}
+		} catch {}
+	}
+
+	function startTreePolling(taskId: string, workflowId: string, ctx: ExtensionContext) {
+		treeLastTaskId = taskId;
+		treeLastWorkflowId = workflowId;
+		const root = sessionRoot(sessionId);
+		treeArtifactDir = join(root, "workflows", workflowId);
+		treeSchedulerRoot = join(root, "scheduler");
+		lastContext = ctx;
+		stopTreeTimer();
+		void pollTreeTick();
+		treeTimer = setInterval(() => {
+			void pollTreeTick();
+		}, 1000);
+		treeTimer.unref();
+	}
 
 	function getEventBusPort(): BackgroundTaskPort {
 		eventBusPort ??= createEventBusV1Port({ events: pi.events, makeRequestId: randomUUID });
@@ -418,11 +487,27 @@ export default function dstack(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		pendingContinuation = undefined;
+		stopTreeTimer();
+		treeSnapshot = undefined;
+		treeLastTaskId = undefined;
+		treeLastWorkflowId = undefined;
+		treeArtifactDir = undefined;
+		treeSchedulerRoot = undefined;
+		if (ctx.hasUI && typeof ctx.ui.setWidget === "function") {
+			ctx.ui.setWidget("dstack-tree", undefined);
+		}
 		mode = restoreMode(branchEntries(ctx));
 		activeWorkflow = restoreActiveWorkflow(branchEntries(ctx));
 		sessionId = ctx.sessionManager.getSessionId();
 		await refreshTodos();
 		applyStatus(ctx);
+		if (activeWorkflow) {
+			const files = createTaskResultFiles(sessionId);
+			const binding = await files.readBinding(activeWorkflow.taskId);
+			if (binding) {
+				startTreePolling(binding.taskId, binding.workflowId, ctx);
+			}
+		}
 		if (!fallbacks) {
 			fallbacks = true;
 			registerFallbackTools();
@@ -433,6 +518,23 @@ export default function dstack(pi: ExtensionAPI) {
 		mode = restoreMode(branchEntries(ctx));
 		activeWorkflow = restoreActiveWorkflow(branchEntries(ctx));
 		applyStatus(ctx);
+		if (activeWorkflow) {
+			const files = createTaskResultFiles(sessionId);
+			const binding = await files.readBinding(activeWorkflow.taskId);
+			if (binding) {
+				startTreePolling(binding.taskId, binding.workflowId, ctx);
+				return;
+			}
+		}
+		stopTreeTimer();
+		treeSnapshot = undefined;
+		treeLastTaskId = undefined;
+		treeLastWorkflowId = undefined;
+		treeArtifactDir = undefined;
+		treeSchedulerRoot = undefined;
+		if (ctx.hasUI && typeof ctx.ui.setWidget === "function") {
+			ctx.ui.setWidget("dstack-tree", undefined);
+		}
 	});
 
 	pi.on("before_agent_start", async () => {
@@ -480,10 +582,15 @@ export default function dstack(pi: ExtensionAPI) {
 		);
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (_event, ctx) => {
 		pendingContinuation = undefined;
 		eventBusPort?.close();
 		eventBusPort = undefined;
+		stopTreeTimer();
+		treeSnapshot = undefined;
+		if (ctx?.hasUI && typeof ctx.ui.setWidget === "function") {
+			ctx.ui.setWidget("dstack-tree", undefined);
+		}
 	});
 
 	pi.on("session_before_tree", async () => {
@@ -506,6 +613,91 @@ export default function dstack(pi: ExtensionAPI) {
 	pi.registerCommand("poteto-mode", {
 		description: "Alias of /dmode.",
 		handler: modeHandler,
+	});
+
+	pi.registerCommand("dtree", {
+		description: "Show dstack subagent tree. /dtree on | off toggles the live widget. /dtree [taskId] renders a snapshot.",
+		handler: async (args, ctx) => {
+			const trimmed = args.trim();
+			if (trimmed === "on") {
+				treeWidgetVisible = true;
+				if (treeSnapshot && ctx.hasUI) {
+					updateTreeWidget(ctx);
+				}
+				ctx.ui.notify("dstack tree widget enabled", "info");
+				return;
+			}
+			if (trimmed === "off") {
+				treeWidgetVisible = false;
+				if (ctx.hasUI) {
+					ctx.ui.setWidget("dstack-tree", undefined);
+				}
+				ctx.ui.notify("dstack tree widget disabled", "info");
+				return;
+			}
+
+			const targetTaskId = trimmed !== "" ? trimmed : (activeWorkflow?.taskId ?? treeLastTaskId);
+			if (!targetTaskId) {
+				ctx.ui.notify("no dstack workflow in this session", "info");
+				return;
+			}
+
+			const files = createTaskResultFiles(sessionId);
+			const binding = await files.readBinding(targetTaskId);
+			if (!binding) {
+				ctx.ui.notify(`no dstack workflow found for task ${targetTaskId}`, "error");
+				return;
+			}
+
+			const root = sessionRoot(sessionId);
+			const artifactDir = join(root, "workflows", binding.workflowId);
+			const schedulerRoot = join(root, "scheduler");
+			const snapshot = await buildTreeSnapshot({
+				taskId: targetTaskId,
+				workflowId: binding.workflowId,
+				artifactDir,
+				schedulerRoot,
+				todoPath: todoFilePath(sessionId),
+				playbook: activeWorkflow?.taskId === targetTaskId ? activeWorkflow?.playbook : undefined,
+			});
+
+			if (!snapshot) {
+				ctx.ui.notify(`could not load workflow snapshot for ${targetTaskId}`, "error");
+				return;
+			}
+
+			pi.appendEntry("dstack-tree-snapshot", snapshot);
+		},
+	});
+
+	pi.registerEntryRenderer?.("dstack-tree-snapshot", (entry, { expanded }, theme) => {
+		const snapshot = parseTreeSnapshot(entry.data);
+		if (!snapshot) {
+			return new Text(theme.fg("dim", "(corrupt dstack tree snapshot)"), 0, 0);
+		}
+		const lines = renderTreeLines(snapshot, {
+			width: 80,
+			maxLines: Number.POSITIVE_INFINITY,
+			theme,
+			includeTodos: true,
+			expanded,
+		});
+		return new Text(lines.join("\n"), 0, 0);
+	});
+
+	pi.registerCommand("dagents", {
+		description: "Open the dstack agent inspector overlay: /dagents [taskId]",
+		handler: async (args, ctx) => {
+			const taskId = args.trim() || undefined;
+			await openInspector(ctx, taskId);
+		},
+	});
+
+	pi.registerShortcut?.("shift+up", {
+		description: "Open dstack agent inspector overlay",
+		handler: async (ctx) => {
+			await openInspector(ctx);
+		},
 	});
 
 	pi.registerCommand("setup-dstack", {
@@ -652,6 +844,7 @@ export default function dstack(pi: ExtensionAPI) {
 							playbook: specs[0].workflow.playbook,
 						});
 					}
+					startTreePolling(receipt.taskId, receipt.workflowId, ctx);
 					return textResult(JSON.stringify(receipt), receipt);
 				} catch (error) {
 					return textResult(error instanceof Error ? error.message : String(error), {}, true);
@@ -668,92 +861,281 @@ export default function dstack(pi: ExtensionAPI) {
 				),
 			};
 			const nestedGroupId = randomUUID();
+			const rootWorkflowId = process.env[ROOT_WORKFLOW_ENV];
+			const schedulerRoot = process.env[SCHEDULER_ROOT_ENV];
+			const childIndexEnv = process.env[DSTACK_CHILD_INDEX_ENV];
+			const artifactDirEnv = process.env[DSTACK_ARTIFACT_DIR_ENV];
+			const parentIndex = childIndexEnv !== undefined ? Number.parseInt(childIndexEnv, 10) : Number.NaN;
+			const canPersistSpawns = rootWorkflowId !== undefined && artifactDirEnv !== undefined && Number.isSafeInteger(parentIndex) && parentIndex >= 0;
+			const spawnsDir = canPersistSpawns ? join(artifactDirEnv, "children", String(parentIndex), "spawns") : undefined;
+			const spawnRecordPath = spawnsDir !== undefined ? join(spawnsDir, `${nestedGroupId}.json`) : undefined;
+			const initialCreatedAt = new Date().toISOString();
+			const spawnPhase = specs.map((s) => s.workflow?.phase).find((p): p is string => typeof p === "string" && p.length > 0);
+
+			const spawnChildren: SpawnChildV1[] = specs.map((spec, idx) => {
+				const resolved = resolveAgent(spec);
+				const modelRes = resolveModel({
+					explicit: spec.model,
+					role: spec.role,
+					roles: config.roles,
+					candidateIndex: request.kind === "parallel" ? idx : 0,
+					overrideReason: spec.overrideReason,
+				});
+				const launchModel = resolveNestedLaunchModel({
+					resolution: modelRes.ok ? modelRes.value : undefined,
+					env: process.env,
+				});
+				return {
+					nestedIndex: idx,
+					agent: resolved.agent,
+					role: spec.role,
+					assignment: spec.workflow?.assignment,
+					taskPreview: taskPreviewOf(spec.task),
+					taskFull: spec.task,
+					workflow: spec.workflow,
+					model: launchModel,
+					cwd: spec.cwd ?? ctx.cwd,
+					tools: resolved.tools ?? spec.tools,
+					state: "queued",
+					updatedAt: initialCreatedAt,
+				};
+			});
+
+			function createSpawnRecordWriter(options: {
+				spawnsDir: string;
+				filePath: string;
+				getRecord: () => SpawnRecordV1;
+				minIntervalMs?: number;
+			}) {
+				const minIntervalMs = options.minIntervalMs ?? 1000;
+				let lastWriteTime = 0;
+				let timer: NodeJS.Timeout | undefined;
+				let writeChain: Promise<void> = Promise.resolve();
+				let disposed = false;
+
+				const doWrite = async () => {
+					const record = options.getRecord();
+					try {
+						await mkdir(options.spawnsDir, { recursive: true, mode: 0o700 });
+						await atomicWriteFile(options.filePath, `${JSON.stringify(record, null, 2)}\n`);
+						lastWriteTime = Date.now();
+					} catch {}
+				};
+
+				const scheduleWrite = (): Promise<void> => {
+					if (disposed) return Promise.resolve();
+					if (timer !== undefined) {
+						clearTimeout(timer);
+						timer = undefined;
+					}
+					writeChain = writeChain.then(doWrite, doWrite);
+					return writeChain;
+				};
+
+				return {
+					writeThrottled() {
+						if (disposed) return;
+						const elapsed = Date.now() - lastWriteTime;
+						if (elapsed >= minIntervalMs && timer === undefined) {
+							void scheduleWrite();
+						} else if (timer === undefined) {
+							const delay = Math.max(0, minIntervalMs - elapsed);
+							timer = setTimeout(() => {
+								timer = undefined;
+								void scheduleWrite();
+							}, delay);
+							timer.unref?.();
+						}
+					},
+					async flush() {
+						if (disposed) return;
+						if (timer !== undefined) {
+							clearTimeout(timer);
+							timer = undefined;
+						}
+						await scheduleWrite();
+					},
+					dispose() {
+						disposed = true;
+						if (timer !== undefined) {
+							clearTimeout(timer);
+							timer = undefined;
+						}
+					},
+				};
+			}
+
+			const spawnRecordWriter = canPersistSpawns && spawnsDir !== undefined && spawnRecordPath !== undefined
+				? createSpawnRecordWriter({
+						spawnsDir,
+						filePath: spawnRecordPath,
+						getRecord: () => ({
+							schemaVersion: "dstack.spawn-record.v1",
+							workflowId: rootWorkflowId,
+							parentIndex,
+							groupId: nestedGroupId,
+							mode: request.kind,
+							phase: spawnPhase,
+							createdAt: initialCreatedAt,
+							children: spawnChildren.map((c) => ({ ...c })),
+						}),
+					})
+				: undefined;
+
+			await spawnRecordWriter?.flush();
+
 			const publish = () => {
 				const snapshot = cloneDetails(details);
 				onUpdate?.(textResult(progressText(snapshot), snapshot));
 			};
 			publish();
 			const runOne = async (spec: TaskSpec, index: number): Promise<TaskResult> => {
-				const resolved = resolveAgent(spec);
-				const agent = agents.find((candidate) => candidate.name === resolved.agent);
-				if (!agent) {
-					const available = agents.map((candidate) => candidate.name).join(", ") || "none";
-					throw new Error(`Unknown agent "${resolved.agent}". Available: ${available}.`);
-				}
-				const model = resolveModel({
-					explicit: spec.model,
-					role: spec.role,
-					roles: config.roles,
-					candidateIndex: request.kind === "parallel" ? index : 0,
-					overrideReason: spec.overrideReason,
-				});
-				if (!model.ok) throw new Error(formatConfigError(model.error));
-				let cwd = spec.cwd ?? ctx.cwd;
-				if (spec.worktree) {
-					cwd = await createWorktree({
-						repoRoot: ctx.cwd,
-						task: spec.task,
-						base: config.worktree.base,
-						from: config.worktree.from,
-					});
-				}
-				details.results[index] = { ...details.results[index], agent: resolved.agent, cwd, task: spec.task } as TaskResult;
-				publish();
-				const promptParts = [agent.systemPrompt.trim()];
-				if (spec.workflow !== undefined) promptParts.push(workflowSystemPrompt(skillPath(), childDepth, spec.workflow));
-				else if (resolved.dmode) promptParts.push(dmodeReminder(skillPath(), childDepth));
-				let tmp: { dir: string; filePath: string } | undefined;
-				let lease: Awaited<ReturnType<typeof acquireChildSlot>> | undefined;
-				const system = promptParts.filter(Boolean).join("\n\n");
-				if (system) tmp = await writeTempPrompt(system);
 				try {
-					const rootWorkflowId = process.env[ROOT_WORKFLOW_ENV];
-					const schedulerRoot = process.env[SCHEDULER_ROOT_ENV];
-					if (rootWorkflowId && schedulerRoot) {
-						lease = await acquireChildSlot({
-							schedulerRoot: toAbsolutePath(schedulerRoot),
-							workflowId: rootWorkflowId,
-							childId: `${nestedGroupId}-${index}`,
-							work: {
-								depth: childDepth,
-								tools: (resolved.tools ?? agent.tools?.join(","))?.split(","),
-							},
-							signal: signal ?? new AbortController().signal,
+					const resolved = resolveAgent(spec);
+					const agent = agents.find((candidate) => candidate.name === resolved.agent);
+					if (!agent) {
+						const available = agents.map((candidate) => candidate.name).join(", ") || "none";
+						throw new Error(`Unknown agent "${resolved.agent}". Available: ${available}.`);
+					}
+					const model = resolveModel({
+						explicit: spec.model,
+						role: spec.role,
+						roles: config.roles,
+						candidateIndex: request.kind === "parallel" ? index : 0,
+						overrideReason: spec.overrideReason,
+					});
+					if (!model.ok) throw new Error(formatConfigError(model.error));
+					const launchModel = resolveNestedLaunchModel({
+						resolution: model.value,
+						env: process.env,
+					});
+					let cwd = spec.cwd ?? ctx.cwd;
+					if (spec.worktree) {
+						cwd = await createWorktree({
+							repoRoot: ctx.cwd,
+							task: spec.task,
+							base: config.worktree.base,
+							from: config.worktree.from,
 						});
 					}
-					const args = buildChildArgv({
-						task: spec.task,
-						extensionPath: extensionPath(),
-						model: model.value.model,
-						omitModel: model.value.omitModel,
-						tools: resolved.tools ?? agent.tools?.join(","),
-						systemPromptPath: tmp?.filePath,
-					});
-					const child = await runChildProcess({
-						args,
-						cwd,
-						env: childEnv(childDepth, process.env, spec.workflow?.assignment),
-						signal,
-						onSpawn: (pid) => lease?.bindChild(pid),
-						onUpdate: (partial) => {
-							details.results[index] = { ...partial, agent: resolved.agent, cwd, task: spec.task, step: details.results[index]?.step };
-							publish();
-						},
-					});
-					const completed: TaskResult = {
-						...child,
-						agent: resolved.agent,
-						cwd,
-						task: spec.task,
-						text: capOutput(child.text),
-						step: details.results[index]?.step,
-					};
-					details.results[index] = completed;
+					const existing = details.results[index];
+					if (existing !== undefined) {
+						details.results[index] = { ...existing, agent: resolved.agent, cwd, task: spec.task };
+					}
 					publish();
-					return completed;
-				} finally {
-					await lease?.release();
-					if (tmp) await removeTemp(tmp.dir, tmp.filePath);
+					const promptParts = [agent.systemPrompt.trim()];
+					if (spec.workflow !== undefined) promptParts.push(workflowSystemPrompt(skillPath(), childDepth, spec.workflow));
+					else if (resolved.dmode) promptParts.push(dmodeReminder(skillPath(), childDepth));
+					let tmp: { dir: string; filePath: string } | undefined;
+					let lease: Awaited<ReturnType<typeof acquireChildSlot>> | undefined;
+					const system = promptParts.filter(Boolean).join("\n\n");
+					if (system) tmp = await writeTempPrompt(system);
+					try {
+						if (rootWorkflowId && schedulerRoot) {
+							lease = await acquireChildSlot({
+								schedulerRoot: toAbsolutePath(schedulerRoot),
+								workflowId: rootWorkflowId,
+								childId: `${nestedGroupId}-${index}`,
+								work: {
+									depth: childDepth,
+									tools: (resolved.tools ?? agent.tools?.join(","))?.split(","),
+								},
+								signal: signal ?? new AbortController().signal,
+							});
+						}
+						const startedAt = new Date().toISOString();
+						const runningChild = spawnChildren[index];
+						if (runningChild !== undefined) {
+							spawnChildren[index] = {
+								...runningChild,
+								state: "running",
+								taskFull: spec.task,
+								taskPreview: taskPreviewOf(spec.task),
+								cwd,
+								model: runningChild.model ?? launchModel,
+								startedAt,
+								updatedAt: startedAt,
+							};
+							await spawnRecordWriter?.flush();
+						}
+
+						const args = buildChildArgv({
+							task: spec.task,
+							extensionPath: extensionPath(),
+							model: model.value.model,
+							omitModel: model.value.omitModel,
+							tools: resolved.tools ?? agent.tools?.join(","),
+							systemPromptPath: tmp?.filePath,
+						});
+						const child = await runChildProcess({
+							args,
+							cwd,
+							env: childEnv(childDepth, process.env, spec.workflow?.assignment),
+							signal,
+							onSpawn: (pid) => lease?.bindChild(pid),
+							onUpdate: (partial) => {
+								details.results[index] = { ...partial, agent: resolved.agent, cwd, task: spec.task, step: details.results[index]?.step };
+								publish();
+								const now = new Date().toISOString();
+								const existing = spawnChildren[index];
+								if (existing !== undefined) {
+									spawnChildren[index] = {
+										...existing,
+										activity: latestActivity(partial),
+										updatedAt: now,
+									};
+									spawnRecordWriter?.writeThrottled();
+								}
+							},
+						});
+						const completed: TaskResult = {
+							...child,
+							agent: resolved.agent,
+							cwd,
+							task: spec.task,
+							text: capOutput(child.text),
+							step: details.results[index]?.step,
+						};
+						details.results[index] = completed;
+						publish();
+						const now = new Date().toISOString();
+						const existing = spawnChildren[index];
+						if (existing !== undefined) {
+							spawnChildren[index] = {
+								...existing,
+								state: signal?.aborted ? "cancelled" : completed.exitCode === 0 ? "succeeded" : "failed",
+								exitCode: completed.exitCode,
+								finalResponse: completed.text,
+								errorMessage: completed.errorMessage,
+								stderr: completed.stderr,
+								stopReason: completed.stopReason,
+								usage: completed.usage,
+								model: completed.model ?? existing.model ?? launchModel,
+								activity: latestActivity(completed),
+								updatedAt: now,
+								endedAt: now,
+							};
+							await spawnRecordWriter?.flush();
+						}
+						return completed;
+					} finally {
+						await lease?.release();
+						if (tmp) await removeTemp(tmp.dir, tmp.filePath);
+					}
+				} catch (err) {
+					const now = new Date().toISOString();
+					const existing = spawnChildren[index];
+					if (existing !== undefined && existing.state !== "succeeded" && existing.state !== "failed" && existing.state !== "cancelled") {
+						spawnChildren[index] = {
+							...existing,
+							state: signal?.aborted ? "cancelled" : "failed",
+							errorMessage: err instanceof Error ? err.message : String(err),
+							updatedAt: now,
+							endedAt: now,
+						};
+						await spawnRecordWriter?.flush();
+					}
+					throw err;
 				}
 			};
 			try {
@@ -762,12 +1144,42 @@ export default function dstack(pi: ExtensionAPI) {
 					let previous = "";
 					for (const [index, spec] of specs.entries()) {
 						const task = spec.task.replace(/\{previous\}/g, previous);
-						const result = await runOne({ ...spec, task }, index);
-						results.push(result);
-						if (result.exitCode !== 0) {
-							return textResult(`Chain stopped (${spec.agent}): ${ownerResultText(result.text)}`, ownerResultDetails(details), true);
+						try {
+							const result = await runOne({ ...spec, task }, index);
+							results.push(result);
+							if (result.exitCode !== 0) {
+								const now = new Date().toISOString();
+								for (let i = index + 1; i < spawnChildren.length; i++) {
+									const remaining = spawnChildren[i];
+									if (remaining !== undefined && remaining.state === "queued") {
+										spawnChildren[i] = {
+											...remaining,
+											state: "skipped",
+											updatedAt: now,
+											endedAt: now,
+										};
+									}
+								}
+								await spawnRecordWriter?.flush();
+								return textResult(`Chain stopped (${spec.agent}): ${ownerResultText(result.text)}`, ownerResultDetails(details), true);
+							}
+							previous = result.text;
+						} catch (err) {
+							const now = new Date().toISOString();
+							for (let i = index + 1; i < spawnChildren.length; i++) {
+								const remaining = spawnChildren[i];
+								if (remaining !== undefined && remaining.state === "queued") {
+									spawnChildren[i] = {
+										...remaining,
+										state: "skipped",
+										updatedAt: now,
+										endedAt: now,
+									};
+								}
+							}
+							await spawnRecordWriter?.flush();
+							throw err;
 						}
-						previous = result.text;
 					}
 					const last = results[results.length - 1];
 					return textResult(ownerResultText(last?.text ?? "(no output)"), ownerResultDetails(details));
@@ -783,10 +1195,25 @@ export default function dstack(pi: ExtensionAPI) {
 					.join("\n\n---\n\n");
 				return textResult(text, ownerResultDetails(details));
 			} catch (err) {
+				const now = new Date().toISOString();
+				for (let i = 0; i < spawnChildren.length; i++) {
+					const c = spawnChildren[i];
+					if (c !== undefined && (c.state === "queued" || c.state === "running")) {
+						spawnChildren[i] = {
+							...c,
+							state: signal?.aborted ? "cancelled" : "failed",
+							updatedAt: now,
+							endedAt: now,
+						};
+					}
+				}
+				await spawnRecordWriter?.flush();
 				if (err instanceof WorktreeError) {
 					return textResult(err.message, {}, true);
 				}
 				return textResult(err instanceof Error ? err.message : String(err), {}, true);
+			} finally {
+				spawnRecordWriter?.dispose();
 			}
 		},
 	});
@@ -796,7 +1223,7 @@ export default function dstack(pi: ExtensionAPI) {
 		label: "dstack result",
 		description: "Read a bounded summary for a background dstack task. Use detail=full only when the complete child transcript is necessary.",
 		parameters: ResultParams,
-		async execute(_id, params, signal) {
+		async execute(_id, params, signal, _onUpdate, ctx) {
 			const files = createTaskResultFiles(sessionId);
 			const result = await readDstackResult({
 				taskId: params.taskId,
@@ -807,7 +1234,18 @@ export default function dstack(pi: ExtensionAPI) {
 				readCommittedResult: files.readCommittedResult,
 			});
 			const terminal = result.kind === "complete" || result.kind === "artifact" || result.kind === "cancelled" || result.kind === "runner_failed";
-			if (activeWorkflow?.taskId === params.taskId && terminal) persistActiveWorkflow(undefined);
+			if (activeWorkflow?.taskId === params.taskId && terminal) {
+				if (ctx) lastContext = ctx;
+				await pollTreeTick();
+				if (!treeSnapshot?.committed) {
+					treeSnapshot = undefined;
+					if (lastContext?.hasUI) {
+						lastContext.ui.setWidget("dstack-tree", undefined);
+					}
+				}
+				persistActiveWorkflow(undefined);
+				stopTreeTimer();
+			}
 			return textResult(JSON.stringify(result), result);
 		},
 	});

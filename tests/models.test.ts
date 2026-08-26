@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { loadConfig, parseConfig, resolveModel, validateRoles } from "../extensions/models.ts";
+import { loadConfig, parseConfig, resolveModel, resolveNestedLaunchModel, validateRoles } from "../extensions/models.ts";
 
 test("models.json rejects unknown slugs", () => {
 	const result = validateRoles({ "how-explorer": "acme/secret" }, new Set(["acme/fast"]));
@@ -135,4 +135,46 @@ test("parseConfig reads worktree.from", () => {
 	});
 	assert.equal(parsed.ok, true);
 	if (parsed.ok) assert.equal(parsed.value.worktree.from, "origin/main");
+});
+
+test("resolveNestedLaunchModel prefers resolved explicit model over env", () => {
+	const model = resolveNestedLaunchModel({
+		resolution: { model: "google/gemini-3.7-flash", omitModel: false },
+		env: { PI_PROVIDER: "anthropic", PI_MODEL: "claude-3-5-sonnet" },
+	});
+	assert.equal(model, "google/gemini-3.7-flash");
+});
+
+test("resolveNestedLaunchModel extracts provider and model from environment when resolution omits model", () => {
+	const model = resolveNestedLaunchModel({
+		resolution: { omitModel: true },
+		env: { PI_PROVIDER: "anthropic", PI_MODEL: "claude-3-7-sonnet" },
+	});
+	assert.equal(model, "anthropic/claude-3-7-sonnet");
+
+	const alreadyPrefixed = resolveNestedLaunchModel({
+		resolution: { omitModel: true },
+		env: { PI_PROVIDER: "google", PI_MODEL: "google/gemini-2.5-pro" },
+	});
+	assert.equal(alreadyPrefixed, "google/gemini-2.5-pro");
+
+	const differentProviderPrefix = resolveNestedLaunchModel({
+		resolution: { omitModel: true },
+		env: { PI_PROVIDER: "azure", PI_MODEL: "openai/gpt-4" },
+	});
+	assert.equal(differentProviderPrefix, "openai/gpt-4");
+});
+
+test("resolveNestedLaunchModel returns undefined when model resolution failed even if env is set", () => {
+	const model = resolveNestedLaunchModel({
+		resolution: undefined,
+		env: { PI_PROVIDER: "anthropic", PI_MODEL: "claude-3-7-sonnet" },
+	});
+	assert.equal(model, undefined);
+});
+
+test("resolveNestedLaunchModel returns undefined when resolution omits model but env is incomplete or empty", () => {
+	assert.equal(resolveNestedLaunchModel({ resolution: { omitModel: true }, env: { PI_PROVIDER: "", PI_MODEL: "gpt-4o" } }), undefined);
+	assert.equal(resolveNestedLaunchModel({ resolution: { omitModel: true }, env: {} }), undefined);
+	assert.equal(resolveNestedLaunchModel({ env: {} }), undefined);
 });

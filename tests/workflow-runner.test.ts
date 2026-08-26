@@ -18,10 +18,13 @@ import {
 import {
 	createLocalSlotAcquirer,
 	executeWorkflow,
+	DSTACK_ARTIFACT_DIR_ENV,
+	DSTACK_CHILD_INDEX_ENV,
 	type ResolvedChildSpec,
 	type SlotAcquirer,
 	type WorkflowManifestV1,
 } from "../extensions/background/workflow.ts";
+import { buildTreeSnapshot } from "../extensions/background/tree.ts";
 
 const execFileAsync = promisify(execFile);
 const runnerPath = fileURLToPath(new URL("../extensions/background/runner.ts", import.meta.url));
@@ -107,7 +110,7 @@ test("parallel results retain manifest order when children finish in reverse ord
 			slots: createLocalSlotAcquirer(4),
 			spawnChild: async ({ args }) => {
 				const id = Number(args.at(-1)?.replace("Task: ", ""));
-				await new Promise((resolve) => setTimeout(resolve, (2 - id) * 15));
+				await new Promise((resolve) => setTimeout(resolve, (2 - id) * 40));
 				calls.push(id);
 				return child(`output-${id}`);
 			},
@@ -289,7 +292,7 @@ test("concurrent runner processes share one four-child scheduler", async (t) => 
 			`import { join } from "node:path";`,
 			`const marker = join(process.env.DSTACK_TEST_ACTIVE_DIR, String(process.pid));`,
 			`writeFileSync(marker, "active");`,
-			`await new Promise((resolve) => setTimeout(resolve, 1000));`,
+			`await new Promise((resolve) => setTimeout(resolve, 3000));`,
 			`const task = process.argv.at(-1).slice(6);`,
 			`process.stdout.write(JSON.stringify({type:"message_end",message:{role:"assistant",content:[{type:"text",text:task}]}}) + "\\n");`,
 			`unlinkSync(marker);`,
@@ -355,4 +358,176 @@ test("committed result reader rejects index corruption", async (t) => {
 	await commitWorkflowResult(workflow, index);
 	await writeFile(join(workflow.artifactDir, "result-index.json"), `${JSON.stringify({ ...index, workflowId: "other" })}\n`);
 	await assert.rejects(readCommittedWorkflowResult(workflow.artifactDir, digest, workflow.workflowId), /hash|sha256|integrity/);
+});
+
+test("parallel execution writes durable per-child progress v2 and startedAt/endedAt timestamps", async (t) => {
+	const cwd = await temporaryDirectory(t);
+	const workflow = manifest({
+		artifactDir: join(cwd, "artifacts"),
+		cwd,
+		mode: "parallel",
+		specs: [
+			spec(cwd, "task-0", { requestedRole: "feature", workflow: { assignment: "owner", playbook: "feature", phase: "design", completedPhases: [], artifacts: [] } }),
+			spec(cwd, "task-1", { requestedRole: "implementation-worker", workflow: { assignment: "worker", playbook: "feature", phase: "implement", completedPhases: ["design"], artifacts: [] } }),
+		],
+	});
+	const digest = "a".repeat(64);
+	const index = await executeWorkflow(workflow, digest, new AbortController().signal, {
+		slots: createLocalSlotAcquirer(2),
+		spawnChild: async () => {
+			await sleep(5);
+			return child("done");
+		},
+	});
+	await commitWorkflowResult(workflow, index);
+
+	const progressRaw = await readFile(join(workflow.artifactDir, "progress.json"), "utf8");
+	const progress = JSON.parse(progressRaw) as {
+		queued: number;
+		running: number;
+		complete: number;
+		total: number;
+		children: Array<{ index: number; state: string; startedAt?: string; endedAt?: string; assignment?: string; role?: string }>;
+	};
+	assert.equal(progress.queued, 0);
+	assert.equal(progress.running, 0);
+	assert.equal(progress.complete, 2);
+	assert.equal(progress.total, 2);
+	assert.equal(progress.children.length, 2);
+
+	for (const childRecord of progress.children) {
+		assert.equal(childRecord.state, "succeeded");
+		assert.ok(typeof childRecord.startedAt === "string" && childRecord.startedAt.length > 0);
+		assert.ok(typeof childRecord.endedAt === "string" && childRecord.endedAt.length > 0);
+		const startMs = Date.parse(childRecord.startedAt!);
+		const endMs = Date.parse(childRecord.endedAt!);
+		assert.ok(!Number.isNaN(startMs));
+		assert.ok(!Number.isNaN(endMs));
+		assert.ok(startMs <= endMs);
+	}
+
+	const childResultRaw = await readFile(join(workflow.artifactDir, "children", "0", "result.json"), "utf8");
+	const childResult = JSON.parse(childResultRaw) as { schemaVersion: string; startedAt?: string; endedAt?: string; state: string };
+	assert.equal(childResult.schemaVersion, "dstack.child-result.v1");
+	assert.equal(childResult.state, "succeeded");
+	assert.ok(typeof childResult.startedAt === "string");
+	assert.ok(typeof childResult.endedAt === "string");
+});
+
+test("chain execution stamps skipped steps with endedAt and no startedAt", async (t) => {
+	const cwd = await temporaryDirectory(t);
+	const workflow = manifest({
+		artifactDir: join(cwd, "artifacts"),
+		cwd,
+		mode: "chain",
+		specs: [
+			spec(cwd, "first-step"),
+			spec(cwd, "second-step"),
+		],
+	});
+	const digest = "b".repeat(64);
+	const index = await executeWorkflow(workflow, digest, new AbortController().signal, {
+		slots: createLocalSlotAcquirer(1),
+		spawnChild: async () => child("failing output", 1),
+	});
+	await commitWorkflowResult(workflow, index);
+
+	const progressRaw = await readFile(join(workflow.artifactDir, "progress.json"), "utf8");
+	const progress = JSON.parse(progressRaw) as {
+		children: Array<{ index: number; state: string; startedAt?: string; endedAt?: string }>;
+	};
+	assert.equal(progress.children.length, 2);
+	assert.equal(progress.children[0]?.state, "failed");
+	assert.ok(typeof progress.children[0]?.startedAt === "string");
+	assert.ok(typeof progress.children[0]?.endedAt === "string");
+
+	assert.equal(progress.children[1]?.state, "skipped");
+	assert.equal(progress.children[1]?.startedAt, undefined);
+	assert.ok(typeof progress.children[1]?.endedAt === "string");
+});
+
+test("child execution exports index and artifact dir env vars and writes activity.json onUpdate", async (t) => {
+	const cwd = await temporaryDirectory(t);
+	const workflow = manifest({
+		artifactDir: join(cwd, "artifacts"),
+		cwd,
+		mode: "single",
+		specs: [spec(cwd, "test-task")],
+	});
+
+	let capturedChildIndex: string | undefined;
+	let capturedArtifactDir: string | undefined;
+
+	const index = await executeWorkflow(workflow, "c".repeat(64), new AbortController().signal, {
+		slots: createLocalSlotAcquirer(1),
+		spawnChild: async ({ env, onUpdate }) => {
+			capturedChildIndex = env[DSTACK_CHILD_INDEX_ENV];
+			capturedArtifactDir = env[DSTACK_ARTIFACT_DIR_ENV];
+
+			onUpdate?.({
+				exitCode: -1,
+				text: "working on step 1",
+				stderr: "",
+				messages: [
+					{
+						role: "assistant",
+						content: [{ type: "toolCall", name: "read", arguments: { path: "src/index.ts" } }],
+					},
+				],
+				usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: 0.001, contextTokens: 500, turns: 1 },
+			});
+
+			await sleep(50);
+
+			onUpdate?.({
+				exitCode: -1,
+				text: "working on step 2",
+				stderr: "",
+				messages: [
+					{
+						role: "assistant",
+						content: [{ type: "toolCall", name: "bash", arguments: { command: "npm test" } }],
+					},
+				],
+				usage: { input: 200, output: 100, cacheRead: 0, cacheWrite: 0, cost: 0.002, contextTokens: 1000, turns: 2 },
+			});
+
+			await sleep(50);
+			return child("all done", 0);
+		},
+	});
+	await commitWorkflowResult(workflow, index);
+
+	assert.equal(capturedChildIndex, "0");
+	assert.equal(capturedArtifactDir, workflow.artifactDir);
+
+	const activityRaw = await readFile(join(workflow.artifactDir, "children", "0", "activity.json"), "utf8");
+	const activity = JSON.parse(activityRaw) as {
+		schemaVersion: string;
+		workflowId: string;
+		index: number;
+		activity: string;
+		turns: number;
+		contextTokens: number;
+		updatedAt: string;
+	};
+
+	assert.equal(activity.schemaVersion, "dstack.child-activity.v1");
+	assert.equal(activity.workflowId, workflow.workflowId);
+	assert.equal(activity.index, 0);
+	assert.ok(activity.activity.includes("npm test") || activity.activity.includes("read"));
+	assert.ok(activity.turns >= 1);
+	assert.ok(typeof activity.updatedAt === "string");
+
+	await writeFile(join(workflow.artifactDir, "manifest.json"), JSON.stringify(workflow), "utf8");
+	const snapshot = await buildTreeSnapshot({
+		taskId: "task-test",
+		workflowId: workflow.workflowId,
+		artifactDir: workflow.artifactDir,
+		schedulerRoot: workflow.schedulerRoot,
+	});
+
+	assert.ok(snapshot !== undefined);
+	assert.equal(snapshot.children[0]?.state, "succeeded");
+	assert.equal(snapshot.children[0]?.outcome, "all done");
 });

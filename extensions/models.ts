@@ -216,6 +216,26 @@ export function resolveModel(input: {
 	return { ok: true, value: { model: value, omitModel: false, requestedRole: input.role } };
 }
 
+export function resolveNestedLaunchModel(input: {
+	resolution?: { model?: string; omitModel: boolean };
+	env?: NodeJS.Dict<string>;
+}): string | undefined {
+	if (!input.resolution) return undefined;
+	if (input.resolution.model !== undefined && input.resolution.model.trim() !== "" && !isAlias(input.resolution.model)) {
+		return input.resolution.model.trim();
+	}
+	if (input.resolution.omitModel) {
+		const env = input.env ?? process.env;
+		const provider = env.PI_PROVIDER?.trim();
+		const model = env.PI_MODEL?.trim();
+		if (provider && model) {
+			if (model.includes("/")) return model;
+			return `${provider}/${model}`;
+		}
+	}
+	return undefined;
+}
+
 export async function loadConfig(path: string): Promise<ConfigResult<DstackConfig>> {
 	let text: string;
 	try {
