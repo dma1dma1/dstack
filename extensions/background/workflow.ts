@@ -7,9 +7,12 @@ import { MAX_CONCURRENCY, NESTING_ENV } from "../types.ts";
 import { createWorktree } from "../worktree.ts";
 import { atomicWriteFile, readOutputArtifact, toAbsolutePath, writeSealedArtifact, type OutputArtifactSeal } from "./artifacts.ts";
 import { acquireChildSlot } from "./scheduler.ts";
+import { latestActivity, type ChildActivityV1, type ProgressChildV1, type WorkflowProgressV2 } from "./tree.ts";
 
 export const ROOT_WORKFLOW_ENV = "DSTACK_ROOT_WORKFLOW";
 export const SCHEDULER_ROOT_ENV = "DSTACK_SCHEDULER_ROOT";
+export const DSTACK_CHILD_INDEX_ENV = "DSTACK_CHILD_INDEX";
+export const DSTACK_ARTIFACT_DIR_ENV = "DSTACK_ARTIFACT_DIR";
 
 export type WorkflowMode = "single" | "parallel" | "chain";
 
@@ -146,14 +149,19 @@ function syntheticResult(input: Readonly<{ spec: ResolvedChildSpec; cwd: string;
 	};
 }
 
-async function writeProgress(manifest: WorkflowManifestV1, states: readonly (ChildState | "queued" | "running")[]): Promise<void> {
-	const progress = {
-		queued: states.filter((state) => state === "queued").length,
-		running: states.filter((state) => state === "running").length,
-		complete: states.filter((state) => state !== "queued" && state !== "running").length,
-		total: states.length,
+async function writeProgress(manifest: WorkflowManifestV1, children: readonly ProgressChildV1[]): Promise<void> {
+	const queued = children.filter((child) => child.state === "queued").length;
+	const running = children.filter((child) => child.state === "running").length;
+	const complete = children.filter((child) => child.state !== "queued" && child.state !== "running").length;
+	const total = children.length;
+	const payload: WorkflowProgressV2 = {
+		queued,
+		running,
+		complete,
+		total,
+		children,
 	};
-	await atomicWriteFile(join(manifest.artifactDir, "progress.json"), `${JSON.stringify(progress)}\n`);
+	await atomicWriteFile(join(manifest.artifactDir, "progress.json"), `${JSON.stringify(payload)}\n`);
 }
 
 function taskResult(child: ChildResult, spec: ResolvedChildSpec, cwd: string, task: string, step?: number): TaskResult {
@@ -166,6 +174,8 @@ async function sealChild(input: Readonly<{
 	state: ChildState;
 	result: TaskResult;
 	fullOutput: string;
+	startedAt?: string;
+	endedAt?: string;
 }>): Promise<ChildIndexEntry> {
 	const directory = join(input.manifest.artifactDir, "children", String(input.index));
 	await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -176,6 +186,8 @@ async function sealChild(input: Readonly<{
 		workflowId: input.manifest.workflowId,
 		index: input.index,
 		state: input.state,
+		startedAt: input.startedAt,
+		endedAt: input.endedAt,
 		result: input.result,
 		output,
 	};
@@ -192,6 +204,70 @@ function resolvedToolsAllowlist(tools: string | undefined): readonly string[] | 
 	return tools.split(",");
 }
 
+function createThrottledWriter<T>(filePath: string, minIntervalMs = 1000) {
+	let lastWriteTime = 0;
+	let pendingData: T | undefined;
+	let timer: NodeJS.Timeout | undefined;
+	let writePromise: Promise<void> | undefined;
+	let disposed = false;
+
+	const flush = async (): Promise<void> => {
+		if (writePromise !== undefined) {
+			await writePromise;
+			if (pendingData !== undefined) await flush();
+			return;
+		}
+		if (pendingData === undefined) return;
+		const data = pendingData;
+		pendingData = undefined;
+		writePromise = (async () => {
+			try {
+				await atomicWriteFile(filePath, `${JSON.stringify(data, null, 2)}\n`);
+				lastWriteTime = Date.now();
+			} catch {}
+		})();
+		await writePromise;
+		writePromise = undefined;
+		if (pendingData !== undefined && !disposed) schedule();
+	};
+
+	const schedule = () => {
+		if (timer !== undefined || disposed) return;
+		const elapsed = Date.now() - lastWriteTime;
+		const delay = Math.max(0, minIntervalMs - elapsed);
+		timer = setTimeout(() => {
+			timer = undefined;
+			void flush();
+		}, delay);
+		timer.unref?.();
+	};
+
+	return {
+		write(data: T) {
+			if (disposed) return;
+			pendingData = data;
+			const elapsed = Date.now() - lastWriteTime;
+			if (elapsed >= minIntervalMs && writePromise === undefined) {
+				if (timer !== undefined) {
+					clearTimeout(timer);
+					timer = undefined;
+				}
+				void flush();
+			} else {
+				schedule();
+			}
+		},
+		async dispose() {
+			disposed = true;
+			if (timer !== undefined) {
+				clearTimeout(timer);
+				timer = undefined;
+			}
+			await flush();
+		},
+	};
+}
+
 export async function executeWorkflow(
 	manifest: WorkflowManifestV1,
 	manifestSha256: string,
@@ -200,10 +276,16 @@ export async function executeWorkflow(
 ): Promise<WorkflowResultIndexV1> {
 	const spawnChild = dependencies.spawnChild ?? runChildProcess;
 	const makeWorktree = dependencies.createWorktree ?? createWorktree;
-	const states: (ChildState | "queued" | "running")[] = manifest.specs.map(() => "queued");
+	const childMeta: ProgressChildV1[] = manifest.specs.map((spec, index) => ({
+		index,
+		agent: spec.agent,
+		state: "queued",
+		role: spec.requestedRole,
+		assignment: spec.workflow?.assignment,
+	}));
 	const results: TaskResult[] = new Array(manifest.specs.length);
 	const entries: ChildIndexEntry[] = new Array(manifest.specs.length);
-	await writeProgress(manifest, states);
+	await writeProgress(manifest, childMeta);
 
 	const runOne = async (spec: ResolvedChildSpec, index: number, task: string): Promise<{ state: ChildState; output: string }> => {
 		if (signal.aborted) throw abortError(signal);
@@ -216,10 +298,16 @@ export async function executeWorkflow(
 					signal,
 				})
 			: await dependencies.slots.acquire({ workflowId: manifest.workflowId, childIndex: index, signal });
+		let startedAt: string | undefined;
 		try {
 			if (signal.aborted) throw abortError(signal);
-			states[index] = "running";
-			await writeProgress(manifest, states);
+			startedAt = new Date().toISOString();
+			childMeta[index] = {
+				...childMeta[index],
+				state: "running",
+				startedAt,
+			};
+			await writeProgress(manifest, childMeta);
 			let cwd = spec.cwd;
 			if (spec.worktree !== undefined) {
 				cwd = await makeWorktree({
@@ -250,21 +338,46 @@ export async function executeWorkflow(
 			env[NESTING_ENV] = "1";
 			env[ROOT_WORKFLOW_ENV] = manifest.workflowId;
 			env[SCHEDULER_ROOT_ENV] = manifest.schedulerRoot;
-			const child = await spawnChild({
-				args,
-				cwd,
-				env,
-				invocation,
-				signal,
-				onSpawn: (pid) => lease.bindChild(pid),
-			});
-			const state: ChildState = signal.aborted ? "cancelled" : child.exitCode === 0 ? "succeeded" : "failed";
-			const completed = taskResult(child, spec, cwd, task, manifest.mode === "chain" ? index + 1 : undefined);
-			results[index] = completed;
-			entries[index] = await sealChild({ manifest, index, state, result: completed, fullOutput: child.text });
-			states[index] = state;
-			await writeProgress(manifest, states);
-			return { state, output: child.text };
+			env[DSTACK_CHILD_INDEX_ENV] = String(index);
+			env[DSTACK_ARTIFACT_DIR_ENV] = manifest.artifactDir;
+			const activityPath = join(childDirectory, "activity.json");
+			const throttledActivity = createThrottledWriter<ChildActivityV1>(activityPath, 1000);
+			try {
+				const child = await spawnChild({
+					args,
+					cwd,
+					env,
+					invocation,
+					signal,
+					onSpawn: (pid) => lease.bindChild(pid),
+					onUpdate: (partial) => {
+						throttledActivity.write({
+							schemaVersion: "dstack.child-activity.v1",
+							workflowId: manifest.workflowId,
+							index,
+							activity: latestActivity(partial),
+							updatedAt: new Date().toISOString(),
+							turns: partial.usage.turns,
+							contextTokens: partial.usage.contextTokens,
+						});
+					},
+				});
+				const endedAt = new Date().toISOString();
+				const state: ChildState = signal.aborted ? "cancelled" : child.exitCode === 0 ? "succeeded" : "failed";
+				const completed = taskResult(child, spec, cwd, task, manifest.mode === "chain" ? index + 1 : undefined);
+				results[index] = completed;
+				entries[index] = await sealChild({ manifest, index, state, result: completed, fullOutput: child.text, startedAt, endedAt });
+				childMeta[index] = {
+					...childMeta[index],
+					state,
+					startedAt,
+					endedAt,
+				};
+				await writeProgress(manifest, childMeta);
+				return { state, output: child.text };
+			} finally {
+				await throttledActivity.dispose();
+			}
 		} finally {
 			await lease.release();
 		}
@@ -278,10 +391,15 @@ export async function executeWorkflow(
 				const state = signal.aborted ? "cancelled" : "skipped";
 				const message = signal.aborted ? "Workflow cancelled before this step started." : "Skipped because an earlier chain step failed.";
 				const skipped = syntheticResult({ spec, cwd: spec.cwd, step: index + 1, state, message });
+				const endedAt = new Date().toISOString();
 				results[index] = skipped;
-				entries[index] = await sealChild({ manifest, index, state, result: skipped, fullOutput: "" });
-				states[index] = state;
-				await writeProgress(manifest, states);
+				entries[index] = await sealChild({ manifest, index, state, result: skipped, fullOutput: "", endedAt });
+				childMeta[index] = {
+					...childMeta[index],
+					state,
+					endedAt,
+				};
+				await writeProgress(manifest, childMeta);
 				continue;
 			}
 			const task = spec.task.replaceAll("{previous}", previous);
@@ -291,10 +409,16 @@ export async function executeWorkflow(
 				if (outcome.state !== "succeeded") stopped = true;
 			} catch (error) {
 				if (!signal.aborted) throw error;
+				const endedAt = new Date().toISOString();
 				const cancelled = syntheticResult({ spec: { ...spec, task }, cwd: spec.cwd, step: index + 1, state: "cancelled", message: abortError(signal).message });
 				results[index] = cancelled;
-				entries[index] = await sealChild({ manifest, index, state: "cancelled", result: cancelled, fullOutput: "" });
-				states[index] = "cancelled";
+				entries[index] = await sealChild({ manifest, index, state: "cancelled", result: cancelled, fullOutput: "", endedAt });
+				childMeta[index] = {
+					...childMeta[index],
+					state: "cancelled",
+					endedAt,
+				};
+				await writeProgress(manifest, childMeta);
 			}
 		}
 	} else {
@@ -303,27 +427,32 @@ export async function executeWorkflow(
 				await runOne(spec, index, spec.task);
 			} catch (error) {
 				if (!signal.aborted) throw error;
+				const endedAt = new Date().toISOString();
 				const cancelled = syntheticResult({ spec, cwd: spec.cwd, state: "cancelled", message: abortError(signal).message });
 				results[index] = cancelled;
-				entries[index] = await sealChild({ manifest, index, state: "cancelled", result: cancelled, fullOutput: "" });
-				states[index] = "cancelled";
-				await writeProgress(manifest, states);
+				entries[index] = await sealChild({ manifest, index, state: "cancelled", result: cancelled, fullOutput: "", endedAt });
+				childMeta[index] = {
+					...childMeta[index],
+					state: "cancelled",
+					endedAt,
+				};
+				await writeProgress(manifest, childMeta);
 			}
 		}));
 	}
 
-	const succeeded = states.filter((state) => state === "succeeded").length;
-	const cancelled = states.filter((state) => state === "cancelled").length;
-	const failed = states.length - succeeded - cancelled;
+	const succeeded = childMeta.filter((child) => child.state === "succeeded").length;
+	const cancelled = childMeta.filter((child) => child.state === "cancelled").length;
+	const failed = childMeta.length - succeeded - cancelled;
 	const outcome = cancelled > 0 ? "cancelled" : failed > 0 ? "failed" : "succeeded";
-	await writeProgress(manifest, states);
+	await writeProgress(manifest, childMeta);
 	return {
 		schemaVersion: "dstack.result-index.v1",
 		workflowId: manifest.workflowId,
 		manifestSha256,
 		mode: manifest.mode,
 		outcome,
-		summary: { total: states.length, succeeded, failed, cancelled },
+		summary: { total: childMeta.length, succeeded, failed, cancelled },
 		package: { mode: manifest.mode, results },
 		children: entries,
 	};

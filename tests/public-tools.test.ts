@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEventBus, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { test } from "node:test";
 import dstack from "../extensions/dstack.ts";
 import { commitWorkflowResult, parseWorkflowManifest } from "../extensions/background/runner.ts";
-import { createLocalSlotAcquirer, executeWorkflow } from "../extensions/background/workflow.ts";
+import { createLocalSlotAcquirer, executeWorkflow, DSTACK_ARTIFACT_DIR_ENV, DSTACK_CHILD_INDEX_ENV, ROOT_WORKFLOW_ENV, SCHEDULER_ROOT_ENV } from "../extensions/background/workflow.ts";
+import { parseSpawnRecordV1 } from "../extensions/background/tree.ts";
 
 const RESPONSE_CHANNEL = "pi-background-tasks:response:v1";
 const REQUEST_CHANNEL = "pi-background-tasks:request:v1";
@@ -22,16 +23,40 @@ function response(requestId: string, operation: string, result: unknown) {
 	};
 }
 
+async function waitUntil(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() >= deadline) throw new Error(`condition not met within ${timeoutMs}ms`);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+}
+
 function testRuntime(events: ReturnType<typeof createEventBus>) {
 	const tools = new Map<string, { execute: (...args: unknown[]) => Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown; isError?: boolean }> }>();
 	const handlers = new Map<string, (...args: unknown[]) => unknown>();
+	const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<unknown> }>();
+	const shortcuts = new Map<string, { description: string; handler: (ctx: unknown) => Promise<unknown> }>();
+	const entryRenderers = new Map<string, (entry: unknown, options: unknown, theme: unknown) => unknown>();
+	const entries: Array<{ customType: string; data: unknown }> = [];
+	const notifications: Array<{ message: string; level: string }> = [];
 	const widgets: string[] = [];
+	let customOverlayOpened = 0;
 	const pi = {
 		events,
 		registerTool(tool: { name: string }) { tools.set(tool.name, tool as never); },
-		registerCommand() {},
+		registerCommand(name: string, def: { handler: (args: string, ctx: unknown) => Promise<unknown> }) {
+			commands.set(name, def);
+		},
+		registerShortcut(key: string, def: { description: string; handler: (ctx: unknown) => Promise<unknown> }) {
+			shortcuts.set(key, def);
+		},
+		registerEntryRenderer(type: string, renderer: (entry: unknown, options: unknown, theme: unknown) => unknown) {
+			entryRenderers.set(type, renderer);
+		},
 		on(name: string, handler: (...args: unknown[]) => unknown) { handlers.set(name, handler); },
-		appendEntry() {},
+		appendEntry(customType: string, data: unknown) {
+			entries.push({ customType, data });
+		},
 		getAllTools() { return [...tools.keys()].map((name) => ({ name })); },
 		sendMessage() {},
 		sendUserMessage() {},
@@ -43,16 +68,34 @@ function testRuntime(events: ReturnType<typeof createEventBus>) {
 		hasUI: true,
 		ui: {
 			setStatus() {},
-			setWidget(name: string) { widgets.push(name); },
-			notify() {},
+			setWidget(name: string, content?: unknown) {
+				if (content === undefined) {
+					const idx = widgets.indexOf(name);
+					if (idx >= 0) widgets.splice(idx, 1);
+				} else if (!widgets.includes(name)) {
+					widgets.push(name);
+				}
+			},
+			notify(message: string, level: string) {
+				notifications.push({ message, level });
+			},
+			async custom(factory: (...args: unknown[]) => { render: (w: number) => string[]; dispose?: () => void }, _options: unknown) {
+				customOverlayOpened++;
+				const done = (_res: unknown) => {};
+				const component = factory({ requestRender: () => {} }, { fg: (_: string, t: string) => t }, {}, done);
+				if (typeof component === "object" && component !== null && "dispose" in component && typeof component.dispose === "function") {
+					component.dispose();
+				}
+				return "closed";
+			},
 		},
 		sessionManager: {
-			getBranch: () => [],
+			getBranch: (): unknown[] => [],
 			getSessionId: () => "public-tools-session",
 		},
 		modelRegistry: { getAvailable: () => [] },
 	};
-	return { tools, handlers, widgets, ctx };
+	return { tools, handlers, commands, shortcuts, entryRenderers, entries, notifications, widgets, getCustomOverlayOpened: () => customOverlayOpened, ctx };
 }
 
 test("root task returns a receipt before the runner completes and dstack_result projects running and ordered completion", async (t) => {
@@ -60,8 +103,10 @@ test("root task returns a receipt before the runner completes and dstack_result 
 	t.after(() => rm(home, { recursive: true, force: true }));
 	const previousHome = process.env.HOME;
 	const previousDepth = process.env.DSTACK_NESTING;
+	const previousAssignment = process.env.DSTACK_ASSIGNMENT;
 	process.env.HOME = home;
 	delete process.env.DSTACK_NESTING;
+	delete process.env.DSTACK_ASSIGNMENT;
 	const configPath = join(home, ".pi", "agent", "dstack", "models.json");
 	await mkdir(join(home, ".pi", "agent", "dstack"), { recursive: true });
 	await writeFile(configPath, JSON.stringify({
@@ -75,6 +120,8 @@ test("root task returns a receipt before the runner completes and dstack_result 
 		process.env.HOME = previousHome;
 		if (previousDepth === undefined) delete process.env.DSTACK_NESTING;
 		else process.env.DSTACK_NESTING = previousDepth;
+		if (previousAssignment === undefined) delete process.env.DSTACK_ASSIGNMENT;
+		else process.env.DSTACK_ASSIGNMENT = previousAssignment;
 	});
 
 	const events = createEventBus();
@@ -227,7 +274,9 @@ test("depth 1 keeps the synchronous execution path", async () => {
 	const runtime = testRuntime(events);
 	await runtime.handlers.get("session_start")?.({}, runtime.ctx);
 	const previousDepth = process.env.DSTACK_NESTING;
+	const previousAssignment = process.env.DSTACK_ASSIGNMENT;
 	process.env.DSTACK_NESTING = "1";
+	delete process.env.DSTACK_ASSIGNMENT;
 	try {
 		const result = await runtime.tools.get("dstack_task")?.execute(
 			"nested-call",
@@ -243,5 +292,548 @@ test("depth 1 keeps the synchronous execution path", async () => {
 		stop();
 		if (previousDepth === undefined) delete process.env.DSTACK_NESTING;
 		else process.env.DSTACK_NESTING = previousDepth;
+		if (previousAssignment === undefined) delete process.env.DSTACK_ASSIGNMENT;
+		else process.env.DSTACK_ASSIGNMENT = previousAssignment;
 	}
+});
+
+test("depth-1 nested dstack_task writes spawn record with parentage and phase when env vars are present", async (t) => {
+	const cwd = await mkdtemp(join(tmpdir(), "dstack-nested-spawn-"));
+	t.after(() => rm(cwd, { recursive: true, force: true }));
+
+	const artifactDir = join(cwd, "artifacts");
+	const schedulerRoot = join(cwd, "scheduler");
+	await mkdir(artifactDir, { recursive: true });
+	await mkdir(schedulerRoot, { recursive: true });
+
+	const events = createEventBus();
+	const runtime = testRuntime(events);
+	await runtime.handlers.get("session_start")?.({}, runtime.ctx);
+
+	const previousDepth = process.env.DSTACK_NESTING;
+	const previousAssignment = process.env.DSTACK_ASSIGNMENT;
+	const previousRootWf = process.env[ROOT_WORKFLOW_ENV];
+	const previousSchedRoot = process.env[SCHEDULER_ROOT_ENV];
+	const previousChildIdx = process.env[DSTACK_CHILD_INDEX_ENV];
+	const previousArtifactDir = process.env[DSTACK_ARTIFACT_DIR_ENV];
+
+	process.env.DSTACK_NESTING = "1";
+	process.env.DSTACK_ASSIGNMENT = "owner";
+	process.env[ROOT_WORKFLOW_ENV] = "wf-nested-test";
+	process.env[SCHEDULER_ROOT_ENV] = schedulerRoot;
+	process.env[DSTACK_CHILD_INDEX_ENV] = "0";
+	process.env[DSTACK_ARTIFACT_DIR_ENV] = artifactDir;
+
+	try {
+		const res = await runtime.tools.get("dstack_task")?.execute(
+			"nested-call",
+			{
+				agent: "missing-agent",
+				task: "nested worker brief with full multiline\ninstruction content",
+				cwd,
+				tools: "read,write",
+				model: "anthropic/claude-3-5-sonnet",
+				workflow: {
+					playbook: "feature",
+					assignment: "worker",
+					phase: "implement",
+					completedPhases: ["ground"],
+					artifacts: [{ name: "ground-doc", path: "/tmp/ground.md", sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" }],
+				},
+			},
+			undefined,
+			undefined,
+			runtime.ctx,
+		);
+		assert.equal(res?.isError, true);
+		assert.match(res?.content[0]?.text ?? "", /Unknown agent/);
+
+		const spawnsDir = join(artifactDir, "children", "0", "spawns");
+		const files = await readdir(spawnsDir);
+		assert.equal(files.length, 1);
+		const raw = await readFile(join(spawnsDir, files[0]!), "utf8");
+		const spawnRecord = parseSpawnRecordV1(JSON.parse(raw));
+		assert.ok(spawnRecord !== undefined);
+		assert.equal(spawnRecord.workflowId, "wf-nested-test");
+		assert.equal(spawnRecord.parentIndex, 0);
+		assert.equal(spawnRecord.phase, "implement");
+		assert.equal(spawnRecord.children.length, 1);
+
+		const child = spawnRecord.children[0];
+		assert.ok(child !== undefined);
+		assert.equal(child.agent, "missing-agent");
+		assert.equal(child.role, undefined);
+		assert.equal(child.assignment, "worker");
+		assert.equal(child.taskFull, "nested worker brief with full multiline\ninstruction content");
+		assert.equal(child.taskPreview, "nested worker brief with full multiline");
+		assert.equal(child.cwd, cwd);
+		assert.equal(child.tools, "read,write");
+		assert.equal(child.model, "anthropic/claude-3-5-sonnet");
+		assert.equal(child.workflow?.playbook, "feature");
+		assert.equal(child.workflow?.phase, "implement");
+		assert.deepEqual(child.workflow?.completedPhases, ["ground"]);
+		assert.deepEqual(child.workflow?.artifacts, [{ name: "ground-doc", path: "/tmp/ground.md", sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" }]);
+		assert.equal(child.state, "failed");
+		assert.match(child.errorMessage ?? "", /Unknown agent/);
+		assert.ok(typeof child.endedAt === "string" && child.endedAt.length > 0);
+	} finally {
+		if (previousDepth === undefined) delete process.env.DSTACK_NESTING;
+		else process.env.DSTACK_NESTING = previousDepth;
+		if (previousAssignment === undefined) delete process.env.DSTACK_ASSIGNMENT;
+		else process.env.DSTACK_ASSIGNMENT = previousAssignment;
+		if (previousRootWf === undefined) delete process.env[ROOT_WORKFLOW_ENV];
+		else process.env[ROOT_WORKFLOW_ENV] = previousRootWf;
+		if (previousSchedRoot === undefined) delete process.env[SCHEDULER_ROOT_ENV];
+		else process.env[SCHEDULER_ROOT_ENV] = previousSchedRoot;
+		if (previousChildIdx === undefined) delete process.env[DSTACK_CHILD_INDEX_ENV];
+		else process.env[DSTACK_CHILD_INDEX_ENV] = previousChildIdx;
+		if (previousArtifactDir === undefined) delete process.env[DSTACK_ARTIFACT_DIR_ENV];
+		else process.env[DSTACK_ARTIFACT_DIR_ENV] = previousArtifactDir;
+	}
+});
+
+test("depth-1 nested dstack_task persists concrete model from PI_PROVIDER and PI_MODEL for inherit-parent worker", async (t) => {
+	const cwd = await mkdtemp(join(tmpdir(), "dstack-nested-env-model-"));
+	t.after(() => rm(cwd, { recursive: true, force: true }));
+
+	const artifactDir = join(cwd, "artifacts");
+	const schedulerRoot = join(cwd, "scheduler");
+	await mkdir(artifactDir, { recursive: true });
+	await mkdir(schedulerRoot, { recursive: true });
+
+	const configPath = join(cwd, ".pi", "agent", "dstack", "models.json");
+	await mkdir(join(cwd, ".pi", "agent", "dstack"), { recursive: true });
+	await writeFile(configPath, JSON.stringify({
+		roles: { "implementation-worker": "inherit-parent" },
+	}), "utf8");
+
+	const previousHome = process.env.HOME;
+	const previousDepth = process.env.DSTACK_NESTING;
+	const previousAssignment = process.env.DSTACK_ASSIGNMENT;
+	const previousRootWf = process.env[ROOT_WORKFLOW_ENV];
+	const previousSchedRoot = process.env[SCHEDULER_ROOT_ENV];
+	const previousChildIdx = process.env[DSTACK_CHILD_INDEX_ENV];
+	const previousArtifactDir = process.env[DSTACK_ARTIFACT_DIR_ENV];
+	const previousProvider = process.env.PI_PROVIDER;
+	const previousModel = process.env.PI_MODEL;
+
+	process.env.HOME = cwd;
+	process.env.DSTACK_NESTING = "1";
+	process.env.DSTACK_ASSIGNMENT = "owner";
+	process.env[ROOT_WORKFLOW_ENV] = "wf-nested-env-model";
+	process.env[SCHEDULER_ROOT_ENV] = schedulerRoot;
+	process.env[DSTACK_CHILD_INDEX_ENV] = "0";
+	process.env[DSTACK_ARTIFACT_DIR_ENV] = artifactDir;
+	process.env.PI_PROVIDER = "anthropic";
+	process.env.PI_MODEL = "claude-3-7-sonnet";
+
+	const events = createEventBus();
+	const runtime = testRuntime(events);
+	await runtime.handlers.get("session_start")?.({}, runtime.ctx);
+
+	try {
+		const res = await runtime.tools.get("dstack_task")?.execute(
+			"nested-call",
+			{
+				agent: "missing-agent",
+				task: "implement worker task",
+				cwd,
+				role: "implementation-worker",
+				workflow: {
+					playbook: "feature",
+					assignment: "worker",
+					phase: "implementation",
+					completedPhases: ["grounding"],
+					artifacts: [],
+				},
+			},
+			undefined,
+			undefined,
+			runtime.ctx,
+		);
+		assert.equal(res?.isError, true);
+
+		const spawnsDir = join(artifactDir, "children", "0", "spawns");
+		const files = await readdir(spawnsDir);
+		assert.equal(files.length, 1);
+		const raw = await readFile(join(spawnsDir, files[0]!), "utf8");
+		const spawnRecord = parseSpawnRecordV1(JSON.parse(raw));
+		assert.ok(spawnRecord !== undefined);
+		assert.equal(spawnRecord.children.length, 1);
+
+		const child = spawnRecord.children[0];
+		assert.ok(child !== undefined);
+		assert.equal(child.role, "implementation-worker");
+		assert.equal(child.model, "anthropic/claude-3-7-sonnet");
+	} finally {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		if (previousDepth === undefined) delete process.env.DSTACK_NESTING;
+		else process.env.DSTACK_NESTING = previousDepth;
+		if (previousAssignment === undefined) delete process.env.DSTACK_ASSIGNMENT;
+		else process.env.DSTACK_ASSIGNMENT = previousAssignment;
+		if (previousRootWf === undefined) delete process.env[ROOT_WORKFLOW_ENV];
+		else process.env[ROOT_WORKFLOW_ENV] = previousRootWf;
+		if (previousSchedRoot === undefined) delete process.env[SCHEDULER_ROOT_ENV];
+		else process.env[SCHEDULER_ROOT_ENV] = previousSchedRoot;
+		if (previousChildIdx === undefined) delete process.env[DSTACK_CHILD_INDEX_ENV];
+		else process.env[DSTACK_CHILD_INDEX_ENV] = previousChildIdx;
+		if (previousArtifactDir === undefined) delete process.env[DSTACK_ARTIFACT_DIR_ENV];
+		else process.env[DSTACK_ARTIFACT_DIR_ENV] = previousArtifactDir;
+		if (previousProvider === undefined) delete process.env.PI_PROVIDER;
+		else process.env.PI_PROVIDER = previousProvider;
+		if (previousModel === undefined) delete process.env.PI_MODEL;
+		else process.env.PI_MODEL = previousModel;
+	}
+});
+
+test("depth-1 nested dstack_task ignores missing env vars and does not write spawn records", async () => {
+	const events = createEventBus();
+	const runtime = testRuntime(events);
+	await runtime.handlers.get("session_start")?.({}, runtime.ctx);
+
+	const previousDepth = process.env.DSTACK_NESTING;
+	const previousAssignment = process.env.DSTACK_ASSIGNMENT;
+	const previousRootWf = process.env[ROOT_WORKFLOW_ENV];
+	const previousSchedRoot = process.env[SCHEDULER_ROOT_ENV];
+	const previousChildIdx = process.env[DSTACK_CHILD_INDEX_ENV];
+	const previousArtifactDir = process.env[DSTACK_ARTIFACT_DIR_ENV];
+
+	process.env.DSTACK_NESTING = "1";
+	process.env.DSTACK_ASSIGNMENT = "owner";
+	delete process.env[ROOT_WORKFLOW_ENV];
+	delete process.env[SCHEDULER_ROOT_ENV];
+	delete process.env[DSTACK_CHILD_INDEX_ENV];
+	delete process.env[DSTACK_ARTIFACT_DIR_ENV];
+
+	try {
+		const res = await runtime.tools.get("dstack_task")?.execute(
+			"nested-missing-env",
+			{
+				agent: "missing-agent",
+				task: "fail without env",
+			},
+			undefined,
+			undefined,
+			runtime.ctx,
+		);
+		assert.equal(res?.isError, true);
+		assert.match(res?.content[0]?.text ?? "", /Unknown agent/);
+	} finally {
+		if (previousDepth === undefined) delete process.env.DSTACK_NESTING;
+		else process.env.DSTACK_NESTING = previousDepth;
+		if (previousAssignment === undefined) delete process.env.DSTACK_ASSIGNMENT;
+		else process.env.DSTACK_ASSIGNMENT = previousAssignment;
+		if (previousRootWf === undefined) delete process.env[ROOT_WORKFLOW_ENV];
+		else process.env[ROOT_WORKFLOW_ENV] = previousRootWf;
+		if (previousSchedRoot === undefined) delete process.env[SCHEDULER_ROOT_ENV];
+		else process.env[SCHEDULER_ROOT_ENV] = previousSchedRoot;
+		if (previousChildIdx === undefined) delete process.env[DSTACK_CHILD_INDEX_ENV];
+		else process.env[DSTACK_CHILD_INDEX_ENV] = previousChildIdx;
+		if (previousArtifactDir === undefined) delete process.env[DSTACK_ARTIFACT_DIR_ENV];
+		else process.env[DSTACK_ARTIFACT_DIR_ENV] = previousArtifactDir;
+	}
+});
+
+test("depth-1 nested chain stops and marks unstarted steps as skipped in spawn record", async (t) => {
+	const cwd = await mkdtemp(join(tmpdir(), "dstack-nested-chain-"));
+	t.after(() => rm(cwd, { recursive: true, force: true }));
+
+	const artifactDir = join(cwd, "artifacts");
+	const schedulerRoot = join(cwd, "scheduler");
+	await mkdir(artifactDir, { recursive: true });
+	await mkdir(schedulerRoot, { recursive: true });
+
+	const events = createEventBus();
+	const runtime = testRuntime(events);
+	await runtime.handlers.get("session_start")?.({}, runtime.ctx);
+
+	const previousDepth = process.env.DSTACK_NESTING;
+	const previousAssignment = process.env.DSTACK_ASSIGNMENT;
+	const previousRootWf = process.env[ROOT_WORKFLOW_ENV];
+	const previousSchedRoot = process.env[SCHEDULER_ROOT_ENV];
+	const previousChildIdx = process.env[DSTACK_CHILD_INDEX_ENV];
+	const previousArtifactDir = process.env[DSTACK_ARTIFACT_DIR_ENV];
+
+	process.env.DSTACK_NESTING = "1";
+	process.env.DSTACK_ASSIGNMENT = "owner";
+	process.env[ROOT_WORKFLOW_ENV] = "wf-chain-test";
+	process.env[SCHEDULER_ROOT_ENV] = schedulerRoot;
+	process.env[DSTACK_CHILD_INDEX_ENV] = "0";
+	process.env[DSTACK_ARTIFACT_DIR_ENV] = artifactDir;
+
+	try {
+		const res = await runtime.tools.get("dstack_task")?.execute(
+			"nested-chain",
+			{
+				chain: [
+					{ agent: "missing-agent", task: "failing step 1" },
+					{ agent: "general-purpose", task: "unstarted step 2" },
+				],
+			},
+			undefined,
+			undefined,
+			runtime.ctx,
+		);
+		assert.equal(res?.isError, true);
+
+		const spawnsDir = join(artifactDir, "children", "0", "spawns");
+		const files = await readdir(spawnsDir);
+		assert.equal(files.length, 1);
+		const raw = await readFile(join(spawnsDir, files[0]!), "utf8");
+		const spawnRecord = parseSpawnRecordV1(JSON.parse(raw));
+		assert.ok(spawnRecord !== undefined);
+		assert.equal(spawnRecord.mode, "chain");
+		assert.equal(spawnRecord.children.length, 2);
+
+		const step1 = spawnRecord.children[0];
+		assert.equal(step1?.agent, "missing-agent");
+		assert.equal(step1?.state, "failed");
+		assert.ok(typeof step1?.endedAt === "string");
+
+		const step2 = spawnRecord.children[1];
+		assert.equal(step2?.agent, "general-purpose");
+		assert.equal(step2?.state, "skipped");
+		assert.equal(step2?.startedAt, undefined);
+		assert.ok(typeof step2?.endedAt === "string");
+	} finally {
+		if (previousDepth === undefined) delete process.env.DSTACK_NESTING;
+		else process.env.DSTACK_NESTING = previousDepth;
+		if (previousAssignment === undefined) delete process.env.DSTACK_ASSIGNMENT;
+		else process.env.DSTACK_ASSIGNMENT = previousAssignment;
+		if (previousRootWf === undefined) delete process.env[ROOT_WORKFLOW_ENV];
+		else process.env[ROOT_WORKFLOW_ENV] = previousRootWf;
+		if (previousSchedRoot === undefined) delete process.env[SCHEDULER_ROOT_ENV];
+		else process.env[SCHEDULER_ROOT_ENV] = previousSchedRoot;
+		if (previousChildIdx === undefined) delete process.env[DSTACK_CHILD_INDEX_ENV];
+		else process.env[DSTACK_CHILD_INDEX_ENV] = previousChildIdx;
+		if (previousArtifactDir === undefined) delete process.env[DSTACK_ARTIFACT_DIR_ENV];
+		else process.env[DSTACK_ARTIFACT_DIR_ENV] = previousArtifactDir;
+	}
+});
+
+test("dtree command toggles widget and renders workflow snapshot entries", async (t) => {
+	const home = await mkdtemp(join(tmpdir(), "dstack-public-dtree-"));
+	t.after(() => rm(home, { recursive: true, force: true }));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	t.after(() => { process.env.HOME = previousHome; });
+
+	const events = createEventBus();
+	const runtime = testRuntime(events);
+	await runtime.handlers.get("session_start")?.({}, runtime.ctx);
+
+	const dtreeCommand = runtime.commands.get("dtree");
+	assert.ok(dtreeCommand !== undefined);
+
+	await dtreeCommand.handler("off", runtime.ctx);
+	assert.ok(runtime.notifications.some((n) => n.message.includes("widget disabled")));
+
+	await dtreeCommand.handler("on", runtime.ctx);
+	assert.ok(runtime.notifications.some((n) => n.message.includes("widget enabled")));
+
+	await dtreeCommand.handler("", runtime.ctx);
+	assert.ok(runtime.notifications.some((n) => n.message.includes("no dstack workflow in this session")));
+
+	const renderer = runtime.entryRenderers.get("dstack-tree-snapshot");
+	assert.ok(renderer !== undefined);
+	const rendered = renderer(
+		{ data: { taskId: "t-1", workflowId: "w-1", mode: "single", createdAt: "2025-01-01T00:00:00.000Z", committed: true, counts: { queued: 0, running: 0, complete: 1, total: 1 }, slots: { active: 0, capacity: 4 }, children: [{ index: 0, agent: "poteto-agent", state: "succeeded", taskPreview: "done", nested: [] }], todos: [], todoCounts: { total: 0, completed: 0, inProgress: 0 }, capturedAt: "2025-01-01T00:01:00.000Z" } },
+		{ expanded: false },
+		{ fg: (_: string, text: string) => text, bold: (t: string) => t, strikethrough: (t: string) => t },
+	);
+	assert.ok(rendered !== undefined);
+});
+
+test("dtree resolves manifest playbook when inspecting another task", async (t) => {
+	const home = await mkdtemp(join(tmpdir(), "dstack-public-dtree-manifest-"));
+	t.after(() => rm(home, { recursive: true, force: true }));
+	const previousHome = process.env.HOME;
+	const previousDepth = process.env.DSTACK_NESTING;
+	const previousAssignment = process.env.DSTACK_ASSIGNMENT;
+	process.env.HOME = home;
+	delete process.env.DSTACK_NESTING;
+	delete process.env.DSTACK_ASSIGNMENT;
+	t.after(() => {
+		process.env.HOME = previousHome;
+		if (previousDepth === undefined) delete process.env.DSTACK_NESTING;
+		else process.env.DSTACK_NESTING = previousDepth;
+		if (previousAssignment === undefined) delete process.env.DSTACK_ASSIGNMENT;
+		else process.env.DSTACK_ASSIGNMENT = previousAssignment;
+	});
+
+	const events = createEventBus();
+	const runtime = testRuntime(events);
+	await runtime.handlers.get("session_start")?.({}, runtime.ctx);
+
+	const sRoot = join(home, ".pi", "agent", "dstack", "background", "public-tools-session");
+	await mkdir(join(sRoot, "bindings"), { recursive: true });
+	await mkdir(join(sRoot, "workflows", "wf-other"), { recursive: true });
+	await mkdir(join(sRoot, "workflows", "wf-active"), { recursive: true });
+
+	await writeFile(
+		join(sRoot, "bindings", "task-other.json"),
+		JSON.stringify({ taskId: "task-other", workflowId: "wf-other" }),
+		"utf8",
+	);
+	await writeFile(
+		join(sRoot, "workflows", "wf-other", "manifest.json"),
+		JSON.stringify({
+			workflowId: "wf-other",
+			mode: "single",
+			createdAt: new Date().toISOString(),
+			specs: [{ agent: "poteto-agent", task: "other task", workflow: { assignment: "owner", playbook: "target-manifest-playbook" } }],
+		}),
+		"utf8",
+	);
+
+	await writeFile(
+		join(sRoot, "bindings", "task-active.json"),
+		JSON.stringify({ taskId: "task-active", workflowId: "wf-active" }),
+		"utf8",
+	);
+	await writeFile(
+		join(sRoot, "workflows", "wf-active", "manifest.json"),
+		JSON.stringify({
+			workflowId: "wf-active",
+			mode: "single",
+			createdAt: new Date().toISOString(),
+			specs: [{ agent: "poteto-agent", task: "active task", workflow: { assignment: "owner", playbook: "active-manifest-playbook" } }],
+		}),
+		"utf8",
+	);
+
+	runtime.ctx.sessionManager.getBranch = () => [
+		{
+			type: "custom",
+			customType: "dstack-active-workflow",
+			data: { taskId: "task-active", playbook: "active-workflow-playbook" },
+		},
+	];
+	await runtime.handlers.get("session_tree")?.({}, runtime.ctx);
+
+	const dtreeCommand = runtime.commands.get("dtree");
+	assert.ok(dtreeCommand !== undefined);
+
+	await dtreeCommand.handler("task-other", runtime.ctx);
+	const otherEntry = runtime.entries.find(
+		(e) => e.customType === "dstack-tree-snapshot" && (e.data as { taskId: string }).taskId === "task-other",
+	);
+	assert.ok(otherEntry !== undefined);
+	assert.equal((otherEntry.data as { playbook?: string }).playbook, "target-manifest-playbook");
+
+	await dtreeCommand.handler("task-active", runtime.ctx);
+	const activeEntry = runtime.entries.find(
+		(e) => e.customType === "dstack-tree-snapshot" && (e.data as { taskId: string }).taskId === "task-active",
+	);
+	assert.ok(activeEntry !== undefined);
+	assert.equal((activeEntry.data as { playbook?: string }).playbook, "active-workflow-playbook");
+});
+
+test("dstack_result clears widget and stops timer when terminal result is uncommitted", async (t) => {
+	const home = await mkdtemp(join(tmpdir(), "dstack-public-uncommitted-"));
+	t.after(() => rm(home, { recursive: true, force: true }));
+	const previousHome = process.env.HOME;
+	const previousDepth = process.env.DSTACK_NESTING;
+	const previousAssignment = process.env.DSTACK_ASSIGNMENT;
+	process.env.HOME = home;
+	delete process.env.DSTACK_NESTING;
+	delete process.env.DSTACK_ASSIGNMENT;
+	t.after(() => {
+		process.env.HOME = previousHome;
+		if (previousDepth === undefined) delete process.env.DSTACK_NESTING;
+		else process.env.DSTACK_NESTING = previousDepth;
+		if (previousAssignment === undefined) delete process.env.DSTACK_ASSIGNMENT;
+		else process.env.DSTACK_ASSIGNMENT = previousAssignment;
+	});
+
+	const events = createEventBus();
+	let task = {
+		id: "bg-failing-task",
+		name: "dstack",
+		command: "runner",
+		status: "running" as "running" | "failed",
+		outputPath: join(home, "companion-output.txt"),
+	};
+	const stop = events.on(REQUEST_CHANNEL, (raw) => {
+		if (typeof raw !== "object" || raw === null || !("request_id" in raw) || !("operation" in raw)) return;
+		const requestId = String(raw.request_id);
+		const operation = String(raw.operation);
+		if (operation === "capabilities") {
+			events.emit(RESPONSE_CHANNEL, response(requestId, operation, {
+				api_version: 1,
+				run: true,
+				status: true,
+			}));
+		} else if (operation === "run") {
+			events.emit(RESPONSE_CHANNEL, response(requestId, operation, task));
+		} else if (operation === "status") {
+			events.emit(RESPONSE_CHANNEL, response(requestId, operation, { tasks: [task] }));
+		}
+	});
+	t.after(stop);
+
+	const runtime = testRuntime(events);
+	await runtime.handlers.get("session_start")?.({}, runtime.ctx);
+
+	const sRoot = join(home, ".pi", "agent", "dstack", "background", "public-tools-session");
+	await mkdir(join(sRoot, "bindings"), { recursive: true });
+	await mkdir(join(sRoot, "workflows", "wf-fail"), { recursive: true });
+	await writeFile(
+		join(sRoot, "bindings", "bg-failing-task.json"),
+		JSON.stringify({ taskId: "bg-failing-task", workflowId: "wf-fail" }),
+		"utf8",
+	);
+	await writeFile(
+		join(sRoot, "workflows", "wf-fail", "manifest.json"),
+		JSON.stringify({
+			workflowId: "wf-fail",
+			mode: "single",
+			createdAt: new Date().toISOString(),
+			specs: [{ agent: "poteto-agent", task: "owner task", workflow: { assignment: "owner", playbook: "bug-fix" } }],
+		}),
+		"utf8",
+	);
+
+	runtime.ctx.sessionManager.getBranch = () => [
+		{
+			type: "custom",
+			customType: "dstack-active-workflow",
+			data: { taskId: "bg-failing-task", playbook: "bug-fix" },
+		},
+	];
+	await runtime.handlers.get("session_tree")?.({}, runtime.ctx);
+	await waitUntil(() => runtime.widgets.includes("dstack-tree"));
+
+	task = { ...task, status: "failed" };
+
+	const resultTool = runtime.tools.get("dstack_result");
+	assert.ok(resultTool !== undefined);
+	const res = await resultTool.execute("call-1", { taskId: "bg-failing-task" }, undefined, undefined, runtime.ctx);
+	assert.equal((res.details as { kind: string }).kind, "runner_failed");
+	assert.equal(runtime.widgets.includes("dstack-tree"), false);
+});
+
+test("dagents command and shift+up shortcut open inspector overlay and manage widget suppression", async (t) => {
+	const home = await mkdtemp(join(tmpdir(), "dstack-public-dagents-"));
+	t.after(() => rm(home, { recursive: true, force: true }));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	t.after(() => { process.env.HOME = previousHome; });
+
+	const events = createEventBus();
+	const runtime = testRuntime(events);
+	await runtime.handlers.get("session_start")?.({}, runtime.ctx);
+
+	const dagentsCommand = runtime.commands.get("dagents");
+	assert.ok(dagentsCommand !== undefined);
+
+	const shiftUpShortcut = runtime.shortcuts.get("shift+up");
+	assert.ok(shiftUpShortcut !== undefined);
+
+	await dagentsCommand.handler("", runtime.ctx);
+	assert.equal(runtime.getCustomOverlayOpened(), 1);
+
+	await shiftUpShortcut.handler(runtime.ctx);
+	assert.equal(runtime.getCustomOverlayOpened(), 2);
 });

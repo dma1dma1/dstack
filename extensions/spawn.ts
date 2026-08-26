@@ -282,6 +282,16 @@ export type ChildMessage = {
 	};
 };
 
+export type ChildUsage = {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
+	contextTokens: number;
+	turns: number;
+};
+
 export type ChildResult = {
 	text: string;
 	exitCode: number;
@@ -290,15 +300,7 @@ export type ChildResult = {
 	stopReason?: string;
 	errorMessage?: string;
 	model?: string;
-	usage: {
-		input: number;
-		output: number;
-		cacheRead: number;
-		cacheWrite: number;
-		cost: number;
-		contextTokens: number;
-		turns: number;
-	};
+	usage: ChildUsage;
 };
 
 function formatTokens(count: number): string {
