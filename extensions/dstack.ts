@@ -380,7 +380,7 @@ async function removeTemp(dir: string, filePath: string): Promise<void> {
 }
 
 export default function dstack(pi: ExtensionAPI) {
-	let mode: ModeState = { on: false };
+	let mode: ModeState = { on: true };
 	let activeWorkflow: ActiveWorkflow | undefined;
 	let todos: TodoState = { items: [] };
 	let sessionId = "unknown";

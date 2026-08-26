@@ -14,7 +14,7 @@ export function parseModeData(data: unknown): ModeState | undefined {
 }
 
 export function restoreMode(entries: readonly SessionEntryLike[]): ModeState {
-	let state: ModeState = { on: false };
+	let state: ModeState = { on: true };
 	for (const entry of entries) {
 		if (entry.type !== "custom" || entry.customType !== MODE_ENTRY) continue;
 		const next = parseModeData(entry.data);

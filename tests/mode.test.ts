@@ -16,7 +16,10 @@ test("root reminders require delegation without restricting terminal workers", (
 	assert.match(dmodeReminder("/tmp/SKILL.md", 2), /\/tmp\/SKILL\.md.*terminal depth-2/s);
 });
 
-test("/dmode and /poteto-mode set the same session flag", () => {
+test("dmode defaults on and restores the latest session flag", () => {
+	assert.deepEqual(restoreMode([]), { on: true });
+	assert.deepEqual(restoreMode([{ type: "custom", customType: MODE_ENTRY, data: { on: false } }]), { on: false });
+
 	assert.deepEqual(sameModeCommands(), ["dmode", "poteto-mode"]);
 	assert.deepEqual(toggleMode({ on: false }, ""), { on: true });
 	assert.deepEqual(toggleMode({ on: true }, "off"), { on: false });

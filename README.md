@@ -20,13 +20,9 @@ Add `-- --optional` to include richer todos, questions, and web.
 
 Open Pi in a repo. Run `/setup-dstack`. That installs missing required companions, then proposes a mapping from the models you have. Change it in chat, then it writes `~/.pi/agent/dstack/models.json`.
 
-Turn the sticky workflow on:
+dmode starts on by default. Use `/dmode off` to turn it off and `/dmode` to turn it back on.
 
-```text
-/dmode
-```
-
-`/poteto-mode` is an alias of `/dmode`. `/dmode off` turns it off. The flag survives `/new` and session reopen.
+`/poteto-mode` is an alias of `/dmode`. The flag survives `/new` and session reopen.
 
 For nontrivial work, dmode routes the request to one depth-1 playbook owner. The owner grounds the task, chooses the playbook phases, launches bounded batches of terminal workers, integrates their work, and verifies the result. The root keeps only the task receipt and the owner's final evidence.
 
