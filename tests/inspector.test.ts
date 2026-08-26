@@ -223,7 +223,7 @@ test("renderAmbientWidgetLine renders concise one-line indicators for running an
 		capturedAt: "2025-01-01T00:02:00.000Z",
 	};
 
-	const runningLines = renderAmbientWidgetLine(runningSnapshot, 100, theme);
+	const runningLines = renderAmbientWidgetLine({ snapshot: runningSnapshot, activeWorkflowCount: 1 }, 100, theme);
 	assert.equal(runningLines.length, 1);
 	assert.ok(runningLines[0]?.includes("2 running"));
 	assert.ok(runningLines[0]?.includes("1 queued"));
@@ -242,7 +242,7 @@ test("renderAmbientWidgetLine renders concise one-line indicators for running an
 		],
 	};
 
-	const finishedLines = renderAmbientWidgetLine(finishedSnapshot, 100, theme);
+	const finishedLines = renderAmbientWidgetLine({ snapshot: finishedSnapshot, activeWorkflowCount: 0 }, 100, theme);
 	assert.equal(finishedLines.length, 1);
 	assert.ok(finishedLines[0]?.includes("feature complete"));
 	assert.ok(finishedLines[0]?.includes("shift+up to inspect"));
@@ -288,6 +288,33 @@ test("renderAmbientWidgetLine reports session-wide active workflow count when mu
 	assert.equal(singleLines.length, 1);
 	assert.ok(singleLines[0]?.includes("1 running"));
 	assert.ok(!singleLines[0]?.includes("1 active workflows"));
+});
+
+test("renderAmbientWidgetLine hides a committed tracked workflow while another workflow remains active", () => {
+	const theme = plainTheme();
+	const snapshot: TreeSnapshot = {
+		taskId: "task-new",
+		workflowId: "wf-new",
+		mode: "single",
+		playbook: "bug-fix",
+		createdAt: "2025-01-01T00:01:00.000Z",
+		committed: true,
+		counts: { queued: 0, running: 0, complete: 1, total: 1 },
+		slots: { active: 1, capacity: 4 },
+		children: [
+			{ index: 0, agent: "poteto-agent", state: "succeeded", taskPreview: "fix bug", nested: [] },
+		],
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		capturedAt: "2025-01-01T00:02:00.000Z",
+	};
+
+	const lines = renderAmbientWidgetLine({ snapshot, activeWorkflowCount: 1 }, 100, theme);
+	assert.equal(lines.length, 1);
+	assert.ok(lines[0]?.includes("1 active workflow"));
+	assert.ok(lines[0]?.includes("slots 1/4"));
+	assert.ok(!lines[0]?.includes("bug-fix"));
+	assert.ok(!lines[0]?.includes("complete"));
 });
 
 test("AgentInspector subtitle uses shared scheduler slot count when multiple active workflows have differing scheduler activity", async () => {

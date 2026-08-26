@@ -450,7 +450,7 @@ export default function dstack(pi: ExtensionAPI) {
 			if (lastContext) {
 				updateTreeWidget(lastContext);
 			}
-			if (snapshot.committed && activeWorkflowCount <= 1) {
+			if (snapshot.committed && activeWorkflowCount === 0) {
 				stopTreeTimer();
 			}
 		} catch {}

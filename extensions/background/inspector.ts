@@ -393,17 +393,20 @@ export type AmbientStatus = Readonly<{
 }>;
 
 export function renderAmbientWidgetLine(
-	status: TreeSnapshot | AmbientStatus,
+	status: AmbientStatus,
 	width: number,
 	theme: TreeTheme,
 ): string[] {
-	const snapshot = "snapshot" in status ? status.snapshot : status;
-	const activeWorkflowCount = "snapshot" in status ? status.activeWorkflowCount : (snapshot.committed ? 0 : 1);
+	const { snapshot, activeWorkflowCount } = status;
 	const label = snapshot.playbook ?? snapshot.mode;
 	const totalElapsed = formatElapsed(computeWorkflowElapsed(snapshot, Date.now()));
 
 	let text = "";
-	if (snapshot.committed) {
+	if (snapshot.committed && activeWorkflowCount > 0) {
+		const glyph = theme.fg("accent", "⛁");
+		const workflowLabel = activeWorkflowCount === 1 ? "workflow" : "workflows";
+		text = `${glyph} dstack · ${activeWorkflowCount} active ${workflowLabel} · slots ${snapshot.slots.active}/${snapshot.slots.capacity} · shift+up to inspect`;
+	} else if (snapshot.committed) {
 		const stateText = snapshot.counts.complete === snapshot.counts.total && snapshot.children.every((c) => c.state === "succeeded")
 			? "complete"
 			: "finished";
