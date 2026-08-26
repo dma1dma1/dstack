@@ -13,6 +13,7 @@ import {
 	readChildResultDetails,
 	renderAmbientWidgetLine,
 	wrapText,
+	type AmbientStatus,
 	type BoundedReadResult,
 	type InspectorTheme,
 	type WorkflowSummary,
@@ -245,6 +246,131 @@ test("renderAmbientWidgetLine renders concise one-line indicators for running an
 	assert.equal(finishedLines.length, 1);
 	assert.ok(finishedLines[0]?.includes("feature complete"));
 	assert.ok(finishedLines[0]?.includes("shift+up to inspect"));
+});
+
+test("renderAmbientWidgetLine reports session-wide active workflow count when multiple workflows are active", () => {
+	const theme = plainTheme();
+	const snapshot: TreeSnapshot = {
+		taskId: "task-1",
+		workflowId: "wf-1",
+		mode: "single",
+		playbook: "bug-fix",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		committed: false,
+		counts: { queued: 0, running: 1, complete: 0, total: 1 },
+		slots: { active: 3, capacity: 4 },
+		children: [
+			{ index: 0, agent: "poteto-agent", state: "running", taskPreview: "fix bug", nested: [] },
+		],
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		capturedAt: "2025-01-01T00:01:00.000Z",
+	};
+
+	const multiWorkflowStatus: AmbientStatus = {
+		snapshot,
+		activeWorkflowCount: 2,
+	};
+
+	const multiLines = renderAmbientWidgetLine(multiWorkflowStatus, 100, theme);
+	assert.equal(multiLines.length, 1);
+	assert.ok(multiLines[0]?.includes("bug-fix"));
+	assert.ok(multiLines[0]?.includes("2 active workflows"));
+	assert.ok(multiLines[0]?.includes("slots 3/4"));
+	assert.ok(!multiLines[0]?.includes("1 running"));
+	assert.ok(multiLines[0]?.includes("shift+up to inspect"));
+
+	const singleWorkflowStatus: AmbientStatus = {
+		snapshot,
+		activeWorkflowCount: 1,
+	};
+	const singleLines = renderAmbientWidgetLine(singleWorkflowStatus, 100, theme);
+	assert.equal(singleLines.length, 1);
+	assert.ok(singleLines[0]?.includes("1 running"));
+	assert.ok(!singleLines[0]?.includes("1 active workflows"));
+});
+
+test("AgentInspector subtitle uses shared scheduler slot count when multiple active workflows have differing scheduler activity", async () => {
+	const tui = { requestRender: () => {} };
+	const done = () => {};
+
+	const workflows: WorkflowSummary[] = [
+		{
+			workflowId: "wf-2",
+			taskId: "task-2",
+			artifactDir: "/tmp/wf-2",
+			schedulerRoot: "/tmp/scheduler",
+			committed: false,
+			createdAt: "2025-01-01T00:01:00.000Z",
+			playbook: "bug-fix",
+			unreadable: false,
+		},
+		{
+			workflowId: "wf-1",
+			taskId: "task-1",
+			artifactDir: "/tmp/wf-1",
+			schedulerRoot: "/tmp/scheduler",
+			committed: false,
+			createdAt: "2025-01-01T00:00:00.000Z",
+			playbook: "feature",
+			unreadable: false,
+		},
+	];
+
+	const snapshot1: TreeSnapshot = {
+		taskId: "task-1",
+		workflowId: "wf-1",
+		mode: "single",
+		playbook: "feature",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		committed: false,
+		counts: { queued: 0, running: 1, complete: 0, total: 1 },
+		slots: { active: 3, capacity: 4 },
+		children: [
+			{ index: 0, agent: "poteto-agent", state: "running", role: "feature", assignment: "owner", taskPreview: "owner 1", nested: [] },
+		],
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		capturedAt: "2025-01-01T00:02:00.000Z",
+	};
+
+	const snapshot2: TreeSnapshot = {
+		taskId: "task-2",
+		workflowId: "wf-2",
+		mode: "single",
+		playbook: "bug-fix",
+		createdAt: "2025-01-01T00:01:00.000Z",
+		committed: false,
+		counts: { queued: 0, running: 1, complete: 0, total: 1 },
+		slots: { active: 3, capacity: 4 },
+		children: [
+			{ index: 0, agent: "poteto-agent", state: "running", role: "bug-fix", assignment: "owner", taskPreview: "owner 2", nested: [] },
+		],
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		capturedAt: "2025-01-01T00:02:00.000Z",
+	};
+
+	const snapshotsById = new Map<string, TreeSnapshot>([
+		["wf-1", snapshot1],
+		["wf-2", snapshot2],
+	]);
+
+	const inspector = new AgentInspector(tui, plainTheme(), done, {
+		sessionId: "test-sess",
+		listWorkflows: async () => workflows,
+		getSnapshot: async (w) => snapshotsById.get(w.workflowId),
+		readOutputTail: async () => ({ content: "", truncated: false, bytesRead: 0, totalBytes: 0 }),
+		now: () => new Date("2025-01-01T00:02:00.000Z"),
+	});
+
+	await new Promise((r) => setTimeout(r, 20));
+
+	const listLines = inspector.render(100);
+	assert.ok(listLines.some((l) => l.includes("2 active workflows · slots 3")));
+	assert.ok(!listLines.some((l) => l.includes("slots 2")));
+
+	inspector.dispose();
 });
 
 test("AgentInspector component navigation: list -> drill-down -> nested drill-down -> pop navigation -> close", async () => {
