@@ -75,7 +75,13 @@ import { readDstackResult } from "./background/result.ts";
 import { acquireChildSlot } from "./background/scheduler.ts";
 import { DSTACK_ARTIFACT_DIR_ENV, DSTACK_CHILD_INDEX_ENV, ROOT_WORKFLOW_ENV, SCHEDULER_ROOT_ENV } from "./background/workflow.ts";
 import { activityLines, buildTreeSnapshot, latestActivity, parseTreeSnapshot, renderTreeLines, taskPreviewOf, type SpawnChildV1, type SpawnRecordV1, type TreeSnapshot } from "./background/tree.ts";
-import { AgentInspector, renderAmbientWidgetLine, type AgentInspectorResult } from "./background/inspector.ts";
+import {
+	AgentInspector,
+	listSessionWorkflows,
+	renderAmbientWidgetLine,
+	type AgentInspectorResult,
+	type AmbientStatus,
+} from "./background/inspector.ts";
 import { createWorktree, WorktreeError } from "./worktree.ts";
 import { workflowSystemPrompt } from "./workflow-context.ts";
 
@@ -348,7 +354,7 @@ export default function dstack(pi: ExtensionAPI) {
 	let pendingContinuation: { sessionId: string; tasks: TodoSnapshot[] } | undefined;
 	let eventBusPort: BackgroundTaskPort | undefined;
 	let treeTimer: NodeJS.Timeout | undefined;
-	let treeSnapshot: TreeSnapshot | undefined;
+	let ambientStatus: AmbientStatus | undefined;
 	let inspectorOpen = false;
 	let treeWidgetVisible = true;
 	let treeLastTaskId: string | undefined;
@@ -366,7 +372,7 @@ export default function dstack(pi: ExtensionAPI) {
 
 	function updateTreeWidget(ctx: ExtensionContext) {
 		lastContext = ctx;
-		if (!treeWidgetVisible || !treeSnapshot || !ctx.hasUI || inspectorOpen) {
+		if (!treeWidgetVisible || !ambientStatus || !ctx.hasUI || inspectorOpen) {
 			if (ctx.hasUI) {
 				ctx.ui.setWidget("dstack-tree", undefined);
 			}
@@ -374,8 +380,8 @@ export default function dstack(pi: ExtensionAPI) {
 		}
 		ctx.ui.setWidget("dstack-tree", (_tui, theme) => ({
 			render(width: number) {
-				if (!treeSnapshot || inspectorOpen || !treeWidgetVisible) return [];
-				return renderAmbientWidgetLine(treeSnapshot, width, theme);
+				if (!ambientStatus || inspectorOpen || !treeWidgetVisible) return [];
+				return renderAmbientWidgetLine(ambientStatus, width, theme);
 			},
 			invalidate() {},
 		}));
@@ -431,11 +437,20 @@ export default function dstack(pi: ExtensionAPI) {
 				playbook: activeWorkflow?.playbook,
 			});
 			if (!snapshot) return;
-			treeSnapshot = snapshot;
+			let activeWorkflowCount = snapshot.committed ? 0 : 1;
+			try {
+				const workflows = await listSessionWorkflows(sessionId);
+				const uncommittedCount = workflows.filter((w) => !w.committed).length;
+				activeWorkflowCount = Math.max(activeWorkflowCount, uncommittedCount);
+			} catch {}
+			ambientStatus = {
+				snapshot,
+				activeWorkflowCount,
+			};
 			if (lastContext) {
 				updateTreeWidget(lastContext);
 			}
-			if (snapshot.committed) {
+			if (snapshot.committed && activeWorkflowCount === 0) {
 				stopTreeTimer();
 			}
 		} catch {}
@@ -488,7 +503,7 @@ export default function dstack(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		pendingContinuation = undefined;
 		stopTreeTimer();
-		treeSnapshot = undefined;
+		ambientStatus = undefined;
 		treeLastTaskId = undefined;
 		treeLastWorkflowId = undefined;
 		treeArtifactDir = undefined;
@@ -527,7 +542,7 @@ export default function dstack(pi: ExtensionAPI) {
 			}
 		}
 		stopTreeTimer();
-		treeSnapshot = undefined;
+		ambientStatus = undefined;
 		treeLastTaskId = undefined;
 		treeLastWorkflowId = undefined;
 		treeArtifactDir = undefined;
@@ -587,7 +602,7 @@ export default function dstack(pi: ExtensionAPI) {
 		eventBusPort?.close();
 		eventBusPort = undefined;
 		stopTreeTimer();
-		treeSnapshot = undefined;
+		ambientStatus = undefined;
 		if (ctx?.hasUI && typeof ctx.ui.setWidget === "function") {
 			ctx.ui.setWidget("dstack-tree", undefined);
 		}
@@ -621,7 +636,7 @@ export default function dstack(pi: ExtensionAPI) {
 			const trimmed = args.trim();
 			if (trimmed === "on") {
 				treeWidgetVisible = true;
-				if (treeSnapshot && ctx.hasUI) {
+				if (ambientStatus && ctx.hasUI) {
 					updateTreeWidget(ctx);
 				}
 				ctx.ui.notify("dstack tree widget enabled", "info");
@@ -1237,8 +1252,8 @@ export default function dstack(pi: ExtensionAPI) {
 			if (activeWorkflow?.taskId === params.taskId && terminal) {
 				if (ctx) lastContext = ctx;
 				await pollTreeTick();
-				if (!treeSnapshot?.committed) {
-					treeSnapshot = undefined;
+				if (!ambientStatus?.snapshot.committed) {
+					ambientStatus = undefined;
 					if (lastContext?.hasUI) {
 						lastContext.ui.setWidget("dstack-tree", undefined);
 					}

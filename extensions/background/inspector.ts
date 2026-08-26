@@ -387,12 +387,26 @@ export function computeWorkflowElapsed(snapshot: TreeSnapshot, nowMs: number): n
 	return 0;
 }
 
-export function renderAmbientWidgetLine(snapshot: TreeSnapshot, width: number, theme: TreeTheme): string[] {
+export type AmbientStatus = Readonly<{
+	snapshot: TreeSnapshot;
+	activeWorkflowCount: number;
+}>;
+
+export function renderAmbientWidgetLine(
+	status: AmbientStatus,
+	width: number,
+	theme: TreeTheme,
+): string[] {
+	const { snapshot, activeWorkflowCount } = status;
 	const label = snapshot.playbook ?? snapshot.mode;
 	const totalElapsed = formatElapsed(computeWorkflowElapsed(snapshot, Date.now()));
 
 	let text = "";
-	if (snapshot.committed) {
+	if (snapshot.committed && activeWorkflowCount > 0) {
+		const glyph = theme.fg("accent", "⛁");
+		const workflowLabel = activeWorkflowCount === 1 ? "workflow" : "workflows";
+		text = `${glyph} dstack · ${activeWorkflowCount} active ${workflowLabel} · slots ${snapshot.slots.active}/${snapshot.slots.capacity} · shift+up to inspect`;
+	} else if (snapshot.committed) {
 		const stateText = snapshot.counts.complete === snapshot.counts.total && snapshot.children.every((c) => c.state === "succeeded")
 			? "complete"
 			: "finished";
@@ -404,7 +418,9 @@ export function renderAmbientWidgetLine(snapshot: TreeSnapshot, width: number, t
 		const runningCount = snapshot.counts.running;
 		const queuedCount = snapshot.counts.queued;
 		const glyph = theme.fg("accent", "⛁");
-		const runningSegment = `${runningCount} running`;
+		const runningSegment = activeWorkflowCount > 1
+			? `${activeWorkflowCount} active workflows`
+			: `${runningCount} running`;
 		const queuedSegment = queuedCount > 0 ? ` · ${queuedCount} queued` : "";
 		const slotsSegment = ` · slots ${snapshot.slots.active}/${snapshot.slots.capacity}`;
 		text = `${glyph} dstack · ${label} · ${runningSegment}${queuedSegment}${slotsSegment} · shift+up to inspect`;
@@ -1380,14 +1396,26 @@ export class AgentInspector implements Component {
 		const nowMs = now.getTime();
 
 		let activeWorkflowCount = 0;
-		let totalRunningSlots = 0;
+		let sharedSlots: number | undefined;
 		for (const wf of this.workflows) {
 			const s = this.snapshots.get(wf.workflowId);
 			if (s !== undefined && (!s.committed || s.counts.running > 0)) {
 				activeWorkflowCount++;
-				totalRunningSlots += s.counts.running;
+				if (sharedSlots === undefined && typeof s.slots?.active === "number") {
+					sharedSlots = s.slots.active;
+				}
 			}
 		}
+
+		if (sharedSlots === undefined) {
+			for (const s of this.snapshots.values()) {
+				if (typeof s.slots?.active === "number") {
+					sharedSlots = s.slots.active;
+					break;
+				}
+			}
+		}
+		const activeSlots = sharedSlots ?? 0;
 
 		const filteredWorkflows = this.workflows.filter((wf) => {
 			if (this.showHistory) return true;
@@ -1500,7 +1528,7 @@ export class AgentInspector implements Component {
 		} else {
 			subtitleParts.push(activeWorkflowCount > 0 ? `${activeWorkflowCount} active workflow${activeWorkflowCount === 1 ? "" : "s"}` : "No active workflows");
 		}
-		subtitleParts.push(`slots ${totalRunningSlots}`);
+		subtitleParts.push(`slots ${activeSlots}`);
 		const subtitle = subtitleParts.join(" · ");
 
 		const body: string[] = [];
