@@ -28,7 +28,7 @@ Turn the sticky workflow on:
 
 `/poteto-mode` is an alias of `/dmode`. `/dmode off` turns it off. The flag survives `/new` and session reopen.
 
-Ask "how does X work?" on a real repo. dmode fans out `general-purpose` explorers with `dmode: false`, then one explainer.
+For nontrivial work, dmode routes the request to one depth-1 playbook owner. The owner grounds the task, chooses the playbook phases, launches bounded batches of terminal workers, integrates their work, and verifies the result. The root keeps only the task receipt and the owner's final evidence.
 
 ## Full stack
 
@@ -55,8 +55,8 @@ The first `/setup-dstack` also writes `~/.pi/agent/extensions/pi-permission-syst
 
 | Tool | Role |
 | --- | --- |
-| `dstack_task` | Launches one background single, parallel, or chain group through `pi-background-tasks`. Max 8 tasks, 4 at a time. |
-| `dstack_result` | Returns the current or completed result for a background dstack task without waiting. |
+| `dstack_task` | Launches one background single, parallel, or chain group through `pi-background-tasks`. Each batch accepts 8 tasks. One session-wide scheduler runs at most 4 child processes across root and nested groups. |
+| `dstack_result` | Returns current progress or a bounded completed summary. `detail: "full"` is an explicit escape hatch. |
 | `dstack_todo` | Durable todos under `~/.pi/agent/dstack/todos/`. |
 | `dstack_ask` | Typed questions. |
 | `dstack_sessions` | `SessionManager.list(cwd)`. |
@@ -64,7 +64,7 @@ The first `/setup-dstack` also writes `~/.pi/agent/extensions/pi-permission-syst
 
 `dstack_task` returns a task ID immediately. Continue with independent work or wait for the normal completion notification, then call `dstack_result` once. Do not poll. The companion task manager owns status, logs, cancellation, and notifications.
 
-Nesting has three depths. An unset `DSTACK_NESTING` or `0` is root depth 0. Root children run at depth 1 and may spawn depth-2 children. Depth 2 is terminal. dstack rejects malformed values instead of guessing. Parallel writers should each set `worktree: true`.
+Nesting has three depths. An unset `DSTACK_NESTING` or `0` is root depth 0. A structured dmode request names one depth-1 `owner`. That owner may launch as many batches as needed. Each depth-2 `worker` or `reviewer` receives a playbook phase, completed phase names, and artifact paths. Worker and reviewer assignments are terminal even if their process depth is malformed or reused. dstack rejects malformed values instead of guessing. Parallel writers should each set `worktree: true`.
 
 `worktree: true` on `dstack_task` creates `~/.dma/worktrees/<repo>/<slug>` on branch `dma/<slug>` and runs the child there. The default base is `HEAD`, so the child sees the parent's current commit, not `origin/main`, unless `worktree.from` in `models.json` is `origin/main`. If `git worktree add` fails, the child does not run in the parent tree. Uncommitted parent diffs stay invisible either way.
 

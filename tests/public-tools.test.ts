@@ -163,7 +163,12 @@ test("root task returns a receipt before the runner completes and dstack_result 
 
 	const featureResult = await taskTool.execute(
 		"feature-call",
-		{ agent: "general-purpose", task: "feature task", role: "feature" },
+		{
+			agent: "poteto-agent",
+			task: "feature task",
+			role: "feature",
+			workflow: { playbook: "feature", assignment: "owner", phase: "run", completedPhases: [], artifacts: [] },
+		},
 		undefined,
 		undefined,
 		runtime.ctx,
@@ -173,9 +178,11 @@ test("root task returns a receipt before the runner completes and dstack_result 
 	const featureManifest = JSON.parse(await readFile(
 		join(home, ".pi", "agent", "dstack", "background", "public-tools-session", "workflows", featureReceipt.workflowId, "manifest.json"),
 		"utf8",
-	)) as { specs: Array<{ model?: string; requestedRole?: string }> };
+	)) as { specs: Array<{ model?: string; requestedRole?: string; workflow?: { assignment: string }; systemPrompt?: string }> };
 	assert.equal(featureManifest.specs[0]?.model, "google/gemini-3.7-flash");
 	assert.equal(featureManifest.specs[0]?.requestedRole, "feature");
+	assert.equal(featureManifest.specs[0]?.workflow?.assignment, "owner");
+	assert.match(featureManifest.specs[0]?.systemPrompt ?? "", /task owner.*playbooks\/feature\.md/s);
 
 	const arenaResult = await taskTool.execute(
 		"arena-call",

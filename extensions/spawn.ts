@@ -3,6 +3,8 @@ import { constants, existsSync } from "node:fs";
 import { access, realpath, stat } from "node:fs/promises";
 import { basename, delimiter, join } from "node:path";
 import {
+	ASSIGNMENT_ENV,
+	COMMENT_SICKO_TOOLS,
 	MAX_CONCURRENCY,
 	MAX_PARALLEL_TASKS,
 	NESTING_ENV,
@@ -12,7 +14,10 @@ import {
 	type SpawnableDepth,
 	type TaskRequest,
 	type TaskSpec,
+	type WorkflowAssignment,
+	type WorkflowContext,
 } from "./types.ts";
+import { parseWorkflowContext } from "./workflow-context.ts";
 
 export class NestingError extends Error {
 	constructor(message: string) {
@@ -30,6 +35,10 @@ export function parseNestingDepth(value: string | undefined): NestingDepth {
 
 export function spawnableDepth(env: NodeJS.Dict<string> = process.env): SpawnableDepth {
 	const depth = parseNestingDepth(env[NESTING_ENV]);
+	const assignment = env[ASSIGNMENT_ENV];
+	if (assignment === "worker" || assignment === "reviewer") {
+		throw new NestingError(`dstack_task refused: ${assignment} assignments are terminal and cannot spawn children.`);
+	}
 	if (depth === 2) {
 		throw new NestingError("dstack_task refused: depth 2 is terminal and cannot spawn children.");
 	}
@@ -61,12 +70,18 @@ export function buildChildArgv(input: {
 	return args;
 }
 
-export function childEnv(depth: ChildDepth, parent: NodeJS.Dict<string> = process.env): Record<string, string> {
+export function childEnv(
+	depth: ChildDepth,
+	parent: NodeJS.Dict<string> = process.env,
+	assignment?: WorkflowAssignment,
+): Record<string, string> {
 	const env: Record<string, string> = {};
 	for (const [key, value] of Object.entries(parent)) {
 		if (value !== undefined) env[key] = value;
 	}
 	env[NESTING_ENV] = String(depth);
+	if (assignment !== undefined) env[ASSIGNMENT_ENV] = assignment;
+	else delete env[ASSIGNMENT_ENV];
 	return env;
 }
 
@@ -111,6 +126,7 @@ export function parseTaskRequest(params: {
 	cwd?: string;
 	worktree?: boolean;
 	dmode?: boolean;
+	workflow?: WorkflowContext;
 	tasks?: TaskSpec[];
 	chain?: TaskSpec[];
 }): TaskRequest | { error: string } {
@@ -119,16 +135,34 @@ export function parseTaskRequest(params: {
 	const hasSingle = Boolean(params.agent && params.task);
 	const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
 	if (modeCount !== 1) return { error: "Provide exactly one of agent+task, tasks, or chain." };
+	const normalizeSpec = (spec: TaskSpec, label: string): TaskSpec | { error: string } => {
+		if (spec.workflow === undefined) return spec;
+		const workflow = parseWorkflowContext(spec.workflow);
+		if ("error" in workflow) return { error: `${label}: ${workflow.error}` };
+		return { ...spec, workflow };
+	};
 	if (hasTasks) {
 		if ((params.tasks?.length ?? 0) > MAX_PARALLEL_TASKS) {
 			return { error: `Too many parallel tasks (${params.tasks?.length}). Max is ${MAX_PARALLEL_TASKS}.` };
 		}
-		return { kind: "parallel", specs: params.tasks as TaskSpec[] };
+		const specs: TaskSpec[] = [];
+		for (const [index, spec] of (params.tasks as TaskSpec[]).entries()) {
+			const parsed = normalizeSpec(spec, `tasks[${index}]`);
+			if ("error" in parsed) return parsed;
+			specs.push(parsed);
+		}
+		return { kind: "parallel", specs };
 	}
-	if (hasChain) return { kind: "chain", specs: params.chain as TaskSpec[] };
-	return {
-		kind: "single",
-		spec: {
+	if (hasChain) {
+		const specs: TaskSpec[] = [];
+		for (const [index, spec] of (params.chain as TaskSpec[]).entries()) {
+			const parsed = normalizeSpec(spec, `chain[${index}]`);
+			if ("error" in parsed) return parsed;
+			specs.push(parsed);
+		}
+		return { kind: "chain", specs };
+	}
+	const spec = normalizeSpec({
 			agent: params.agent as string,
 			task: params.task as string,
 			model: params.model,
@@ -138,11 +172,16 @@ export function parseTaskRequest(params: {
 			cwd: params.cwd,
 			worktree: params.worktree,
 			dmode: params.dmode,
-		},
-	};
+			workflow: params.workflow,
+		}, "task");
+	if ("error" in spec) return spec;
+	return { kind: "single", spec };
 }
 
 export function resolveAgent(spec: TaskSpec): { agent: string; dmode: boolean; tools?: string } {
+	if (spec.workflow?.assignment === "reviewer") {
+		return { agent: "general-purpose", dmode: false, tools: spec.tools ?? COMMENT_SICKO_TOOLS };
+	}
 	const forcedGeneral = spec.dmode === false;
 	if (forcedGeneral || spec.agent === "general-purpose") {
 		return { agent: "general-purpose", dmode: false, tools: spec.tools };

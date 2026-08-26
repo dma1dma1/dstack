@@ -1,5 +1,5 @@
-import type { TaskDetails } from "../dstack.ts";
-import type { AbsolutePath, Sha256 } from "./artifacts.ts";
+import type { TaskDetails, TaskResult } from "../dstack.ts";
+import type { AbsolutePath, OutputArtifactSeal, Sha256 } from "./artifacts.ts";
 import type { CompanionTaskState } from "./eventbus-v1.ts";
 
 export type WorkflowProgress = Readonly<{
@@ -19,7 +19,7 @@ export type TaskSummary = Readonly<{
 }>;
 
 export type CommittedResult =
-	| Readonly<{ kind: "complete"; package: TaskDetails }>
+	| Readonly<{ kind: "complete"; package: TaskDetails; outputs?: readonly OutputArtifactSeal[] }>
 	| Readonly<{
 		kind: "artifact";
 		outcome: GroupOutcome;
@@ -32,7 +32,8 @@ export type CommittedResult =
 
 export type DstackResultView =
 	| Readonly<{ kind: "running"; taskId: string; progress: WorkflowProgress }>
-	| Readonly<{ kind: "complete"; taskId: string; package: TaskDetails }>
+	| Readonly<{ kind: "complete"; taskId: string; detail: "summary"; package: TaskSummaryDetails }>
+	| Readonly<{ kind: "complete"; taskId: string; detail: "full"; package: TaskDetails }>
 	| Readonly<{
 		kind: "artifact";
 		taskId: string;
@@ -54,6 +55,7 @@ export type TaskBinding = Readonly<{
 
 type ResultReader = Readonly<{
 	taskId: string;
+	detail?: "summary" | "full";
 	statusExact: (taskId: string) => Promise<CompanionTaskState | undefined>;
 	readBinding: (taskId: string) => Promise<TaskBinding | undefined>;
 	readProgress: (binding: TaskBinding) => Promise<WorkflowProgress>;
@@ -95,7 +97,7 @@ export async function readDstackResult(input: ResultReader): Promise<DstackResul
 			if (committed.result === undefined) {
 				return infrastructureFailure(input.taskId, task, "The background task completed without a valid committed result.");
 			}
-			return projectCommitted(input.taskId, committed.result);
+			return projectCommitted(input.taskId, committed.result, input.detail ?? "summary");
 		}
 		case "failed":
 			return {
@@ -135,10 +137,63 @@ async function readCommitted(input: ResultReader, binding: TaskBinding, task: Co
 	}
 }
 
-function projectCommitted(taskId: string, committed: CommittedResult): DstackResultView {
+export type TaskSummaryResult = Readonly<{
+	agent: string;
+	cwd: string;
+	task: string;
+	summary: string;
+	exitCode: number;
+	stderr: string;
+	stopReason?: string;
+	errorMessage?: string;
+	model?: string;
+	usage: TaskResult["usage"];
+	step?: number;
+	fullOutput?: OutputArtifactSeal;
+}>;
+
+export type TaskSummaryDetails = Readonly<{
+	mode: TaskDetails["mode"];
+	results: readonly TaskSummaryResult[];
+}>;
+
+const SUMMARY_CAP = 8 * 1024;
+const TASK_CAP = 2 * 1024;
+const STDERR_CAP = 2 * 1024;
+
+function bounded(value: string, cap: number): string {
+	if (Buffer.byteLength(value, "utf8") <= cap) return value;
+	let text = value.slice(0, cap);
+	while (Buffer.byteLength(text, "utf8") > cap) text = text.slice(0, -1);
+	return `${text}\n\n[truncated; read the full output artifact for the remainder]`;
+}
+
+function summaryPackage(committed: Extract<CommittedResult, { kind: "complete" }>): TaskSummaryDetails {
+	return {
+		mode: committed.package.mode,
+		results: committed.package.results.map((result, index) => ({
+			agent: result.agent,
+			cwd: result.cwd,
+			task: bounded(result.task, TASK_CAP),
+			summary: bounded(result.text, SUMMARY_CAP),
+			exitCode: result.exitCode,
+			stderr: bounded(result.stderr, STDERR_CAP),
+			stopReason: result.stopReason,
+			errorMessage: result.errorMessage,
+			model: result.model,
+			usage: { ...result.usage },
+			step: result.step,
+			fullOutput: committed.outputs?.[index],
+		})),
+	};
+}
+
+function projectCommitted(taskId: string, committed: CommittedResult, detail: "summary" | "full"): DstackResultView {
 	switch (committed.kind) {
 		case "complete":
-			return { kind: "complete", taskId, package: committed.package };
+			return detail === "full"
+				? { kind: "complete", taskId, detail, package: committed.package }
+				: { kind: "complete", taskId, detail, package: summaryPackage(committed) };
 		case "artifact":
 			return { kind: "artifact", taskId, outcome: committed.outcome, path: committed.path, sha256: committed.sha256, bytes: committed.bytes, summary: committed.summary };
 		case "cancelled":

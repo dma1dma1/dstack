@@ -6,17 +6,17 @@ disable-model-invocation: true
 
 # Architect
 
-Design before implementing. Sketch types, function signatures, class shapes, and module boundaries with `not implemented` bodies and pseudocode. Synthesize across multiple model perspectives, then fill in code against the chosen sketch. If implementation proves the sketch wrong, throw it out and redesign.
+Resolve an actual design question before implementing it. Sketch types, function signatures, class shapes, and module boundaries with `not implemented` bodies and pseudocode. Synthesize across multiple model perspectives. When a dmode owner invokes Architect in design-only mode, write the synthesis to `design.md` and return without implementing. A direct `/architect` request continues into implementation unless the user asks for design only. If implementation proves the sketch wrong, throw it out and redesign.
 
 ## Start
 
-Open a todolist with one entry per phase before starting. Autonomous mode without checkpoints needs the list to show phase position and keep phases from silently disappearing.
+Open a todolist with one entry per applicable phase before starting. Autonomous mode without checkpoints needs the list to show phase position and keep phases from silently disappearing.
 
 1. Ground
 2. Sketch
 3. Agree
-4. Implement
-5. Scrap
+4. Return for design-only mode, or Implement for a direct full run
+5. Scrap for a direct full run
 
 ## Phase A: Ground the problem
 
@@ -42,7 +42,9 @@ Arena returns one synthesized design package. The synthesis decision populates t
 
 ## Phase C: Agree (opt-in)
 
-Default: proceed directly to implementation with the synthesized design. No human checkpoint.
+Write the synthesized design package to `design.md` in the caller's worktree. This is an immutable handoff artifact for subsequent phases.
+
+For a dmode owner's design-only phase, return the `design.md` path to the owner now. Do not enter Phase D. For a direct full `/architect` run, proceed to implementation with the synthesized design. No human checkpoint.
 
 Opt in to a checkpoint when the invoker explicitly asks: "/architect with checkpoint," "stop and show me before implementing," or similar. Then surface the synthesized design and pause for sign-off.
 
@@ -50,7 +52,7 @@ The synthesis can ship as its own commit either way. That's the "scaffold first"
 
 If the human pushes back on the shape (in a checkpoint or after the fact), treat that as Phase A evidence. Re-ground and re-run Phase B before writing more code.
 
-## Phase D: Implement against the sketch
+## Phase D: Implement against the sketch for a direct full run
 
 Replace `not implemented` bodies with code, pseudocode with logic. The synthesized sketch is the contract.
 
@@ -80,4 +82,4 @@ When you scrap:
 
 ## Outputs
 
-The caller's usage is written first and the type sketch derived from it. One file with new types and signatures for small changes; module map plus type definitions for larger work. The rationale ships alongside, shaped per `references/rationale-template.md`, including the usage sketch and the synthesis decision.
+The caller's usage is written first and the type sketch derived from it. The synthesized package is always written to `design.md`, including the module map, type definitions, rationale, usage sketch, and synthesis decision. Design-only mode returns that path. A direct full run may also materialize the sketched types and signatures in source files before implementation.

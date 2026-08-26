@@ -4,6 +4,7 @@ import { lstat, mkdir, open, realpath } from "node:fs/promises";
 import { isAbsolute, join, normalize } from "node:path";
 import { atomicWriteFile, readOutputArtifact, sealBytes, toSha256, type OutputArtifactSeal } from "./artifacts.ts";
 import { executeWorkflow, verifyChildOutputs, type WorkflowManifestV1, type WorkflowResultIndexV1 } from "./workflow.ts";
+import { parseWorkflowContext } from "../workflow-context.ts";
 
 export const RUNNER_PREFLIGHT_PROTOCOL = "dstack.runner-preflight.v1";
 const MANIFEST_SCHEMA = "dstack.workflow.v1";
@@ -69,6 +70,12 @@ function parseSpec(value: unknown, index: number) {
 	}
 	const omitModel = spec["omitModel"];
 	if (omitModel !== undefined && typeof omitModel !== "boolean") throw new Error(`manifest.specs[${index}].omitModel must be boolean`);
+	const workflowValue = spec["workflow"];
+	let workflow;
+	if (workflowValue !== undefined) {
+		workflow = parseWorkflowContext(workflowValue);
+		if ("error" in workflow) throw new Error(`manifest.specs[${index}].${workflow.error}`);
+	}
 	return {
 		agent: string(spec["agent"], `manifest.specs[${index}].agent`),
 		task: string(spec["task"], `manifest.specs[${index}].task`),
@@ -80,6 +87,7 @@ function parseSpec(value: unknown, index: number) {
 		overrideReason: optionalString(spec["overrideReason"], `manifest.specs[${index}].overrideReason`),
 		tools: optionalToolsAllowlist(spec["tools"], `manifest.specs[${index}].tools`),
 		systemPrompt: optionalString(spec["systemPrompt"], `manifest.specs[${index}].systemPrompt`),
+		workflow,
 		worktree,
 	};
 }
