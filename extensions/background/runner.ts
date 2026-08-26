@@ -38,6 +38,12 @@ function optionalString(value: unknown, label: string): string | undefined {
 	return value === undefined ? undefined : string(value, label);
 }
 
+function optionalIndex(value: unknown, label: string): number | undefined {
+	if (value === undefined) return undefined;
+	if (!Number.isSafeInteger(value) || Number(value) < 0) throw new Error(`${label} must be a non-negative integer`);
+	return Number(value);
+}
+
 function optionalToolsAllowlist(value: unknown, label: string): string | undefined {
 	if (value === undefined) return undefined;
 	const tools = string(value, label).split(",").map((tool) => tool.trim());
@@ -69,6 +75,9 @@ function parseSpec(value: unknown, index: number) {
 		cwd: absolutePath(spec["cwd"], `manifest.specs[${index}].cwd`),
 		model: optionalString(spec["model"], `manifest.specs[${index}].model`),
 		omitModel,
+		requestedRole: optionalString(spec["requestedRole"], `manifest.specs[${index}].requestedRole`),
+		roleIndex: optionalIndex(spec["roleIndex"], `manifest.specs[${index}].roleIndex`),
+		overrideReason: optionalString(spec["overrideReason"], `manifest.specs[${index}].overrideReason`),
 		tools: optionalToolsAllowlist(spec["tools"], `manifest.specs[${index}].tools`),
 		systemPrompt: optionalString(spec["systemPrompt"], `manifest.specs[${index}].systemPrompt`),
 		worktree,

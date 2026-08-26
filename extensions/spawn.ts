@@ -106,6 +106,7 @@ export function parseTaskRequest(params: {
 	task?: string;
 	model?: string;
 	role?: string;
+	overrideReason?: string;
 	tools?: string;
 	cwd?: string;
 	worktree?: boolean;
@@ -132,6 +133,7 @@ export function parseTaskRequest(params: {
 			task: params.task as string,
 			model: params.model,
 			role: params.role,
+			overrideReason: params.overrideReason,
 			tools: params.tools,
 			cwd: params.cwd,
 			worktree: params.worktree,

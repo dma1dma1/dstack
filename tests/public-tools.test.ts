@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEventBus, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -62,6 +62,15 @@ test("root task returns a receipt before the runner completes and dstack_result 
 	const previousDepth = process.env.DSTACK_NESTING;
 	process.env.HOME = home;
 	delete process.env.DSTACK_NESTING;
+	const configPath = join(home, ".pi", "agent", "dstack", "models.json");
+	await mkdir(join(home, ".pi", "agent", "dstack"), { recursive: true });
+	await writeFile(configPath, JSON.stringify({
+		roles: {
+			feature: "google/gemini-3.7-flash",
+			"arena-runners": ["provider/one", "provider/two", "provider/three"],
+			"architect-runners": ["provider/architect"],
+		},
+	}), "utf8");
 	t.after(() => {
 		process.env.HOME = previousHome;
 		if (previousDepth === undefined) delete process.env.DSTACK_NESTING;
@@ -151,6 +160,55 @@ test("root task returns a receipt before the runner completes and dstack_result 
 		(completed.details as { package: { results: Array<{ task: string }> } }).package.results.map((item) => item.task),
 		["first", "second"],
 	);
+
+	const featureResult = await taskTool.execute(
+		"feature-call",
+		{ agent: "general-purpose", task: "feature task", role: "feature" },
+		undefined,
+		undefined,
+		runtime.ctx,
+	);
+	assert.notEqual(featureResult.isError, true);
+	const featureReceipt = featureResult.details as { workflowId: string };
+	const featureManifest = JSON.parse(await readFile(
+		join(home, ".pi", "agent", "dstack", "background", "public-tools-session", "workflows", featureReceipt.workflowId, "manifest.json"),
+		"utf8",
+	)) as { specs: Array<{ model?: string; requestedRole?: string }> };
+	assert.equal(featureManifest.specs[0]?.model, "google/gemini-3.7-flash");
+	assert.equal(featureManifest.specs[0]?.requestedRole, "feature");
+
+	const arenaResult = await taskTool.execute(
+		"arena-call",
+		{
+			tasks: ["one", "two", "three"].map((name) => ({
+				agent: "general-purpose",
+				task: `arena ${name}`,
+				role: "arena-runners",
+			})),
+		},
+		undefined,
+		undefined,
+		runtime.ctx,
+	);
+	assert.notEqual(arenaResult.isError, true);
+	const arenaReceipt = arenaResult.details as { workflowId: string };
+	const arenaManifest = JSON.parse(await readFile(
+		join(home, ".pi", "agent", "dstack", "background", "public-tools-session", "workflows", arenaReceipt.workflowId, "manifest.json"),
+		"utf8",
+	)) as { specs: Array<{ model?: string; requestedRole?: string; roleIndex?: number }> };
+	assert.deepEqual(arenaManifest.specs.map((spec) => spec.model), ["provider/one", "provider/two", "provider/three"]);
+	assert.deepEqual(arenaManifest.specs.map((spec) => spec.requestedRole), ["arena-runners", "arena-runners", "arena-runners"]);
+	assert.deepEqual(arenaManifest.specs.map((spec) => spec.roleIndex), [0, 1, 2]);
+
+	const unknownRole = await taskTool.execute(
+		"unknown-role-call",
+		{ agent: "general-purpose", task: "must fail", role: "architect runners" },
+		undefined,
+		undefined,
+		runtime.ctx,
+	);
+	assert.equal(unknownRole.isError, true);
+	assert.equal(unknownRole.content[0]?.text, 'Unknown role "architect runners". Did you mean "architect-runners"?');
 	await runtime.handlers.get("session_shutdown")?.({}, runtime.ctx);
 	assert.deepEqual(runtime.widgets, []);
 });

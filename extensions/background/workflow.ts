@@ -19,6 +19,9 @@ export type ResolvedChildSpec = Readonly<{
 	cwd: string;
 	model?: string;
 	omitModel?: boolean;
+	requestedRole?: string;
+	roleIndex?: number;
+	overrideReason?: string;
 	tools?: string;
 	systemPrompt?: string;
 	worktree?: Readonly<{ repoRoot: string; base: string; from: WorktreeFrom }>;

@@ -96,7 +96,29 @@ Read the leaf skill in full for any principle you apply. Each entry names when i
 
 At root depth 0 and child depth 1, identify independent work early and dispatch it together with one parallel `dstack_task` call. `dstack_task` returns a `taskId` immediately; the parent may do independent work. If a later phase needs the result, wait for the normal background completion notification without polling, then call `dstack_result` once with `taskId`. Parallelize independent readers freely. Give each concurrent writer a distinct checkout with `worktree: true` or an explicit distinct `cwd`; one checkout has one writer. Integrate overlapping work serially. A chain remains one background workflow. Depth-1 children should use their final fan-out level when it shortens the critical path. Depth-2 workers are terminal and complete their assigned scope without calling `dstack_task`. Keep trivial work local instead of building an agent tree around it.
 
-**Defaults for every `dstack_task` call.** File pointers not inlined context. Explicit model per role (configurable via `/setup-dstack`; defaults inherit-parent unless models.json sets the role). Missing MCP companions skip that source. Code delegates tier by difficulty. The hardest changes (cross-cutting design, gnarly concurrency, subtle algorithms) go to the hardest-tasks role when the task needs judgment or the intent is vague, and to the bug-fix role when the work is a precisely specified sequence of steps to execute to the letter; trivial mechanical edits go to your fast code model. Per-role lines in the `/setup-dstack` rule override these defaults and the model choices in the routed skills (`how`, `why`, `arena`, `swarm`, `architect`, `interrogate`, `reflect`); a role with no line keeps its default, and a role line of `inherit-parent` or `auto` runs that role on the parent chat model (omit dstack_task `model`).
+**Defaults for every `dstack_task` call.** File pointers not inlined context. Missing MCP companions skip that source.
+
+```text
+┌────────────────────────────────────────────────────────┬───────────────┐
+│                       Work type                        │     Role      │
+├────────────────────────────────────────────────────────┼───────────────┤
+│ new or changed behavior                                │ feature       │
+├────────────────────────────────────────────────────────┼───────────────┤
+│ restructure without behavior change                    │ refactoring   │
+├────────────────────────────────────────────────────────┼───────────────┤
+│ precisely specified fix                                │ bug-fix       │
+├────────────────────────────────────────────────────────┼───────────────┤
+│ performance                                            │ perf-issue    │
+├────────────────────────────────────────────────────────┼───────────────┤
+│ review, critique, synthesis                            │ judgment      │
+├────────────────────────────────────────────────────────┼───────────────┤
+│ vague intent, cross-cutting design, subtle concurrency │ hardest-tasks │
+└────────────────────────────────────────────────────────┴───────────────┘
+```
+
+Choose the role by work type, never by difficulty. Pass `model` only with a non-empty `overrideReason`. `dstack_task` rejects any role absent from `models.json`.
+
+`/setup-dstack` configures these roles and the routed workflow roles (`how`, `why`, `arena`, `swarm`, `architect`, `interrogate`, `reflect`). A mapping of `inherit-parent` or `auto` omits `--model`, so the child uses the parent chat model.
 
 You own every subagent's work. Review the diff and write your own summary, don't pass through what it said. Interrupt-chained resumes silently drop directives, so fire a fresh subagent with consolidated scope rather than trusting a "done" summary. A second opinion is the same prompt against a different model. Agreement is high-signal.
 

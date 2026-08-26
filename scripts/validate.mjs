@@ -355,7 +355,7 @@ async function main() {
 		{
 			action: "write",
 			value: JSON.stringify({
-				roles: { "bug-fix": "acme/fast", "how critics": ["acme/fast", "acme/smart"] },
+				roles: { "bug-fix": "acme/fast", "how-critics": ["acme/fast", "acme/smart"] },
 				worktree: { base: "~/.dma/worktrees", from: "HEAD" },
 			}),
 		},
@@ -377,7 +377,7 @@ async function main() {
 	assert("config-rejects-unknown-slug", badSlug.isError === true, badSlug.content[0].text);
 	const allInherit = await pi.tools.get("dstack_config").execute(
 		"7",
-		{ action: "set", role: "how critics", value: "inherit-parent,inherit-parent,inherit-parent,inherit-parent" },
+		{ action: "set", role: "how-critics", value: "inherit-parent,inherit-parent,inherit-parent,inherit-parent" },
 		undefined,
 		undefined,
 		ctx,

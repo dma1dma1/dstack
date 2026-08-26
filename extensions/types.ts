@@ -1,32 +1,36 @@
 export const ROLE_NAMES = [
-	"feature, refactoring",
+	"feature",
+	"refactoring",
 	"bug-fix",
 	"perf-issue",
 	"hillclimb",
-	"judgment and prose",
-	"hardest tasks",
-	"how explorer",
-	"how explainer",
-	"how critics",
-	"why investigators",
-	"why synthesizer",
-	"reflect tooling",
-	"reflect judgment, divergent, synthesizer",
-	"arena runners",
-	"arena cross-judge pool",
-	"swarm workers",
-	"architect runners",
-	"interrogate reviewers",
+	"judgment",
+	"prose",
+	"hardest-tasks",
+	"how-explorer",
+	"how-explainer",
+	"how-critics",
+	"why-investigators",
+	"why-synthesizer",
+	"reflect-tooling",
+	"reflect-judgment",
+	"reflect-divergent",
+	"reflect-synthesizer",
+	"arena-runners",
+	"arena-cross-judge-pool",
+	"swarm-workers",
+	"architect-runners",
+	"interrogate-reviewers",
 ] as const;
 
 export type RoleName = (typeof ROLE_NAMES)[number];
 
 export const LIST_ROLES = [
-	"how critics",
-	"arena runners",
-	"arena cross-judge pool",
-	"architect runners",
-	"interrogate reviewers",
+	"how-critics",
+	"arena-runners",
+	"arena-cross-judge-pool",
+	"architect-runners",
+	"interrogate-reviewers",
 ] as const;
 
 export type ListRoleName = (typeof LIST_ROLES)[number];
@@ -57,6 +61,7 @@ export type TaskSpec = {
 	task: string;
 	model?: string;
 	role?: string;
+	overrideReason?: string;
 	tools?: string;
 	cwd?: string;
 	worktree?: boolean;

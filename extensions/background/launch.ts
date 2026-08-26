@@ -7,7 +7,7 @@ import type { DstackConfig } from "../types.ts";
 import type { TaskRequest } from "../types.ts";
 import { dmodeReminder } from "../mode.ts";
 import { freezePiChildLaunch, resolveAgent } from "../spawn.ts";
-import { resolveModel } from "../models.ts";
+import { formatConfigError, resolveModel } from "../models.ts";
 import { expandHome } from "../worktree.ts";
 import { atomicWriteFile, writeSealedArtifact } from "./artifacts.ts";
 import type { BackgroundTaskPort } from "./eventbus-v1.ts";
@@ -55,14 +55,21 @@ export async function launchTaskGroup(input: Readonly<{
 	const root = sessionRoot(input.sessionId);
 	const artifactDir = join(root, "workflows", workflowId);
 	const specs = requestSpecs(input.request);
-	const resolvedSpecs = specs.map((spec): ResolvedChildSpec => {
+	const resolvedSpecs = specs.map((spec, index): ResolvedChildSpec => {
 		const resolvedAgent = resolveAgent(spec);
 		const agent = input.agents.find((candidate) => candidate.name === resolvedAgent.agent);
 		if (agent === undefined) {
 			const available = input.agents.map((candidate) => candidate.name).join(", ") || "none";
 			throw new Error(`Unknown agent "${resolvedAgent.agent}". Available: ${available}.`);
 		}
-		const model = resolveModel({ explicit: spec.model, role: spec.role, roles: input.config.roles });
+		const model = resolveModel({
+			explicit: spec.model,
+			role: spec.role,
+			roles: input.config.roles,
+			candidateIndex: input.request.kind === "parallel" ? index : 0,
+			overrideReason: spec.overrideReason,
+		});
+		if (!model.ok) throw new Error(formatConfigError(model.error));
 		const promptParts = [agent.systemPrompt.trim()];
 		if (resolvedAgent.dmode) promptParts.push(dmodeReminder(input.skillPath, 1));
 		const cwd = resolve(input.ctxCwd, spec.cwd ?? input.ctxCwd);
@@ -70,8 +77,11 @@ export async function launchTaskGroup(input: Readonly<{
 			agent: resolvedAgent.agent,
 			task: spec.task,
 			cwd,
-			model: model.model,
-			omitModel: model.omitModel,
+			model: model.value.model,
+			omitModel: model.value.omitModel,
+			requestedRole: model.value.requestedRole,
+			roleIndex: model.value.roleIndex,
+			overrideReason: spec.overrideReason,
 			tools: resolvedAgent.tools ?? agent.tools?.join(","),
 			systemPrompt: promptParts.filter(Boolean).join("\n\n") || undefined,
 			worktree: spec.worktree

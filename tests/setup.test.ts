@@ -40,9 +40,10 @@ test("suggestConfig uses fast for explorers and judgment for prose", () => {
 		"anthropic/claude-opus-4-5",
 	];
 	const suggested = suggestConfig(slugs, emptyConfig());
-	assert.equal(suggested.roles["how explorer"], "anthropic/claude-haiku-4-5");
-	assert.equal(suggested.roles["judgment and prose"], "anthropic/claude-fable-5");
-	assert.deepEqual(suggested.roles["how critics"], [
+	assert.equal(suggested.roles["how-explorer"], "anthropic/claude-haiku-4-5");
+	assert.equal(suggested.roles.judgment, "anthropic/claude-fable-5");
+	assert.equal(suggested.roles.prose, "anthropic/claude-fable-5");
+	assert.deepEqual(suggested.roles["how-critics"], [
 		"anthropic/claude-fable-5",
 		"anthropic/claude-haiku-4-5",
 		"anthropic/claude-opus-4-5",
@@ -72,7 +73,7 @@ test("kickoff includes the suggestion and forbids a raw dump", () => {
 	});
 	assert.match(text, /Do not open a model picker/);
 	assert.match(text, /40 models/);
-	assert.match(text, /how explorer:/);
+	assert.match(text, /how-explorer:/);
 	assert.doesNotMatch(text, /Write dstack models.json/);
 });
 

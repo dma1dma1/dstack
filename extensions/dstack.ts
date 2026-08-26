@@ -77,6 +77,7 @@ const TaskItem = Type.Object({
 	task: Type.String({ description: "Task to delegate" }),
 	model: Type.Optional(Type.String({ description: "provider/model or inherit-parent / auto" })),
 	role: Type.Optional(Type.String({ description: "Role name from models.json" })),
+	overrideReason: Type.Optional(Type.String({ description: "Required reason when model overrides role" })),
 	tools: Type.Optional(Type.String({ description: "Comma-separated tool allowlist" })),
 	cwd: Type.Optional(Type.String()),
 	worktree: Type.Optional(Type.Boolean()),
@@ -88,6 +89,7 @@ const TaskParams = Type.Object({
 	task: Type.Optional(Type.String()),
 	model: Type.Optional(Type.String()),
 	role: Type.Optional(Type.String()),
+	overrideReason: Type.Optional(Type.String()),
 	tools: Type.Optional(Type.String()),
 	cwd: Type.Optional(Type.String()),
 	worktree: Type.Optional(Type.Boolean()),
@@ -610,7 +612,14 @@ export default function dstack(pi: ExtensionAPI) {
 					const available = agents.map((candidate) => candidate.name).join(", ") || "none";
 					throw new Error(`Unknown agent "${resolved.agent}". Available: ${available}.`);
 				}
-				const model = resolveModel({ explicit: spec.model, role: spec.role, roles: config.roles });
+				const model = resolveModel({
+					explicit: spec.model,
+					role: spec.role,
+					roles: config.roles,
+					candidateIndex: request.kind === "parallel" ? index : 0,
+					overrideReason: spec.overrideReason,
+				});
+				if (!model.ok) throw new Error(formatConfigError(model.error));
 				let cwd = spec.cwd ?? ctx.cwd;
 				if (spec.worktree) {
 					cwd = await createWorktree({
@@ -631,8 +640,8 @@ export default function dstack(pi: ExtensionAPI) {
 					const args = buildChildArgv({
 						task: spec.task,
 						extensionPath: extensionPath(),
-						model: model.model,
-						omitModel: model.omitModel,
+						model: model.value.model,
+						omitModel: model.value.omitModel,
 						tools: resolved.tools ?? agent.tools?.join(","),
 						systemPromptPath: tmp?.filePath,
 					});
