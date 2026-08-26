@@ -5,28 +5,44 @@ disable-model-invocation: true
 mode: true
 icon: crown
 color: yellow
-reminder: New task? Playbook match or rigor needed -> apply /dmode. Casual turn or user opts out -> don't.
+reminder: New task? Route nontrivial work to one playbook owner. Casual turn or user opts out -> don't.
 ---
 
 # dmode
 
 `/dmode` is the mode command; `/poteto-mode` is an alias of `/dmode`.
 
-## Non-negotiables
+## Root routing
 
 **Do not overcomplicate simple tasks.** Trivial or simple tasks should not result in multi-step todolists.
 
-**Start every multi-step task with a todolist whose first item is to read the Principles section below in full.** The principles ground every trigger here. In your reply, name each principle that shaped a decision and the specific choice it changed. A citation with no decision behind it means you skipped its leaf skill; it must trace to a real choice the leaf's rule drove.
+At depth 0, route each nontrivial request to exactly one depth-1 owner. Select the matching playbook and launch `agent: "poteto-agent"` with structured workflow metadata:
 
-Remaining triggers:
+```json
+{"playbook":"feature","assignment":"owner","phase":"run","completedPhases":[],"artifacts":[]}
+```
 
-- Nontrivial change, architecture decision, or "are we sure?" → the **how** skill.
+The root keeps only the user's desired outcome, the task id, and the owner's final evidence. It does not copy the playbook, choose implementation phases, run design or review rounds, or ingest worker transcripts. Use the bounded `dstack_result` summary by default. Request `detail: "full"` only when the user explicitly needs the transcript.
+
+Feature handles features of any size. Use **figure-it-out** only when no bundled playbook fits.
+
+## Owner contract
+
+The depth-1 owner reads the selected playbook and runs it end to end. The playbook owns its phases. There is no global rigor level and no universal design or judge gate.
+
+Start multi-step owner work with a todolist. Read the Principles section below in full. Name only principles that changed a concrete decision.
+
+The owner may launch as many bounded worker batches as needed. Each child receives structured workflow metadata with `assignment: "worker"` or `assignment: "reviewer"`, one current phase, the completed phase names, and stable artifact paths. Include a SHA-256 seal when an artifact must be immutable. Workers are terminal. They implement or inspect their assigned slice and report contradictions instead of redesigning the task. The owner integrates the combined result, reads the diff, and verifies the real artifact.
+
+Choose each child's model role by the work it still has to decide. Use `implementation-worker` for a settled code-writing brief with named files, acceptance criteria, and verification. Use a specialized role instead when the child still owns substantive prose, investigation, performance analysis, or judgment.
+
+Use Architect only when the playbook or user requests it, or grounding exposes a consequential choice with multiple plausible shapes that cannot be settled cheaply from existing evidence. Architect produces a `design.md` handoff artifact. Its existence records a completed phase; it is not a global gate. Use Interrogate only when the user requests adversarial review or the selected playbook explicitly calls for it. Never pair every implementation unit with a judge.
+
+Additional triggers:
+
 - About to `dstack_ask` on a "which approach", "how should I", or "what should this do" fork → classify it before you ask. If the answer is a fact you could observe by running something (behavior, timing, layout, output, perf, even whether an eval separates), it is not the human's to answer. Sketch it via the Prototype playbook (`playbooks/prototype.md`) and let the result decide. If the task is a read-only Investigation whose deliverable is a cited answer, stay in it and answer from the evidence rather than building a sketch. Reserve the question for a genuine product or preference call no experiment can settle. The ask is the slow path. A throwaway probe usually answers faster, and it hands the human a result to react to instead of a decision to make.
 - Any code → name the data shape first, and choose its organizing structure per **principle-model-the-domain**.
-- Code crossing a function boundary → the **architect** skill, parallel design exploration before implementing.
-- Parallel fan-out → the **swarm** skill for coverage matrices, races, gauntlets, and exploration partitions. Use **arena** for design or code bakeoffs with base selection and grafting.
-- Contested design → the **interrogate** skill (multi-model adversarial) before shipping.
-- Nontrivial multi-step → write the throughput checkpoint (Feature step 3).
+- Exploratory fan-out across a coverage matrix, race, gauntlet, or search partition → the **swarm** skill. Straightforward implementation slices go directly to terminal workers. Use **arena** only for a genuine design or code bakeoff whose alternatives will be compared, selected, and possibly grafted.
 - Any prose surface → the **unslop** skill. Your reply is a prose surface; write it per **Writing the reply**. Agent-facing prose also follows the **create-skill** skill (the host's built-in for authoring SKILL.md files).
 - Docs, RFCs, readmes, PR descriptions, or commit messages → the **technical-writing** skill (`/technical-writing`).
 - Before commit → the `deslop` skill from the `host companion` plugin (`/deslop`).
@@ -90,11 +106,11 @@ Read the leaf skill in full for any principle you apply. Each entry names when i
 
 ## Subagents
 
-**Root depth 0 is an orchestrator.** Preserve its context by delegating repository-context-intensive work instead of implementing that work directly. Keep direct local work as a narrow escape hatch for trivial, low-context mechanical actions. This restriction is root-only. Terminal depth-2 workers complete their assigned scope directly.
+**Root depth 0 is a router.** Preserve its context by sending each nontrivial request to one playbook owner. Keep direct local work as a narrow escape hatch for trivial, low-context mechanical actions.
 
 **Use `agent: "poteto-agent"` for any subagent you spawn inside a playbook step** (code-writing delegates, ad-hoc helpers). `/dmode` and `poteto-agent` route through the same wrapper. Routed workflow skills (`how`, `why`, `interrogate`, `reflect`, `swarm`) set their own `agent` for diverse-model review; respect what the skill prescribes, don't override to `poteto-agent`.
 
-At root depth 0 and child depth 1, identify independent work early and dispatch it together with one parallel `dstack_task` call. `dstack_task` returns a `taskId` immediately; the parent may do independent work. If a later phase needs the result, wait for the normal background completion notification without polling, then call `dstack_result` once with `taskId`. Parallelize independent readers freely. Give each concurrent writer a distinct checkout with `worktree: true` or an explicit distinct `cwd`; one checkout has one writer. Integrate overlapping work serially. A chain remains one background workflow. Depth-1 children should use their final fan-out level when it shortens the critical path. Depth-2 workers are terminal and complete their assigned scope without calling `dstack_task`. Keep trivial work local instead of building an agent tree around it.
+Depth-1 owners identify independent work early and dispatch it in bounded parallel batches. `dstack_task` returns a `taskId` immediately; the owner may do independent work. If a later phase needs the result, wait for the normal background completion notification without polling, then call `dstack_result` once with `taskId`. Parallelize independent readers freely. Give each concurrent writer a distinct checkout with `worktree: true` or an explicit distinct `cwd`; one checkout has one writer. Integrate overlapping work serially. A chain remains one background workflow. Depth-2 workers are terminal. Keep trivial work local instead of building an agent tree around it. The runtime enforces one global concurrency budget across owners and workers.
 
 **Defaults for every `dstack_task` call.** File pointers not inlined context. Missing MCP companions skip that source.
 
@@ -120,7 +136,7 @@ Choose the role by work type, never by difficulty. Pass `model` only with a non-
 
 `/setup-dstack` configures these roles and the routed workflow roles (`how`, `why`, `arena`, `swarm`, `architect`, `interrogate`, `reflect`). A mapping of `inherit-parent` or `auto` omits `--model`, so the child uses the parent chat model.
 
-You own every subagent's work. Review the diff and write your own summary, don't pass through what it said. Interrupt-chained resumes silently drop directives, so fire a fresh subagent with consolidated scope rather than trusting a "done" summary. A second opinion is the same prompt against a different model. Agreement is high-signal.
+The owner owns every worker's work. Review the combined diff and write an original summary. Do not pass through worker output. Interrupt-chained resumes silently drop directives, so fire a fresh worker with consolidated scope rather than trusting a "done" summary.
 
 ## Writing the reply
 
@@ -141,9 +157,9 @@ Comments follow the same rule as the reply. Write them clean as you go; a flat "
 
 ## Playbooks
 
-Your first todolist actions are the matched playbook's steps, copied in verbatim, before any task-specific todos and before you reason about the task. The failure mode is reading a playbook then writing a bespoke plan that drops its named steps (`architect`, the throughput checkpoint). A step you choose not to do stays in the list with a one-line `skip: <reason>`; skipping silently is not allowed. Match the task to a playbook below, open its file, and copy its steps in verbatim.
+The owner translates the matched playbook into a task-specific phase list. Treat the playbook as the default phase graph, not a ritual checklist. Preserve its required outcomes and safety invariants. Combine, omit, or reorder phases when task evidence supports it, and record only deviations that affect correctness, risk, or handoff state.
 
-A large or cross-cutting effort (a migration across many call sites, an ambitious multi-part change), or work the user steps away from to trust later, routes to the **figure-it-out** skill even when a narrower playbook like Feature fits. Use **figure-it-out** whenever no bundled playbook fits. It designs a bespoke, rigorous playbook for the task. A standing project-scale program (multi-day, many stacked PRs, a fleet of subagents under one coordinator) routes to **Orchestrate** instead; figure-it-out designs one bespoke run, orchestrate runs the program.
+Feature handles features of any size. Use **figure-it-out** only when no bundled playbook fits. It designs a bespoke, rigorous playbook for the task. A standing project-scale program (multi-day, many stacked PRs, a fleet of subagents under one coordinator) routes to **Orchestrate** instead; figure-it-out designs one bespoke run, orchestrate runs the program.
 
 - **Investigation.** Read-only question: how does X work, why was Y built this way, are we sure about Z, should we do X or Y. `playbooks/investigation.md`.
 - **Bug fix.** A reported defect to reproduce, root-cause, and fix with runtime evidence. `playbooks/bug-fix.md`.

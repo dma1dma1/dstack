@@ -2,7 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { TaskDetails, TaskResult } from "../dstack.ts";
 import { buildChildArgv, capOutput, childEnv, runChildProcess, type ChildInvocation, type ChildResult } from "../spawn.ts";
-import type { WorktreeFrom } from "../types.ts";
+import type { WorkflowContext, WorktreeFrom } from "../types.ts";
 import { MAX_CONCURRENCY, NESTING_ENV } from "../types.ts";
 import { createWorktree } from "../worktree.ts";
 import { atomicWriteFile, readOutputArtifact, toAbsolutePath, writeSealedArtifact, type OutputArtifactSeal } from "./artifacts.ts";
@@ -23,6 +23,7 @@ export type ResolvedChildSpec = Readonly<{
 	roleIndex?: number;
 	overrideReason?: string;
 	tools?: string;
+	workflow?: WorkflowContext;
 	systemPrompt?: string;
 	worktree?: Readonly<{ repoRoot: string; base: string; from: WorktreeFrom }>;
 }>;
@@ -245,7 +246,7 @@ export async function executeWorkflow(
 				command: manifest.piChildLaunch.executable,
 				argsPrefix: manifest.piChildLaunch.argvPrefix,
 			};
-			const env = childEnv(1, dependencies.env ?? process.env);
+			const env = childEnv(1, dependencies.env ?? process.env, spec.workflow?.assignment);
 			env[NESTING_ENV] = "1";
 			env[ROOT_WORKFLOW_ENV] = manifest.workflowId;
 			env[SCHEDULER_ROOT_ENV] = manifest.schedulerRoot;

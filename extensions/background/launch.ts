@@ -9,6 +9,7 @@ import { dmodeReminder } from "../mode.ts";
 import { freezePiChildLaunch, resolveAgent } from "../spawn.ts";
 import { formatConfigError, resolveModel } from "../models.ts";
 import { expandHome } from "../worktree.ts";
+import { workflowSystemPrompt } from "../workflow-context.ts";
 import { atomicWriteFile, writeSealedArtifact } from "./artifacts.ts";
 import type { BackgroundTaskPort } from "./eventbus-v1.ts";
 import { readCommittedWorkflowResult } from "./runner.ts";
@@ -71,7 +72,8 @@ export async function launchTaskGroup(input: Readonly<{
 		});
 		if (!model.ok) throw new Error(formatConfigError(model.error));
 		const promptParts = [agent.systemPrompt.trim()];
-		if (resolvedAgent.dmode) promptParts.push(dmodeReminder(input.skillPath, 1));
+		if (spec.workflow !== undefined) promptParts.push(workflowSystemPrompt(input.skillPath, 1, spec.workflow));
+		else if (resolvedAgent.dmode) promptParts.push(dmodeReminder(input.skillPath, 1));
 		const cwd = resolve(input.ctxCwd, spec.cwd ?? input.ctxCwd);
 		return {
 			agent: resolvedAgent.agent,
@@ -83,6 +85,7 @@ export async function launchTaskGroup(input: Readonly<{
 			roleIndex: model.value.roleIndex,
 			overrideReason: spec.overrideReason,
 			tools: resolvedAgent.tools ?? agent.tools?.join(","),
+			workflow: spec.workflow,
 			systemPrompt: promptParts.filter(Boolean).join("\n\n") || undefined,
 			worktree: spec.worktree
 				? {
@@ -172,7 +175,7 @@ export function createTaskResultFiles(sessionId: string): Readonly<{
 			const manifestSha256 = createHash("sha256").update(manifestBytes).digest("hex");
 			try {
 				const result = await readCommittedWorkflowResult(artifactDir, manifestSha256, binding.workflowId);
-				return { kind: "complete", package: result.package };
+				return { kind: "complete", package: result.package, outputs: result.children.map((child) => child.output) };
 			} catch (error) {
 				if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return undefined;
 				throw error;

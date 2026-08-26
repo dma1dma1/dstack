@@ -114,3 +114,5 @@ Present the verdict in this structure:
 
 ### Agreement Map
 [Where did models agree, where did they diverge, and what does the pattern of agreement/disagreement tell us?]
+
+When a dmode owner requests a durable review artifact, save the synthesized verdict in `interrogation.md` in the caller's worktree and return its path. The owner decides how the verdict affects the workflow.

@@ -4,6 +4,7 @@ export const ROLE_NAMES = [
 	"bug-fix",
 	"perf-issue",
 	"hillclimb",
+	"implementation-worker",
 	"judgment",
 	"prose",
 	"hardest-tasks",
@@ -56,6 +57,28 @@ export type NestingDepth = 0 | 1 | 2;
 export type SpawnableDepth = 0 | 1;
 export type ChildDepth = 1 | 2;
 
+export const WORKFLOW_ASSIGNMENTS = ["owner", "worker", "reviewer"] as const;
+export type WorkflowAssignment = (typeof WORKFLOW_ASSIGNMENTS)[number];
+
+export type WorkflowArtifact = Readonly<{
+	name: string;
+	path: string;
+	sha256?: string;
+}>;
+
+export type WorkflowContext = Readonly<{
+	playbook: string;
+	assignment: WorkflowAssignment;
+	phase: string;
+	completedPhases: readonly string[];
+	artifacts: readonly WorkflowArtifact[];
+}>;
+
+export type ActiveWorkflow = Readonly<{
+	taskId: string;
+	playbook: string;
+}>;
+
 export type TaskSpec = {
 	agent: string;
 	task: string;
@@ -66,6 +89,7 @@ export type TaskSpec = {
 	cwd?: string;
 	worktree?: boolean;
 	dmode?: boolean;
+	workflow?: WorkflowContext;
 };
 
 export type TaskRequest =
@@ -95,6 +119,8 @@ export const MAX_PARALLEL_TASKS = 8;
 export const MAX_CONCURRENCY = 4;
 export const PER_TASK_OUTPUT_CAP = 50 * 1024;
 export const NESTING_ENV = "DSTACK_NESTING";
+export const ASSIGNMENT_ENV = "DSTACK_ASSIGNMENT";
 export const MODE_ENTRY = "dstack-mode";
 export const TODO_ENTRY = "dstack-todos";
+export const ACTIVE_WORKFLOW_ENTRY = "dstack-active-workflow";
 export const DEFAULT_WORKTREE_BASE = "~/.dma/worktrees";

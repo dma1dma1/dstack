@@ -6,8 +6,8 @@ Skills in this package talk to Pi through dstack tools. This file is the rewrite
 
 | Skill name | Host |
 | --- | --- |
-| `dstack_task` | Background single, parallel, or chain group at root depth. Returns a task id immediately. Depth-1 nested calls remain synchronous. |
-| `dstack_result` | Nonblocking result lookup after the normal completion notification. |
+| `dstack_task` | Background single, parallel, or chain group at root depth. Returns a task id immediately. Depth-1 owners use synchronous nested calls for terminal workers. |
+| `dstack_result` | Nonblocking bounded summary after the normal completion notification. Full detail is opt-in. |
 | `dstack_todo` | First-party todos, or `@juicesharp/rpiv-todo` if that package is already loaded. |
 | `dstack_ask` | Typed options via `ctx.ui.select` / `ctx.ui.confirm`. |
 | `dstack_sessions` | `SessionManager.list(cwd)`. Do not glob session dirs. |
@@ -16,6 +16,8 @@ Skills in this package talk to Pi through dstack tools. This file is the rewrite
 ## Mode
 
 The user-facing mode command is `/dmode`. `/poteto-mode` is an alias of `/dmode`. Skills mention `/poteto-mode` only as that alias.
+
+Structured dmode launches carry `workflow` metadata with `playbook`, `assignment`, `phase`, `completedPhases`, and `artifacts`. Root launches one `poteto-agent` owner for a nontrivial request. Owners may submit repeated worker batches. Workers and reviewers are terminal, and only owners read the selected playbook. The file scheduler caps all root and nested child processes at four per session.
 
 ## Rewrite map
 

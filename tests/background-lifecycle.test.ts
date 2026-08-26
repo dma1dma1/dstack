@@ -215,7 +215,14 @@ test("dstack_result projects every companion and committed-result state", async 
 		readCommittedResult: async () => committed,
 	});
 
-	assert.deepEqual(await read("completed", complete), { kind: "complete", taskId, package: complete.package });
+	assert.deepEqual(await readDstackResult({
+		taskId,
+		detail: "full",
+		statusExact: async () => ({ ...runningTask, status: "completed" }),
+		readBinding: async () => binding,
+		readProgress: async () => ({ queued: 0, running: 0, complete: 1, total: 1 }),
+		readCommittedResult: async () => complete,
+	}), { kind: "complete", taskId, detail: "full", package: complete.package });
 	assert.deepEqual(await read("completed", artifact), {
 		kind: "artifact",
 		taskId,
@@ -241,6 +248,39 @@ test("dstack_result projects every companion and committed-result state", async 
 		readCommittedResult: async () => { throw new Error("commit is incomplete"); },
 	});
 	assert.deepEqual(killedWithUnreadableCommit, { kind: "cancelled", taskId, message: "The background task was cancelled." });
+});
+
+test("dstack_result defaults to a bounded summary with a sealed full-output pointer", async () => {
+	const binding: TaskBinding = { taskId, workflowId: "wf-0123456789abcdef" };
+	const fullOutput = { path: toAbsolutePath("/tmp/child-output.txt"), sha256: toSha256("b".repeat(64)), bytes: 12_000 };
+	const result = await readDstackResult({
+		taskId,
+		statusExact: async () => ({ ...runningTask, status: "completed" }),
+		readBinding: async () => binding,
+		readProgress: async () => ({ queued: 0, running: 0, complete: 1, total: 1 }),
+		readCommittedResult: async () => ({
+			kind: "complete",
+			outputs: [fullOutput],
+			package: {
+				mode: "single",
+				results: [{
+					agent: "poteto-agent",
+					cwd: "/workspace",
+					task: "own it",
+					text: "x".repeat(12_000),
+					exitCode: 0,
+					stderr: "",
+					messages: [{ role: "assistant", content: [{ type: "text", text: "large transcript" }] }],
+					usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 3, turns: 1 },
+				}],
+			},
+		}),
+	});
+	assert.equal(result.kind, "complete");
+	if (result.kind !== "complete" || result.detail !== "summary") return;
+	assert.equal(result.package.results[0]?.fullOutput, fullOutput);
+	assert.match(result.package.results[0]?.summary ?? "", /truncated/);
+	assert.equal("messages" in (result.package.results[0] ?? {}), false);
 });
 
 test("output artifact hash and byte-length corruption fail closed", async (t) => {

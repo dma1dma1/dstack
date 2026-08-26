@@ -8,7 +8,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { discoverAgents, packageRoot } from "./agents.ts";
 import { richerAskPresent, parseAskParams } from "./ask.ts";
-import { compactDetails, compactInstructions } from "./compact.ts";
+import { compactDetails, compactInstructions, restoreActiveWorkflow } from "./compact.ts";
 import {
 	continuationPrompt,
 	latestActiveTodoTasks,
@@ -66,11 +66,29 @@ import {
 	saveTodos,
 	todoFilePath,
 } from "./todo.ts";
-import { MODE_ENTRY, type ChildDepth, type ModeState, type TaskSpec, type TodoState } from "./types.ts";
+import { ACTIVE_WORKFLOW_ENTRY, MODE_ENTRY, type ActiveWorkflow, type ChildDepth, type ModeState, type TaskSpec, type TodoState } from "./types.ts";
 import { createEventBusV1Port, type BackgroundTaskPort } from "./background/eventbus-v1.ts";
 import { createTaskResultFiles, launchTaskGroup } from "./background/launch.ts";
+import { toAbsolutePath } from "./background/artifacts.ts";
 import { readDstackResult } from "./background/result.ts";
+import { acquireChildSlot } from "./background/scheduler.ts";
+import { ROOT_WORKFLOW_ENV, SCHEDULER_ROOT_ENV } from "./background/workflow.ts";
 import { createWorktree, WorktreeError } from "./worktree.ts";
+import { workflowSystemPrompt } from "./workflow-context.ts";
+
+const WorkflowArtifactItem = Type.Object({
+	name: Type.String(),
+	path: Type.String(),
+	sha256: Type.Optional(Type.String()),
+});
+
+const WorkflowParams = Type.Object({
+	playbook: Type.String({ description: "Selected dmode playbook slug" }),
+	assignment: StringEnum(["owner", "worker", "reviewer"] as const),
+	phase: Type.String({ description: "Current playbook phase slug" }),
+	completedPhases: Type.Array(Type.String()),
+	artifacts: Type.Array(WorkflowArtifactItem),
+});
 
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "poteto-agent | general-purpose | comment-sicko" }),
@@ -82,6 +100,7 @@ const TaskItem = Type.Object({
 	cwd: Type.Optional(Type.String()),
 	worktree: Type.Optional(Type.Boolean()),
 	dmode: Type.Optional(Type.Boolean()),
+	workflow: Type.Optional(WorkflowParams),
 });
 
 const TaskParams = Type.Object({
@@ -94,12 +113,14 @@ const TaskParams = Type.Object({
 	cwd: Type.Optional(Type.String()),
 	worktree: Type.Optional(Type.Boolean()),
 	dmode: Type.Optional(Type.Boolean()),
+	workflow: Type.Optional(WorkflowParams),
 	tasks: Type.Optional(Type.Array(TaskItem)),
 	chain: Type.Optional(Type.Array(TaskItem)),
 });
 
 const ResultParams = Type.Object({
 	taskId: Type.String({ description: "Background task id returned by dstack_task" }),
+	detail: Type.Optional(StringEnum(["summary", "full"] as const)),
 });
 
 const TodoParams = Type.Object({
@@ -231,7 +252,30 @@ function cloneDetails(details: TaskDetails): TaskDetails {
 		mode: details.mode,
 		results: details.results.map((result) => ({
 			...result,
+			task: ownerResultText(result.task),
 			messages: result.messages.map((message) => ({ ...message, content: [...message.content] })),
+			usage: { ...result.usage },
+		})),
+	};
+}
+
+const OWNER_RESULT_CAP = 8 * 1024;
+
+function ownerResultText(text: string): string {
+	if (Buffer.byteLength(text, "utf8") <= OWNER_RESULT_CAP) return text;
+	let summary = text.slice(0, OWNER_RESULT_CAP);
+	while (Buffer.byteLength(summary, "utf8") > OWNER_RESULT_CAP) summary = summary.slice(0, -1);
+	return `${summary}\n\n[worker summary truncated]`;
+}
+
+function ownerResultDetails(details: TaskDetails): TaskDetails {
+	return {
+		mode: details.mode,
+		results: details.results.map((result) => ({
+			...result,
+			text: ownerResultText(result.text),
+			stderr: ownerResultText(result.stderr),
+			messages: [],
 			usage: { ...result.usage },
 		})),
 	};
@@ -337,7 +381,7 @@ async function removeTemp(dir: string, filePath: string): Promise<void> {
 
 export default function dstack(pi: ExtensionAPI) {
 	let mode: ModeState = { on: false };
-	let playbook: string | undefined;
+	let activeWorkflow: ActiveWorkflow | undefined;
 	let todos: TodoState = { items: [] };
 	let sessionId = "unknown";
 	let pendingContinuation: { sessionId: string; tasks: TodoSnapshot[] } | undefined;
@@ -350,6 +394,11 @@ export default function dstack(pi: ExtensionAPI) {
 
 	function persistMode() {
 		pi.appendEntry(MODE_ENTRY, mode);
+	}
+
+	function persistActiveWorkflow(next: ActiveWorkflow | undefined) {
+		activeWorkflow = next;
+		pi.appendEntry(ACTIVE_WORKFLOW_ENTRY, next ?? null);
 	}
 
 	function applyStatus(ctx: ExtensionContext) {
@@ -370,6 +419,7 @@ export default function dstack(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		pendingContinuation = undefined;
 		mode = restoreMode(branchEntries(ctx));
+		activeWorkflow = restoreActiveWorkflow(branchEntries(ctx));
 		sessionId = ctx.sessionManager.getSessionId();
 		await refreshTodos();
 		applyStatus(ctx);
@@ -381,6 +431,7 @@ export default function dstack(pi: ExtensionAPI) {
 
 	pi.on("session_tree", async (_event, ctx) => {
 		mode = restoreMode(branchEntries(ctx));
+		activeWorkflow = restoreActiveWorkflow(branchEntries(ctx));
 		applyStatus(ctx);
 	});
 
@@ -406,7 +457,7 @@ export default function dstack(pi: ExtensionAPI) {
 			? { sessionId: ctx.sessionManager.getSessionId(), tasks }
 			: undefined;
 
-		const details = compactDetails({ playbook, todos });
+		const details = compactDetails({ activeWorkflow, todos });
 		pi.appendEntry("dstack-compact-context", details);
 		return undefined;
 	});
@@ -436,7 +487,7 @@ export default function dstack(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_before_tree", async () => {
-		const extra = compactInstructions({ playbook, todos });
+		const extra = compactInstructions({ activeWorkflow, todos });
 		if (!extra) return undefined;
 		return { customInstructions: extra };
 	});
@@ -509,7 +560,7 @@ export default function dstack(pi: ExtensionAPI) {
 		name: "dstack_task",
 		label: "dstack task",
 		description:
-			"Launch a background child-agent group. Modes: single (agent+task), parallel (tasks), chain (chain). Root calls return a task id immediately; wait for the completion notification, then call dstack_result once. Depth-1 nested calls stay synchronous and may spawn terminal depth-2 children. Do not poll.",
+			"Launch child agents. For dmode, root sends one nontrivial request to a workflow owner; owners may launch as many bounded worker batches as needed. Pass workflow metadata so workers receive phase and artifact state without rereading dmode. Root calls return a task id immediately. Wait for completion, then call dstack_result once. Do not poll.",
 		parameters: TaskParams,
 		renderCall(params, theme) {
 			const request = parseTaskRequest(params);
@@ -565,6 +616,13 @@ export default function dstack(pi: ExtensionAPI) {
 			const config = loaded.ok ? loaded.value : emptyConfig();
 			const agents = discoverAgents();
 			const specs = request.kind === "single" ? [request.spec] : request.specs;
+			const owners = specs.filter((spec) => spec.workflow?.assignment === "owner");
+			if (owners.length > 1) {
+				return textResult("dstack_task refused: one task group may have at most one workflow owner.", {}, true);
+			}
+			if (owners.some((spec) => spec.agent !== "poteto-agent")) {
+				return textResult('dstack_task refused: workflow owners must use agent "poteto-agent".', {}, true);
+			}
 			if (parentDepth === 0) {
 				const port = getEventBusPort();
 				const availabilitySignal = signal === undefined
@@ -588,18 +646,28 @@ export default function dstack(pi: ExtensionAPI) {
 						port,
 						signal,
 					});
+					if (specs.length === 1 && specs[0]?.workflow?.assignment === "owner") {
+						persistActiveWorkflow({
+							taskId: receipt.taskId,
+							playbook: specs[0].workflow.playbook,
+						});
+					}
 					return textResult(JSON.stringify(receipt), receipt);
 				} catch (error) {
 					return textResult(error instanceof Error ? error.message : String(error), {}, true);
 				}
 			}
 			const childDepth: ChildDepth = childDepthFor(parentDepth);
+			if (childDepth === 2 && specs.some((spec) => spec.workflow?.assignment === "owner")) {
+				return textResult("dstack_task refused: depth-2 children cannot be task owners.", {}, true);
+			}
 			const details: TaskDetails = {
 				mode: request.kind,
 				results: specs.map((spec, index) =>
 					emptyTaskResult(spec, spec.cwd ?? ctx.cwd, request.kind === "chain" ? index + 1 : undefined),
 				),
 			};
+			const nestedGroupId = randomUUID();
 			const publish = () => {
 				const snapshot = cloneDetails(details);
 				onUpdate?.(textResult(progressText(snapshot), snapshot));
@@ -632,11 +700,27 @@ export default function dstack(pi: ExtensionAPI) {
 				details.results[index] = { ...details.results[index], agent: resolved.agent, cwd, task: spec.task } as TaskResult;
 				publish();
 				const promptParts = [agent.systemPrompt.trim()];
-				if (resolved.dmode) promptParts.push(dmodeReminder(skillPath(), childDepth));
+				if (spec.workflow !== undefined) promptParts.push(workflowSystemPrompt(skillPath(), childDepth, spec.workflow));
+				else if (resolved.dmode) promptParts.push(dmodeReminder(skillPath(), childDepth));
 				let tmp: { dir: string; filePath: string } | undefined;
+				let lease: Awaited<ReturnType<typeof acquireChildSlot>> | undefined;
 				const system = promptParts.filter(Boolean).join("\n\n");
 				if (system) tmp = await writeTempPrompt(system);
 				try {
+					const rootWorkflowId = process.env[ROOT_WORKFLOW_ENV];
+					const schedulerRoot = process.env[SCHEDULER_ROOT_ENV];
+					if (rootWorkflowId && schedulerRoot) {
+						lease = await acquireChildSlot({
+							schedulerRoot: toAbsolutePath(schedulerRoot),
+							workflowId: rootWorkflowId,
+							childId: `${nestedGroupId}-${index}`,
+							work: {
+								depth: childDepth,
+								tools: (resolved.tools ?? agent.tools?.join(","))?.split(","),
+							},
+							signal: signal ?? new AbortController().signal,
+						});
+					}
 					const args = buildChildArgv({
 						task: spec.task,
 						extensionPath: extensionPath(),
@@ -648,8 +732,9 @@ export default function dstack(pi: ExtensionAPI) {
 					const child = await runChildProcess({
 						args,
 						cwd,
-						env: childEnv(childDepth),
+						env: childEnv(childDepth, process.env, spec.workflow?.assignment),
 						signal,
+						onSpawn: (pid) => lease?.bindChild(pid),
 						onUpdate: (partial) => {
 							details.results[index] = { ...partial, agent: resolved.agent, cwd, task: spec.task, step: details.results[index]?.step };
 							publish();
@@ -667,6 +752,7 @@ export default function dstack(pi: ExtensionAPI) {
 					publish();
 					return completed;
 				} finally {
+					await lease?.release();
 					if (tmp) await removeTemp(tmp.dir, tmp.filePath);
 				}
 			};
@@ -679,23 +765,23 @@ export default function dstack(pi: ExtensionAPI) {
 						const result = await runOne({ ...spec, task }, index);
 						results.push(result);
 						if (result.exitCode !== 0) {
-							return textResult(`Chain stopped (${spec.agent}): ${result.text}`, cloneDetails(details), true);
+							return textResult(`Chain stopped (${spec.agent}): ${ownerResultText(result.text)}`, ownerResultDetails(details), true);
 						}
 						previous = result.text;
 					}
 					const last = results[results.length - 1];
-					return textResult(last?.text ?? "(no output)", cloneDetails(details));
+					return textResult(ownerResultText(last?.text ?? "(no output)"), ownerResultDetails(details));
 				}
 				const results = await mapWithConcurrency(specs, MAX_CONCURRENCY, (spec, index) => runOne(spec, index));
 				if (request.kind === "single") {
 					const result = results[0];
 					if (!result) return textResult("(no output)");
-					return textResult(result.text, cloneDetails(details), result.exitCode !== 0);
+					return textResult(ownerResultText(result.text), ownerResultDetails(details), result.exitCode !== 0);
 				}
 				const text = results
-					.map((task) => `### [${task.agent}] ${task.exitCode === 0 ? "completed" : "failed"}\n\n${task.text}`)
+					.map((task) => `### [${task.agent}] ${task.exitCode === 0 ? "completed" : "failed"}\n\n${ownerResultText(task.text)}`)
 					.join("\n\n---\n\n");
-				return textResult(text, cloneDetails(details));
+				return textResult(text, ownerResultDetails(details));
 			} catch (err) {
 				if (err instanceof WorktreeError) {
 					return textResult(err.message, {}, true);
@@ -708,17 +794,20 @@ export default function dstack(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "dstack_result",
 		label: "dstack result",
-		description: "Read the current result projection for a background dstack task.",
+		description: "Read a bounded summary for a background dstack task. Use detail=full only when the complete child transcript is necessary.",
 		parameters: ResultParams,
 		async execute(_id, params, signal) {
 			const files = createTaskResultFiles(sessionId);
 			const result = await readDstackResult({
 				taskId: params.taskId,
+				detail: params.detail,
 				statusExact: (taskId) => getEventBusPort().statusExact(taskId, signal),
 				readBinding: files.readBinding,
 				readProgress: files.readProgress,
 				readCommittedResult: files.readCommittedResult,
 			});
+			const terminal = result.kind === "complete" || result.kind === "artifact" || result.kind === "cancelled" || result.kind === "runner_failed";
+			if (activeWorkflow?.taskId === params.taskId && terminal) persistActiveWorkflow(undefined);
 			return textResult(JSON.stringify(result), result);
 		},
 	});
