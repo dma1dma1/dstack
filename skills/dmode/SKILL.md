@@ -34,6 +34,8 @@ Start multi-step owner work with a todolist. Read the Principles section below i
 
 The owner may launch as many bounded worker batches as needed. Each child receives structured workflow metadata with `assignment: "worker"` or `assignment: "reviewer"`, one current phase, the completed phase names, and stable artifact paths. Include a SHA-256 seal when an artifact must be immutable. Workers are terminal. They implement or inspect their assigned slice and report contradictions instead of redesigning the task. The owner integrates the combined result, reads the diff, and verifies the real artifact.
 
+Choose each child's model role by the work it still has to decide. Use `implementation-worker` for a settled code-writing brief with named files, acceptance criteria, and verification. Use a specialized role instead when the child still owns substantive prose, investigation, performance analysis, or judgment.
+
 Use Architect only when the playbook or user requests it, or grounding exposes a consequential choice with multiple plausible shapes that cannot be settled cheaply from existing evidence. Architect produces a `design.md` handoff artifact. Its existence records a completed phase; it is not a global gate. Use Interrogate only when the user requests adversarial review or the selected playbook explicitly calls for it. Never pair every implementation unit with a judge.
 
 Additional triggers:

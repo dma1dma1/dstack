@@ -31,6 +31,7 @@ test("implementation playbooks use design only for unresolved consequential choi
 });
 
 test("worker checks stay mechanical and reviews happen at the integrated change", () => {
+	assert.match(feature, /role: "implementation-worker".*brief settles the implementation choices/);
 	assert.match(figureItOut, /Per unit: run the relevant tests, typecheck, and build\. Read the diff yourself\. Do not spawn a per-unit judge/);
 	assert.match(feature, /Review the completed change once, never each implementation step/);
 	assert.doesNotMatch(feature, /no skip-with-reason escape/);

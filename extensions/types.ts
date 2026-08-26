@@ -4,6 +4,7 @@ export const ROLE_NAMES = [
 	"bug-fix",
 	"perf-issue",
 	"hillclimb",
+	"implementation-worker",
 	"judgment",
 	"prose",
 	"hardest-tasks",
