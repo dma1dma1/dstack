@@ -26,11 +26,53 @@ import type { ChildUsage } from "../spawn.ts";
 
 const STATUS_INTERVAL_MS = 1000;
 const DETAIL_TAIL_BYTES = 128 * 1024;
-const LIST_VISIBLE_ROWS = 14;
-const DETAIL_VISIBLE_OUTPUT_LINES = 12;
-const TASK_VISIBLE_LINES = 14;
-const FINAL_VISIBLE_LINES = 12;
-const SUMMARY_VISIBLE_LINES = 14;
+const DEFAULT_FALLBACK_ROWS = 26;
+
+export type InspectorLayoutMetrics = Readonly<{
+	terminalRows: number;
+	frameHeight: number;
+	bodyRows: number;
+	listVisibleRows: number;
+	summaryVisibleRows: number;
+	taskVisibleRows: number;
+	finalVisibleRows: number;
+	rawVisibleRows: number;
+}>;
+
+export function deriveInspectorLayoutMetrics(terminalRows?: number): InspectorLayoutMetrics {
+	if (typeof terminalRows !== "number" || !Number.isFinite(terminalRows)) {
+		return {
+			terminalRows: DEFAULT_FALLBACK_ROWS,
+			frameHeight: 23,
+			bodyRows: 16,
+			listVisibleRows: 14,
+			summaryVisibleRows: 14,
+			taskVisibleRows: 14,
+			finalVisibleRows: 12,
+			rawVisibleRows: 12,
+		};
+	}
+
+	const effectiveTerminalRows = Math.max(8, Math.floor(terminalRows));
+	const frameHeight = Math.max(8, Math.floor(effectiveTerminalRows * 0.9));
+	const bodyRows = Math.max(1, frameHeight - 7);
+	const listVisibleRows = Math.max(1, bodyRows - 2);
+	const summaryVisibleRows = Math.max(1, bodyRows - 2);
+	const taskVisibleRows = Math.max(1, bodyRows - 3);
+	const finalVisibleRows = Math.max(1, bodyRows - 4);
+	const rawVisibleRows = Math.max(1, bodyRows - 4);
+
+	return {
+		terminalRows: effectiveTerminalRows,
+		frameHeight,
+		bodyRows,
+		listVisibleRows,
+		summaryVisibleRows,
+		taskVisibleRows,
+		finalVisibleRows,
+		rawVisibleRows,
+	};
+}
 
 const LIGHT_BLUE_BG = "\x1b[48;2;183;223;255m";
 const LIGHT_BLUE_FG = "\x1b[38;2;11;70;110m";
@@ -771,6 +813,7 @@ export type AgentInspectorOptions = Readonly<{
 	initialView?: DetailViewMode;
 	todoPath?: string;
 	refreshIntervalMs?: number;
+	terminalRows?: number | (() => number);
 	listWorkflows?: (sessionId: string) => Promise<readonly WorkflowSummary[]>;
 	getSnapshot?: (input: BuildTreeSnapshotInput) => Promise<TreeSnapshot | undefined>;
 	readOutputTail?: (filePath: string, maxBytes?: number) => Promise<BoundedReadResult>;
@@ -819,6 +862,7 @@ export class AgentInspector implements Component {
 	private lastTaskLineCount = 0;
 	private finalScrollTop = 0;
 	private lastFinalLineCount = 0;
+	private lastFinalVisibleRows = deriveInspectorLayoutMetrics().finalVisibleRows;
 
 	private loadError?: string;
 	private disposed = false;
@@ -1246,17 +1290,38 @@ export class AgentInspector implements Component {
 		}
 	}
 
+	private getTuiTerminalRows(): number | undefined {
+		if (
+			"terminal" in this.tui &&
+			typeof this.tui.terminal === "object" &&
+			this.tui.terminal !== null &&
+			"rows" in this.tui.terminal &&
+			typeof this.tui.terminal.rows === "number"
+		) {
+			return this.tui.terminal.rows;
+		}
+		return undefined;
+	}
+
+	get layoutMetrics(): InspectorLayoutMetrics {
+		const rawRows = typeof this.options.terminalRows === "function"
+			? this.options.terminalRows()
+			: this.options.terminalRows ?? this.getTuiTerminalRows();
+		return deriveInspectorLayoutMetrics(rawRows);
+	}
+
 	private scrollActiveDetailView(delta: number): void {
 		if (this.detailView === "task") {
-			const maxTop = Math.max(0, this.lastTaskLineCount - TASK_VISIBLE_LINES);
+			const maxTop = Math.max(0, this.lastTaskLineCount - this.layoutMetrics.taskVisibleRows);
 			this.taskScrollTop = Math.min(maxTop, Math.max(0, this.taskScrollTop + delta));
 		} else if (this.detailView === "final") {
-			const maxTop = Math.max(0, this.lastFinalLineCount - FINAL_VISIBLE_LINES);
+			const visibleRows = Math.max(1, this.lastFinalVisibleRows);
+			const maxTop = Math.max(0, this.lastFinalLineCount - visibleRows);
 			this.finalScrollTop = Math.min(maxTop, Math.max(0, this.finalScrollTop + delta));
 		} else if (this.detailView === "raw") {
 			this.scrollRawDetail(delta);
 		} else {
-			const maxTop = Math.max(0, this.lastSummaryLineCount - SUMMARY_VISIBLE_LINES);
+			const maxTop = Math.max(0, this.lastSummaryLineCount - this.layoutMetrics.summaryVisibleRows);
 			this.summaryScrollTop = Math.min(maxTop, Math.max(0, this.summaryScrollTop + delta));
 		}
 		this.tui.requestRender();
@@ -1264,24 +1329,25 @@ export class AgentInspector implements Component {
 
 	private scrollActiveDetailViewTo(target: number): void {
 		if (this.detailView === "task") {
-			const maxTop = Math.max(0, this.lastTaskLineCount - TASK_VISIBLE_LINES);
+			const maxTop = Math.max(0, this.lastTaskLineCount - this.layoutMetrics.taskVisibleRows);
 			this.taskScrollTop = Math.min(maxTop, Math.max(0, target));
 		} else if (this.detailView === "final") {
-			const maxTop = Math.max(0, this.lastFinalLineCount - FINAL_VISIBLE_LINES);
+			const visibleRows = Math.max(1, this.lastFinalVisibleRows);
+			const maxTop = Math.max(0, this.lastFinalLineCount - visibleRows);
 			this.finalScrollTop = Math.min(maxTop, Math.max(0, target));
 		} else if (this.detailView === "raw") {
-			const maxTop = Math.max(0, this.detailLines.length - DETAIL_VISIBLE_OUTPUT_LINES);
+			const maxTop = Math.max(0, this.detailLines.length - this.layoutMetrics.rawVisibleRows);
 			this.detailFollow = target >= maxTop;
 			this.detailScrollTop = Math.min(maxTop, Math.max(0, target));
 		} else {
-			const maxTop = Math.max(0, this.lastSummaryLineCount - SUMMARY_VISIBLE_LINES);
+			const maxTop = Math.max(0, this.lastSummaryLineCount - this.layoutMetrics.summaryVisibleRows);
 			this.summaryScrollTop = Math.min(maxTop, Math.max(0, target));
 		}
 		this.tui.requestRender();
 	}
 
 	private scrollRawDetail(delta: number): void {
-		const maxTop = Math.max(0, this.detailLines.length - DETAIL_VISIBLE_OUTPUT_LINES);
+		const maxTop = Math.max(0, this.detailLines.length - this.layoutMetrics.rawVisibleRows);
 		if (maxTop === 0) return;
 		if (this.detailFollow) {
 			this.detailFollow = false;
@@ -1351,15 +1417,16 @@ export class AgentInspector implements Component {
 	}
 
 	private ensureSelectionVisible(): void {
+		const listVisibleRows = this.layoutMetrics.listVisibleRows;
 		if (this.selectedIndex < this.listScroll) {
 			this.listScroll = this.selectedIndex;
-		} else if (this.selectedIndex >= this.listScroll + LIST_VISIBLE_ROWS) {
-			this.listScroll = this.selectedIndex - LIST_VISIBLE_ROWS + 1;
+		} else if (this.selectedIndex >= this.listScroll + listVisibleRows) {
+			this.listScroll = this.selectedIndex - listVisibleRows + 1;
 		}
 	}
 
 	render(width: number): string[] {
-		const boxWidth = Math.max(20, Math.min(width, 118));
+		const boxWidth = Math.max(3, Math.floor(width));
 		const frame = this.currentFrame();
 		if (frame.kind === "agent-detail") {
 			return this.renderDetail(boxWidth, frame);
@@ -1531,6 +1598,8 @@ export class AgentInspector implements Component {
 		subtitleParts.push(`slots ${activeSlots}`);
 		const subtitle = subtitleParts.join(" · ");
 
+		const listVisibleRows = this.layoutMetrics.listVisibleRows;
+		const bodyRows = this.layoutMetrics.bodyRows;
 		const body: string[] = [];
 		if (this.loadError !== undefined && this.workflows.length === 0) {
 			body.push(this.theme.fg("error", `  Failed to load dstack workflows: ${this.loadError}`));
@@ -1540,7 +1609,7 @@ export class AgentInspector implements Component {
 				: "  No active dstack workflows. Press h to show recent history.";
 			body.push(this.theme.fg("dim", msg));
 		} else {
-			const visibleSlice = rows.slice(this.listScroll, this.listScroll + LIST_VISIBLE_ROWS);
+			const visibleSlice = rows.slice(this.listScroll, this.listScroll + listVisibleRows);
 			for (let i = 0; i < visibleSlice.length; i++) {
 				const r = visibleSlice[i];
 				if (r === undefined) continue;
@@ -1549,16 +1618,23 @@ export class AgentInspector implements Component {
 				const pointer = isSelected ? "›" : " ";
 				let rowLine = `${pointer} ${r.text}`;
 				if (isSelected) {
-					rowLine = lightBlue(padAnsi(truncateToWidth(rowLine, width - 4), width - 4));
+					rowLine = lightBlue(padAnsi(truncateToWidth(rowLine, width - 2), width - 2));
 				}
 				body.push(rowLine);
 			}
 
-			if (rows.length > LIST_VISIBLE_ROWS) {
+			if (rows.length > listVisibleRows) {
 				const start = this.listScroll + 1;
-				const end = Math.min(rows.length, this.listScroll + LIST_VISIBLE_ROWS);
+				const end = Math.min(rows.length, this.listScroll + listVisibleRows);
 				body.push(this.theme.fg("dim", `  Showing ${start}-${end} of ${rows.length}`));
 			}
+		}
+
+		while (body.length < bodyRows) {
+			body.push("");
+		}
+		if (body.length > bodyRows) {
+			body.length = bodyRows;
 		}
 
 		const footer = ` ${this.theme.fg("dim", `↑/↓ select · Enter/→ inspect · h ${this.showHistory ? "hide" : "show"} history · Esc/q close`)}`;
@@ -1573,12 +1649,18 @@ export class AgentInspector implements Component {
 
 		if (snapshot === undefined || wf === undefined) {
 			const body = [this.theme.fg("dim", "Workflow snapshot unavailable.")];
+			while (body.length < this.layoutMetrics.bodyRows) {
+				body.push("");
+			}
 			return this.frameBox("agent detail", "unknown", body, " Esc/← back · q close", width);
 		}
 
 		const child = snapshot.children[frame.childIndex];
 		if (child === undefined) {
 			const body = [this.theme.fg("dim", "Child agent record unavailable.")];
+			while (body.length < this.layoutMetrics.bodyRows) {
+				body.push("");
+			}
 			return this.frameBox("agent detail", "unknown", body, " Esc/← back · q close", width);
 		}
 
@@ -1809,15 +1891,26 @@ export class AgentInspector implements Component {
 		}
 
 		this.lastSummaryLineCount = lines.length;
-		const maxTop = Math.max(0, lines.length - SUMMARY_VISIBLE_LINES);
+		const summaryVisibleRows = this.layoutMetrics.summaryVisibleRows;
+		const bodyRows = this.layoutMetrics.bodyRows;
+		const maxTop = Math.max(0, lines.length - summaryVisibleRows);
 		const start = Math.min(this.summaryScrollTop, maxTop);
-		const end = Math.min(lines.length, start + SUMMARY_VISIBLE_LINES);
+		const end = Math.min(lines.length, start + summaryVisibleRows);
 		const windowLines = lines.slice(start, end);
 		const body: string[] = [...windowLines];
 
-		if (lines.length > SUMMARY_VISIBLE_LINES) {
-			body.push("");
+		if (lines.length > summaryVisibleRows) {
+			if (body.length < bodyRows - 1) {
+				body.push("");
+			}
 			body.push(` ${this.theme.fg("dim", `lines ${start + 1}-${end} of ${lines.length}`)}`);
+		}
+
+		while (body.length < bodyRows) {
+			body.push("");
+		}
+		if (body.length > bodyRows) {
+			body.length = bodyRows;
 		}
 
 		return body;
@@ -1834,84 +1927,119 @@ export class AgentInspector implements Component {
 			"",
 		];
 
-		const maxTop = Math.max(0, wrappedLines.length - TASK_VISIBLE_LINES);
+		const taskVisibleRows = this.layoutMetrics.taskVisibleRows;
+		const bodyRows = this.layoutMetrics.bodyRows;
+		const maxTop = Math.max(0, wrappedLines.length - taskVisibleRows);
 		const start = Math.min(this.taskScrollTop, maxTop);
-		const end = Math.min(wrappedLines.length, start + TASK_VISIBLE_LINES);
+		const end = Math.min(wrappedLines.length, start + taskVisibleRows);
 		const windowLines = wrappedLines.slice(start, end);
 
 		for (const line of windowLines) {
 			body.push(`  ${line}`);
 		}
 
-		while (body.length < TASK_VISIBLE_LINES + 2) {
+		if (body.length < bodyRows - 1) {
 			body.push("");
 		}
-
-		body.push("");
 		body.push(` ${this.theme.fg("dim", `lines ${start + 1}-${end} of ${wrappedLines.length} · ↑/↓ PgUp/PgDn scroll · Home/End top/bottom · s Summary`)}`);
+
+		while (body.length < bodyRows) {
+			body.push("");
+		}
+		if (body.length > bodyRows) {
+			body.length = bodyRows;
+		}
+
 		return body;
 	}
 
 	private renderFinalView(width: number, inspection: AgentInspection): string[] {
 		const inner = Math.max(1, width - 4);
 		const output = inspection.output;
-		const body: string[] = [];
+		const headerLines: string[] = [];
 
 		if (output !== undefined) {
 			const exitCodeStr = output.exitCode !== undefined ? `exitCode ${output.exitCode}` : "exitCode -";
 			const stopStr = output.stopReason ? `stop: ${output.stopReason}` : "";
 			const modelStr = output.model ? `model: ${output.model}` : "";
 			const headerMeta = [exitCodeStr, stopStr, modelStr].filter((s) => s.length > 0).join(" · ");
-			body.push(` ${this.theme.fg("toolTitle", "Envelope:")} ${this.theme.fg("dim", `provenance: ${output.provenance} · ${headerMeta}`)}`);
+			headerLines.push(` ${this.theme.fg("toolTitle", "Envelope:")} ${this.theme.fg("dim", `provenance: ${output.provenance} · ${headerMeta}`)}`);
 
 			if (output.provenance === "sealed-result" && output.seal) {
-				body.push(` ${this.theme.fg("toolTitle", "Seal:")} ${this.theme.fg("dim", `${output.seal.path} (sha256: ${output.seal.sha256}, ${output.seal.bytes} B)`)}`);
+				headerLines.push(` ${this.theme.fg("toolTitle", "Seal:")} ${this.theme.fg("dim", `${output.seal.path} (sha256: ${output.seal.sha256}, ${output.seal.bytes} B)`)}`);
 			}
 			if (output.usage) {
-				body.push(` ${this.theme.fg("toolTitle", "Usage:")} ${this.theme.fg("dim", `${output.usage.turns} turns · ${output.usage.contextTokens} ctx tok · $${output.usage.cost}`)}`);
+				headerLines.push(` ${this.theme.fg("toolTitle", "Usage:")} ${this.theme.fg("dim", `${output.usage.turns} turns · ${output.usage.contextTokens} ctx tok · $${output.usage.cost}`)}`);
 			}
 			if (output.errorMessage) {
-				body.push(` ${this.theme.fg("error", `Error: ${output.errorMessage}`)}`);
+				headerLines.push(` ${this.theme.fg("error", `Error: ${output.errorMessage}`)}`);
 			}
 			if (output.stderr) {
-				body.push(` ${this.theme.fg("error", `Stderr: ${output.stderr.split("\n")[0] ?? ""}`)}`);
+				headerLines.push(` ${this.theme.fg("error", `Stderr: ${output.stderr.split("\n")[0] ?? ""}`)}`);
 			}
 		} else {
-			body.push(` ${this.theme.fg("dim", "No output envelope recorded yet.")}`);
+			headerLines.push(` ${this.theme.fg("dim", "No output envelope recorded yet.")}`);
 		}
 
-		body.push("");
-		body.push(` ${this.theme.fg("toolTitle", "Final Response (free-form text):")}`);
+		const finalHeading = ` ${this.theme.fg("toolTitle", "Final Response (free-form text):")}`;
+		headerLines.push("", finalHeading);
 
 		const finalText = output?.finalText?.trim() || "(no final response text recorded)";
 		const wrappedLines = wrapText(finalText, inner - 2);
 		this.lastFinalLineCount = wrappedLines.length;
 
-		const maxTop = Math.max(0, wrappedLines.length - FINAL_VISIBLE_LINES);
+		const bodyRows = this.layoutMetrics.bodyRows;
+		const maxHeaderRows = Math.max(0, bodyRows - 2);
+		const visibleHeaderLines = headerLines.length <= maxHeaderRows
+			? headerLines
+			: maxHeaderRows >= 2
+				? [headerLines[0] ?? finalHeading, finalHeading]
+				: maxHeaderRows === 1
+					? [finalHeading]
+					: [];
+		const statusLineSpace = bodyRows - visibleHeaderLines.length >= 3 ? 2 : 1;
+		const actualVisibleRows = Math.max(0, bodyRows - visibleHeaderLines.length - statusLineSpace);
+		this.lastFinalVisibleRows = Math.max(1, actualVisibleRows);
+
+		const maxTop = Math.max(0, wrappedLines.length - this.lastFinalVisibleRows);
 		const start = Math.min(this.finalScrollTop, maxTop);
-		const end = Math.min(wrappedLines.length, start + FINAL_VISIBLE_LINES);
+		const end = Math.min(wrappedLines.length, start + actualVisibleRows);
 		const windowLines = wrappedLines.slice(start, end);
 
+		const body: string[] = [...visibleHeaderLines];
 		for (const line of windowLines) {
 			body.push(`  ${line}`);
 		}
 
-		while (body.length < FINAL_VISIBLE_LINES + 5) {
+		while (body.length < bodyRows - 1) {
 			body.push("");
 		}
-
-		body.push("");
 		body.push(` ${this.theme.fg("dim", `lines ${start + 1}-${end} of ${wrappedLines.length} · ↑/↓ PgUp/PgDn scroll · Home/End top/bottom · s Summary`)}`);
+
+		while (body.length < bodyRows) {
+			body.push("");
+		}
+		if (body.length > bodyRows) {
+			body.length = bodyRows;
+		}
+
 		return body;
 	}
 
 	private renderRawView(width: number, inspection: AgentInspection): string[] {
 		const body: string[] = [];
 		const raw = inspection.raw;
+		const bodyRows = this.layoutMetrics.bodyRows;
 
 		if (raw.kind === "output-tail") {
 			body.push(` ${this.theme.fg("toolTitle", "Raw output.txt tail (secondary view):")}`);
 			body.push(...this.renderOutputBox(width - 4));
+			while (body.length < bodyRows) {
+				body.push("");
+			}
+			if (body.length > bodyRows) {
+				body.length = bodyRows;
+			}
 			return body;
 		}
 
@@ -1920,25 +2048,38 @@ export class AgentInspector implements Component {
 			body.push("");
 			body.push(`  ${this.theme.fg("dim", "Raw output.txt tail is not captured separately for depth-2 child agents.")}`);
 			body.push(`  ${this.theme.fg("dim", "The recorded final response is available in the Final response view (press 'f').")}`);
-			while (body.length < DETAIL_VISIBLE_OUTPUT_LINES) {
+			while (body.length < bodyRows - 1) {
 				body.push("");
 			}
 			body.push(` ${this.theme.fg("dim", "f Final response · s Summary · Esc/← back")}`);
+			while (body.length < bodyRows) {
+				body.push("");
+			}
+			if (body.length > bodyRows) {
+				body.length = bodyRows;
+			}
 			return body;
 		}
 
 		body.push(` ${this.theme.fg("toolTitle", "Raw Output:")}`);
 		body.push("");
 		body.push(`  ${this.theme.fg("dim", `Raw output tail unavailable: ${raw.reason ?? "no output file"}`)}`);
-		while (body.length < DETAIL_VISIBLE_OUTPUT_LINES) {
+		while (body.length < bodyRows - 1) {
 			body.push("");
 		}
 		body.push(` ${this.theme.fg("dim", "s Summary · t Task · f Final · Esc/← back")}`);
+		while (body.length < bodyRows) {
+			body.push("");
+		}
+		if (body.length > bodyRows) {
+			body.length = bodyRows;
+		}
 		return body;
 	}
 
 	private renderOutputBox(width: number): string[] {
 		const inner = Math.max(1, width - 2);
+		const rawVisibleRows = this.layoutMetrics.rawVisibleRows;
 		const top = ` ${blueBorder(`╭${"─".repeat(inner)}╮`)}`;
 		const bottom = ` ${blueBorder(`╰${"─".repeat(inner)}╯`)}`;
 		const row = (content = "") =>
@@ -1950,15 +2091,15 @@ export class AgentInspector implements Component {
 		} else if (this.detailLines.length === 0) {
 			lines.push(row(this.theme.fg("dim", "  (no output recorded)")));
 		} else {
-			const maxTop = Math.max(0, this.detailLines.length - DETAIL_VISIBLE_OUTPUT_LINES);
+			const maxTop = Math.max(0, this.detailLines.length - rawVisibleRows);
 			const start = this.detailFollow ? maxTop : Math.min(this.detailScrollTop, maxTop);
-			const windowLines = this.detailLines.slice(start, start + DETAIL_VISIBLE_OUTPUT_LINES);
+			const windowLines = this.detailLines.slice(start, start + rawVisibleRows);
 			for (const line of windowLines) {
 				lines.push(row(`  ${line}`));
 			}
 		}
 
-		while (lines.length < DETAIL_VISIBLE_OUTPUT_LINES + 1) {
+		while (lines.length < rawVisibleRows + 1) {
 			lines.push(row());
 		}
 		lines.push(bottom);
@@ -1968,10 +2109,11 @@ export class AgentInspector implements Component {
 
 	private outputStatusLine(): string {
 		const total = this.detailLines.length;
+		const rawVisibleRows = this.layoutMetrics.rawVisibleRows;
 		if (!this.detailFollow && total > 0) {
-			const maxTop = Math.max(0, total - DETAIL_VISIBLE_OUTPUT_LINES);
+			const maxTop = Math.max(0, total - rawVisibleRows);
 			const start = Math.min(this.detailScrollTop, maxTop);
-			const end = Math.min(total, start + DETAIL_VISIBLE_OUTPUT_LINES);
+			const end = Math.min(total, start + rawVisibleRows);
 			return `lines ${start + 1}-${end} of ${total} · ↑/↓ PgUp/PgDn scroll · ↓ at bottom follows · r resume`;
 		}
 		const suffix = this.tailTruncated ? ` of ${this.tailTotalBytes} bytes` : "";

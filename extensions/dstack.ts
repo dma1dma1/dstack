@@ -406,15 +406,16 @@ export default function dstack(pi: ExtensionAPI) {
 						sessionId,
 						initialTaskId: taskId,
 						todoPath: todoFilePath(sessionId),
+						terminalRows: () => tui.terminal.rows,
 					});
 				},
 				{
 					overlay: true,
 					overlayOptions: {
 						anchor: "bottom-center",
-						width: "96%",
+						width: "100%",
 						minWidth: 64,
-						maxHeight: "60%",
+						maxHeight: "90%",
 						margin: { bottom: 1, left: 1, right: 1 },
 					},
 				},

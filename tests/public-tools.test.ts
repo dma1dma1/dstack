@@ -41,6 +41,7 @@ function testRuntime(events: ReturnType<typeof createEventBus>) {
 	const notifications: Array<{ message: string; level: string }> = [];
 	const widgets: string[] = [];
 	let customOverlayOpened = 0;
+	let lastOverlayOptions: unknown;
 	const pi = {
 		events,
 		registerTool(tool: { name: string }) { tools.set(tool.name, tool as never); },
@@ -79,10 +80,19 @@ function testRuntime(events: ReturnType<typeof createEventBus>) {
 			notify(message: string, level: string) {
 				notifications.push({ message, level });
 			},
-			async custom(factory: (...args: unknown[]) => { render: (w: number) => string[]; dispose?: () => void }, _options: unknown) {
+			async custom(factory: (...args: unknown[]) => { render: (w: number) => string[]; dispose?: () => void }, options: unknown) {
 				customOverlayOpened++;
+				lastOverlayOptions = options;
 				const done = (_res: unknown) => {};
-				const component = factory({ requestRender: () => {} }, { fg: (_: string, t: string) => t }, {}, done);
+				const component = factory(
+					{
+						requestRender: () => {},
+						terminal: { rows: 40, columns: 120 },
+					},
+					{ fg: (_: string, t: string) => t },
+					{},
+					done,
+				);
 				if (typeof component === "object" && component !== null && "dispose" in component && typeof component.dispose === "function") {
 					component.dispose();
 				}
@@ -95,7 +105,19 @@ function testRuntime(events: ReturnType<typeof createEventBus>) {
 		},
 		modelRegistry: { getAvailable: () => [] },
 	};
-	return { tools, handlers, commands, shortcuts, entryRenderers, entries, notifications, widgets, getCustomOverlayOpened: () => customOverlayOpened, ctx };
+	return {
+		tools,
+		handlers,
+		commands,
+		shortcuts,
+		entryRenderers,
+		entries,
+		notifications,
+		widgets,
+		getCustomOverlayOpened: () => customOverlayOpened,
+		getLastOverlayOptions: () => lastOverlayOptions,
+		ctx,
+	};
 }
 
 test("root task returns a receipt before the runner completes and dstack_result projects running and ordered completion", async (t) => {
@@ -833,7 +855,27 @@ test("dagents command and shift+up shortcut open inspector overlay and manage wi
 
 	await dagentsCommand.handler("", runtime.ctx);
 	assert.equal(runtime.getCustomOverlayOpened(), 1);
+	assert.deepEqual(runtime.getLastOverlayOptions(), {
+		overlay: true,
+		overlayOptions: {
+			anchor: "bottom-center",
+			width: "100%",
+			minWidth: 64,
+			maxHeight: "90%",
+			margin: { bottom: 1, left: 1, right: 1 },
+		},
+	});
 
 	await shiftUpShortcut.handler(runtime.ctx);
 	assert.equal(runtime.getCustomOverlayOpened(), 2);
+	assert.deepEqual(runtime.getLastOverlayOptions(), {
+		overlay: true,
+		overlayOptions: {
+			anchor: "bottom-center",
+			width: "100%",
+			minWidth: 64,
+			maxHeight: "90%",
+			margin: { bottom: 1, left: 1, right: 1 },
+		},
+	});
 });
