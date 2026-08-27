@@ -1,6 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, writeFile, unlink, rmdir, mkdir } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StringEnum, type Usage } from "@earendil-works/pi-ai";
 import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -22,8 +20,6 @@ import {
 	formatConfigError,
 	loadConfig,
 	parseConfig,
-	resolveModel,
-	resolveNestedLaunchModel,
 	saveConfig,
 	slugsFromRegistry,
 	validateRoles,
@@ -44,22 +40,15 @@ import {
 	suggestConfig,
 } from "./setup.ts";
 import {
-	buildChildArgv,
-	capOutput,
 	childDepthFor,
-	childEnv,
 	formatUsageStats,
-	mapWithConcurrency,
 	parseNestingDepth,
 	parseTaskRequest,
-	resolveAgent,
 	spawnableDepth,
-	runChildProcess,
 	sumChildUsage,
 	type ChildContentPart,
 	type ChildMessage,
 	type ChildResult,
-	MAX_CONCURRENCY,
 	NestingError,
 } from "./spawn.ts";
 import {
@@ -69,24 +58,29 @@ import {
 	saveTodos,
 	todoFilePath,
 } from "./todo.ts";
-import { ACTIVE_WORKFLOW_ENTRY, MODE_ENTRY, NESTING_ENV, STATUS_FILE_ENV, type ActiveWorkflow, type ChildDepth, type ModeState, type TaskSpec, type TodoState } from "./types.ts";
-import { createEventBusV1Port, type BackgroundTaskPort } from "./background/eventbus-v1.ts";
+import { ACTIVE_WORKFLOW_ENTRY, MODE_ENTRY, NESTING_ENV, STATUS_FILE_ENV, type ActiveWorkflow, type ChildDepth, type ModeState, type TodoState } from "./types.ts";
+import { createEventBusV1Port, type BackgroundTaskPort, type CompanionTaskState } from "./background/eventbus-v1.ts";
 import { createTaskResultFiles, launchTaskGroup, sessionRoot } from "./background/launch.ts";
-import { atomicWriteFile, toAbsolutePath } from "./background/artifacts.ts";
+import { atomicWriteFile } from "./background/artifacts.ts";
 import {
-	allowStatusTool,
-	ChildJournalRecorder,
 	MAX_STATUS_NOTE_CHARS,
 	MAX_STATUS_PHASE_CHARS,
-	recentJournal,
 	sanitizeString,
-	type JournalEntry,
 	type SemanticStatus,
 } from "./background/journal.ts";
 import { readDstackResult, type CommittedResult, type DstackResultView } from "./background/result.ts";
-import { acquireChildSlot } from "./background/scheduler.ts";
-import { DSTACK_ARTIFACT_DIR_ENV, DSTACK_CHILD_INDEX_ENV, ROOT_WORKFLOW_ENV, SCHEDULER_ROOT_ENV } from "./background/workflow.ts";
-import { activityLines, buildTreeSnapshot, latestActivity, parseTreeSnapshot, renderTreeLines, taskPreviewOf, type SpawnChildV1, type SpawnRecordV1, type TreeSnapshot } from "./background/tree.ts";
+import {
+	formatStaleWakePrompt,
+	launchNestedTask,
+	NestedTaskRegistry,
+	projectNestedResult,
+	restoreFiredStaleWakes,
+	shouldTriggerStaleWake,
+	type DstackKillResult,
+	type TaskDetails,
+	type TaskResult,
+} from "./task-registry.ts";
+import { activityLines, buildTreeSnapshot, latestActivity, parseTreeSnapshot, renderTreeLines } from "./background/tree.ts";
 import {
 	AgentInspector,
 	listSessionWorkflows,
@@ -94,8 +88,6 @@ import {
 	type AgentInspectorResult,
 	type AmbientStatus,
 } from "./background/inspector.ts";
-import { createWorktree, WorktreeError } from "./worktree.ts";
-import { workflowSystemPrompt } from "./workflow-context.ts";
 
 const WorkflowArtifactItem = Type.Object({
 	name: Type.String(),
@@ -137,6 +129,10 @@ const TaskParams = Type.Object({
 	workflow: Type.Optional(WorkflowParams),
 	tasks: Type.Optional(Type.Array(TaskItem)),
 	chain: Type.Optional(Type.Array(TaskItem)),
+});
+
+const KillParams = Type.Object({
+	taskId: Type.String({ description: "Task id returned by dstack_task to kill or cancel" }),
 });
 
 const ResultParams = Type.Object({
@@ -226,19 +222,7 @@ function taskUsageRows(details: unknown): TaskUsageRow[] {
 	return rows;
 }
 
-export type TaskResult = ChildResult & {
-	agent: string;
-	cwd: string;
-	task: string;
-	step?: number;
-	status?: SemanticStatus;
-	journal?: readonly JournalEntry[];
-};
-
-export type TaskDetails = {
-	mode: "single" | "parallel" | "chain";
-	results: TaskResult[];
-};
+export type { TaskDetails, TaskResult } from "./task-registry.ts";
 
 function isChildContentPart(value: unknown): value is ChildContentPart {
 	if (!isRecord(value) || typeof value.type !== "string") return false;
@@ -282,63 +266,6 @@ function parseTaskDetails(value: unknown): TaskDetails | undefined {
 	return { mode: value.mode as TaskDetails["mode"], results };
 }
 
-function cloneDetails(details: TaskDetails): TaskDetails {
-	return {
-		mode: details.mode,
-		results: details.results.map((result) => ({
-			...result,
-			task: ownerResultText(result.task),
-			messages: result.messages.map((message) => ({ ...message, content: [...message.content] })),
-			usage: { ...result.usage },
-			journal: result.journal ? [...result.journal] : undefined,
-			status: result.status ? { ...result.status } : undefined,
-		})),
-	};
-}
-
-const OWNER_RESULT_CAP = 8 * 1024;
-
-function ownerResultText(text: string): string {
-	if (Buffer.byteLength(text, "utf8") <= OWNER_RESULT_CAP) return text;
-	let summary = text.slice(0, OWNER_RESULT_CAP);
-	while (Buffer.byteLength(summary, "utf8") > OWNER_RESULT_CAP) summary = summary.slice(0, -1);
-	return `${summary}\n\n[worker summary truncated]`;
-}
-
-function ownerResultDetails(details: TaskDetails): TaskDetails {
-	return {
-		mode: details.mode,
-		results: details.results.map((result) => ({
-			...result,
-			text: ownerResultText(result.text),
-			stderr: ownerResultText(result.stderr),
-			messages: [],
-			usage: { ...result.usage },
-			journal: result.journal ? recentJournal(result.journal) : undefined,
-			status: result.status ? { ...result.status } : undefined,
-		})),
-	};
-}
-
-function emptyTaskResult(spec: TaskSpec, cwd: string, step?: number): TaskResult {
-	return {
-		agent: spec.agent,
-		cwd,
-		task: spec.task,
-		text: "",
-		exitCode: -1,
-		stderr: "",
-		messages: [],
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		step,
-	};
-}
-
-function progressText(details: TaskDetails): string {
-	const done = details.results.filter((result) => result.exitCode !== -1).length;
-	return `${details.mode}: ${done}/${details.results.length} done, ${details.results.length - done} running...`;
-}
-
 export { latestActivity };
 
 function branchEntries(ctx: ExtensionContext): SessionEntryLike[] {
@@ -354,26 +281,6 @@ function continuationControlState(ctx: ExtensionContext): { isIdle: boolean; has
 		isIdle: control.isIdle?.() ?? false,
 		hasPendingMessages: control.hasPendingMessages?.() ?? true,
 	};
-}
-
-async function writeTempPrompt(text: string): Promise<{ dir: string; filePath: string }> {
-	const dir = await mkdtemp(join(tmpdir(), "dstack-"));
-	const filePath = join(dir, "prompt.md");
-	await writeFile(filePath, text, { encoding: "utf8", mode: 0o600 });
-	return { dir, filePath };
-}
-
-async function removeTemp(dir: string, filePath: string): Promise<void> {
-	try {
-		await unlink(filePath);
-	} catch {
-		/* ignore */
-	}
-	try {
-		await rmdir(dir);
-	} catch {
-		/* ignore */
-	}
 }
 
 export default function dstack(pi: ExtensionAPI) {
@@ -392,6 +299,8 @@ export default function dstack(pi: ExtensionAPI) {
 	let treeArtifactDir: string | undefined;
 	let treeSchedulerRoot: string | undefined;
 	let lastContext: ExtensionContext | undefined;
+	const nestedTaskRegistry = new NestedTaskRegistry();
+	const firedStaleWakes = new Set<string>();
 
 	function stopTreeTimer() {
 		if (treeTimer !== undefined) {
@@ -480,6 +389,20 @@ export default function dstack(pi: ExtensionAPI) {
 			};
 			if (lastContext) {
 				updateTreeWidget(lastContext);
+				const control = continuationControlState(lastContext);
+				if (shouldTriggerStaleWake({ snapshot, firedTaskIds: firedStaleWakes, control })) {
+					firedStaleWakes.add(snapshot.taskId);
+					pi.appendEntry("dstack-stale-wake", { taskId: snapshot.taskId, timestamp: new Date().toISOString() });
+					pi.sendMessage(
+						{
+							customType: "dstack-stale-wake",
+							content: formatStaleWakePrompt(snapshot.taskId),
+							display: false,
+							details: { taskId: snapshot.taskId },
+						},
+						{ deliverAs: "followUp", triggerTurn: true },
+					);
+				}
 			}
 			if (snapshot.committed && activeWorkflowCount === 0) {
 				stopTreeTimer();
@@ -576,6 +499,9 @@ export default function dstack(pi: ExtensionAPI) {
 		treeLastWorkflowId = undefined;
 		treeArtifactDir = undefined;
 		treeSchedulerRoot = undefined;
+		firedStaleWakes.clear();
+		for (const id of restoreFiredStaleWakes(branchEntries(ctx))) firedStaleWakes.add(id);
+		nestedTaskRegistry.clear();
 		if (ctx.hasUI && typeof ctx.ui.setWidget === "function") {
 			ctx.ui.setWidget("dstack-tree", undefined);
 		}
@@ -600,6 +526,10 @@ export default function dstack(pi: ExtensionAPI) {
 	pi.on("session_tree", async (_event, ctx) => {
 		mode = restoreMode(branchEntries(ctx));
 		activeWorkflow = restoreActiveWorkflow(branchEntries(ctx));
+		sessionId = ctx.sessionManager.getSessionId();
+		firedStaleWakes.clear();
+		for (const id of restoreFiredStaleWakes(branchEntries(ctx))) firedStaleWakes.add(id);
+		nestedTaskRegistry.clear();
 		applyStatus(ctx);
 		if (activeWorkflow) {
 			const files = createTaskResultFiles(sessionId);
@@ -669,6 +599,7 @@ export default function dstack(pi: ExtensionAPI) {
 		pendingContinuation = undefined;
 		eventBusPort?.close();
 		eventBusPort = undefined;
+		nestedTaskRegistry.clear();
 		stopTreeTimer();
 		ambientStatus = undefined;
 		if (ctx?.hasUI && typeof ctx.ui.setWidget === "function") {
@@ -835,7 +766,7 @@ export default function dstack(pi: ExtensionAPI) {
 		name: "dstack_task",
 		label: "dstack task",
 		description:
-			"Launch child agents. For dmode, root sends one nontrivial request to a workflow owner; owners may launch as many bounded worker batches as needed. Pass workflow metadata so workers receive phase and artifact state without rereading dmode. Root calls return a task id immediately. Wait for completion, then call dstack_result once. Do not poll.",
+			"Launch child agents. For dmode, root sends one nontrivial request to a workflow owner; owners may launch as many bounded worker batches as needed. Pass workflow metadata so workers receive phase and artifact state without rereading dmode. Both root and nested calls return a task id immediately. Wait for completion notifications or a stale wake-up, then call dstack_result once. Do not poll.",
 		parameters: TaskParams,
 		renderCall(params, theme) {
 			const request = parseTaskRequest(params);
@@ -873,7 +804,7 @@ export default function dstack(pi: ExtensionAPI) {
 			if (!expanded) rows.push("(Ctrl+O for details)");
 			return new Text(rows.join("\n"), 0, 0);
 		},
-		async execute(_id, params, signal, onUpdate, ctx) {
+		async execute(_id, params, signal, _onUpdate, ctx) {
 			let parentDepth: ReturnType<typeof spawnableDepth>;
 			try {
 				parentDepth = spawnableDepth();
@@ -937,449 +868,43 @@ export default function dstack(pi: ExtensionAPI) {
 			if (childDepth === 2 && specs.some((spec) => spec.workflow?.assignment === "owner")) {
 				return textResult("dstack_task refused: depth-2 children cannot be task owners.", {}, true);
 			}
-			const details: TaskDetails = {
-				mode: request.kind,
-				results: specs.map((spec, index) =>
-					emptyTaskResult(spec, spec.cwd ?? ctx.cwd, request.kind === "chain" ? index + 1 : undefined),
-				),
-			};
-			const nestedGroupId = randomUUID();
-			const rootWorkflowId = process.env[ROOT_WORKFLOW_ENV];
-			const schedulerRoot = process.env[SCHEDULER_ROOT_ENV];
-			const childIndexEnv = process.env[DSTACK_CHILD_INDEX_ENV];
-			const artifactDirEnv = process.env[DSTACK_ARTIFACT_DIR_ENV];
-			const parentIndex = childIndexEnv !== undefined ? Number.parseInt(childIndexEnv, 10) : Number.NaN;
-			const canPersistSpawns = rootWorkflowId !== undefined && artifactDirEnv !== undefined && Number.isSafeInteger(parentIndex) && parentIndex >= 0;
-			const spawnsDir = canPersistSpawns ? join(artifactDirEnv, "children", String(parentIndex), "spawns") : undefined;
-			const spawnRecordPath = spawnsDir !== undefined ? join(spawnsDir, `${nestedGroupId}.json`) : undefined;
-			const initialCreatedAt = new Date().toISOString();
-			const spawnPhase = specs.map((s) => s.workflow?.phase).find((p): p is string => typeof p === "string" && p.length > 0);
-
-			const spawnChildren: SpawnChildV1[] = specs.map((spec, idx) => {
-				const resolved = resolveAgent(spec);
-				const modelRes = resolveModel({
-					explicit: spec.model,
-					role: spec.role,
-					roles: config.roles,
-					candidateIndex: request.kind === "parallel" ? idx : 0,
-					overrideReason: spec.overrideReason,
-				});
-				const launchModel = resolveNestedLaunchModel({
-					resolution: modelRes.ok ? modelRes.value : undefined,
-					env: process.env,
-				});
-				return {
-					nestedIndex: idx,
-					agent: resolved.agent,
-					role: spec.role,
-					assignment: spec.workflow?.assignment,
-					taskPreview: taskPreviewOf(spec.task),
-					taskFull: spec.task,
-					workflow: spec.workflow,
-					model: launchModel,
-					cwd: spec.cwd ?? ctx.cwd,
-					tools: resolved.tools ?? spec.tools,
-					state: "queued",
-					updatedAt: initialCreatedAt,
-				};
+			const launched = launchNestedTask({
+				request,
+				config,
+				agents,
+				ctxCwd: ctx.cwd,
+				skillPath: skillPath(),
+				extensionPath: extensionPath(),
+				childDepth,
+				registry: nestedTaskRegistry,
 			});
-
-			function createSpawnRecordWriter(options: {
-				spawnsDir: string;
-				filePath: string;
-				getRecord: () => SpawnRecordV1;
-				minIntervalMs?: number;
-			}) {
-				const minIntervalMs = options.minIntervalMs ?? 1000;
-				let lastWriteTime = 0;
-				let timer: NodeJS.Timeout | undefined;
-				let writeChain: Promise<void> = Promise.resolve();
-				let disposed = false;
-
-				const doWrite = async () => {
-					const record = options.getRecord();
-					try {
-						await mkdir(options.spawnsDir, { recursive: true, mode: 0o700 });
-						await atomicWriteFile(options.filePath, `${JSON.stringify(record, null, 2)}\n`);
-						lastWriteTime = Date.now();
-					} catch {}
-				};
-
-				const scheduleWrite = (): Promise<void> => {
-					if (disposed) return Promise.resolve();
-					if (timer !== undefined) {
-						clearTimeout(timer);
-						timer = undefined;
-					}
-					writeChain = writeChain.then(doWrite, doWrite);
-					return writeChain;
-				};
-
-				return {
-					writeThrottled() {
-						if (disposed) return;
-						const elapsed = Date.now() - lastWriteTime;
-						if (elapsed >= minIntervalMs && timer === undefined) {
-							void scheduleWrite();
-						} else if (timer === undefined) {
-							const delay = Math.max(0, minIntervalMs - elapsed);
-							timer = setTimeout(() => {
-								timer = undefined;
-								void scheduleWrite();
-							}, delay);
-							timer.unref?.();
-						}
-					},
-					async flush() {
-						if (disposed) return;
-						if (timer !== undefined) {
-							clearTimeout(timer);
-							timer = undefined;
-						}
-						await scheduleWrite();
-					},
-					dispose() {
-						disposed = true;
-						if (timer !== undefined) {
-							clearTimeout(timer);
-							timer = undefined;
-						}
-					},
-				};
-			}
-
-			const spawnRecordWriter = canPersistSpawns && spawnsDir !== undefined && spawnRecordPath !== undefined
-				? createSpawnRecordWriter({
-						spawnsDir,
-						filePath: spawnRecordPath,
-						getRecord: () => ({
-							schemaVersion: "dstack.spawn-record.v1",
-							workflowId: rootWorkflowId,
-							parentIndex,
-							groupId: nestedGroupId,
-							mode: request.kind,
-							phase: spawnPhase,
-							createdAt: initialCreatedAt,
-							children: spawnChildren.map((c) => ({ ...c })),
-						}),
-					})
-				: undefined;
-
-			await spawnRecordWriter?.flush();
-
-			const publish = () => {
-				const snapshot = cloneDetails(details);
-				onUpdate?.(textResult(progressText(snapshot), snapshot));
+			const receipt = {
+				taskId: launched.taskId,
+				mode: launched.mode,
+				taskCount: launched.taskCount,
 			};
-			publish();
-			const runOne = async (spec: TaskSpec, index: number): Promise<TaskResult> => {
-				let childTmpDir: string | undefined;
-				let recorder: ChildJournalRecorder | undefined;
-				try {
-					const resolved = resolveAgent(spec);
-					const agent = agents.find((candidate) => candidate.name === resolved.agent);
-					if (!agent) {
-						const available = agents.map((candidate) => candidate.name).join(", ") || "none";
-						throw new Error(`Unknown agent "${resolved.agent}". Available: ${available}.`);
-					}
-					const model = resolveModel({
-						explicit: spec.model,
-						role: spec.role,
-						roles: config.roles,
-						candidateIndex: request.kind === "parallel" ? index : 0,
-						overrideReason: spec.overrideReason,
-					});
-					if (!model.ok) throw new Error(formatConfigError(model.error));
-					const launchModel = resolveNestedLaunchModel({
-						resolution: model.value,
-						env: process.env,
-					});
-					let cwd = spec.cwd ?? ctx.cwd;
-					if (spec.worktree) {
-						cwd = await createWorktree({
-							repoRoot: ctx.cwd,
-							task: spec.task,
-							base: config.worktree.base,
-							from: config.worktree.from,
-						});
-					}
-					const existing = details.results[index];
-					if (existing !== undefined) {
-						details.results[index] = { ...existing, agent: resolved.agent, cwd, task: spec.task };
-					}
-					publish();
-					const promptParts = [agent.systemPrompt.trim()];
-					if (spec.workflow !== undefined) promptParts.push(workflowSystemPrompt(skillPath(), childDepth, spec.workflow));
-					else if (resolved.dmode) promptParts.push(dmodeReminder(skillPath(), childDepth));
-					let tmp: { dir: string; filePath: string } | undefined;
-					let lease: Awaited<ReturnType<typeof acquireChildSlot>> | undefined;
-					const system = promptParts.filter(Boolean).join("\n\n");
-					if (system) tmp = await writeTempPrompt(system);
-					try {
-						childTmpDir = await mkdtemp(join(tmpdir(), "dstack-child-"));
-						const statusPath = join(childTmpDir, "status.json");
-						const journalPath = join(childTmpDir, "journal.json");
-						recorder = new ChildJournalRecorder({ statusPath, journalPath });
-						recorder.recordSpawn({
-							agent: resolved.agent,
-							task: spec.task,
-							cwd,
-							model: model.value.model,
-							role: spec.role,
-							step: details.results[index]?.step,
-						});
-						await recorder.persist();
-						if (rootWorkflowId && schedulerRoot) {
-							lease = await acquireChildSlot({
-								schedulerRoot: toAbsolutePath(schedulerRoot),
-								workflowId: rootWorkflowId,
-								childId: `${nestedGroupId}-${index}`,
-								work: {
-									depth: childDepth,
-									tools: (resolved.tools ?? agent.tools?.join(","))?.split(","),
-								},
-								signal: signal ?? new AbortController().signal,
-							});
-						}
-						const startedAt = new Date().toISOString();
-						const runningChild = spawnChildren[index];
-						if (runningChild !== undefined) {
-							spawnChildren[index] = {
-								...runningChild,
-								state: "running",
-								taskFull: spec.task,
-								taskPreview: taskPreviewOf(spec.task),
-								cwd,
-								model: runningChild.model ?? launchModel,
-								startedAt,
-								updatedAt: startedAt,
-							};
-							await spawnRecordWriter?.flush();
-						}
-
-						const childTools = allowStatusTool(resolved.tools ?? agent.tools?.join(","));
-						const args = buildChildArgv({
-							task: spec.task,
-							extensionPath: extensionPath(),
-							model: model.value.model,
-							omitModel: model.value.omitModel,
-							tools: childTools,
-							systemPromptPath: tmp?.filePath,
-						});
-						const env = childEnv(childDepth, process.env, spec.workflow?.assignment);
-						env[STATUS_FILE_ENV] = statusPath;
-						let journalUpdates = Promise.resolve();
-						const child = await runChildProcess({
-							args,
-							cwd,
-							env,
-							signal,
-							onSpawn: (pid) => lease?.bindChild(pid),
-							onUpdate: (partial) => {
-								journalUpdates = journalUpdates.then(async () => {
-									recorder?.recordMessages(partial.messages);
-									if (partial.usage.turns > 0) {
-										recorder?.recordTurn({ turn: partial.usage.turns, text: partial.text, usage: partial.usage });
-									}
-									await recorder?.checkStatusFile();
-									await recorder?.persist();
-									const updatedStatus = recorder?.getLatestStatus();
-									const updatedJournal = recorder?.getEntries();
-									const partialWithStatus: TaskResult = {
-										...partial,
-										agent: resolved.agent,
-										cwd,
-										task: spec.task,
-										step: details.results[index]?.step,
-										journal: updatedJournal,
-										status: updatedStatus,
-									};
-									details.results[index] = partialWithStatus;
-									publish();
-									const now = new Date().toISOString();
-									const existing = spawnChildren[index];
-									if (existing !== undefined) {
-										spawnChildren[index] = {
-											...existing,
-											activity: latestActivity(partialWithStatus),
-											usage: partial.usage,
-											status: updatedStatus,
-											journal: updatedJournal,
-											updatedAt: now,
-										};
-										spawnRecordWriter?.writeThrottled();
-									}
-								}).catch(() => undefined);
-							},
-						});
-						await journalUpdates;
-						await recorder.checkStatusFile();
-						if (signal?.aborted) recorder.recordFailure({ error: "Child agent was aborted" });
-						else recorder.recordExit({ exitCode: child.exitCode, text: child.text });
-						await recorder.persist();
-						const completed: TaskResult = {
-							...child,
-							agent: resolved.agent,
-							cwd,
-							task: spec.task,
-							text: capOutput(child.text),
-							step: details.results[index]?.step,
-							journal: recorder.getEntries(),
-							status: recorder.getLatestStatus(),
-						};
-						details.results[index] = completed;
-						publish();
-						const now = new Date().toISOString();
-						const existing = spawnChildren[index];
-						if (existing !== undefined) {
-							spawnChildren[index] = {
-								...existing,
-								state: signal?.aborted ? "cancelled" : completed.exitCode === 0 ? "succeeded" : "failed",
-								exitCode: completed.exitCode,
-								finalResponse: completed.text,
-								errorMessage: completed.errorMessage,
-								stderr: completed.stderr,
-								stopReason: completed.stopReason,
-								usage: completed.usage,
-								model: completed.model ?? existing.model ?? launchModel,
-								activity: latestActivity(completed),
-								status: completed.status,
-								journal: completed.journal,
-								updatedAt: now,
-								endedAt: now,
-							};
-							await spawnRecordWriter?.flush();
-						}
-						return completed;
-					} finally {
-						await lease?.release();
-						if (tmp) await removeTemp(tmp.dir, tmp.filePath);
-						if (childTmpDir) await rm(childTmpDir, { recursive: true, force: true }).catch(() => undefined);
-					}
-				} catch (err) {
-					const now = new Date().toISOString();
-					const existing = spawnChildren[index];
-					if (existing !== undefined && existing.state !== "succeeded" && existing.state !== "failed" && existing.state !== "cancelled") {
-						spawnChildren[index] = {
-							...existing,
-							state: signal?.aborted ? "cancelled" : "failed",
-							errorMessage: err instanceof Error ? err.message : String(err),
-							updatedAt: now,
-							endedAt: now,
-						};
-						await spawnRecordWriter?.flush();
-					}
-					throw err;
-				}
-			};
-			try {
-				if (request.kind === "chain") {
-					const results: TaskResult[] = [];
-					let previous = "";
-					for (const [index, spec] of specs.entries()) {
-						const task = spec.task.replace(/\{previous\}/g, previous);
-						try {
-							const result = await runOne({ ...spec, task }, index);
-							results.push(result);
-							if (result.exitCode !== 0) {
-								const now = new Date().toISOString();
-								for (let i = index + 1; i < spawnChildren.length; i++) {
-									const remaining = spawnChildren[i];
-									if (remaining !== undefined && remaining.state === "queued") {
-										spawnChildren[i] = {
-											...remaining,
-											state: "skipped",
-											updatedAt: now,
-											endedAt: now,
-										};
-									}
-								}
-								await spawnRecordWriter?.flush();
-								return textResult(
-									`Chain stopped (${spec.agent}): ${ownerResultText(result.text)}`,
-									ownerResultDetails(details),
-									true,
-									sumChildUsage(details.results.map((child) => child.usage)),
-								);
-							}
-							previous = result.text;
-						} catch (err) {
-							const now = new Date().toISOString();
-							for (let i = index + 1; i < spawnChildren.length; i++) {
-								const remaining = spawnChildren[i];
-								if (remaining !== undefined && remaining.state === "queued") {
-									spawnChildren[i] = {
-										...remaining,
-										state: "skipped",
-										updatedAt: now,
-										endedAt: now,
-									};
-								}
-							}
-							await spawnRecordWriter?.flush();
-							throw err;
-						}
-					}
-					const last = results[results.length - 1];
-					return textResult(
-						ownerResultText(last?.text ?? "(no output)"),
-						ownerResultDetails(details),
-						false,
-						sumChildUsage(details.results.map((child) => child.usage)),
-					);
-				}
-				const results = await mapWithConcurrency(specs, MAX_CONCURRENCY, (spec, index) => runOne(spec, index));
-				if (request.kind === "single") {
-					const result = results[0];
-					if (!result) return textResult("(no output)");
-					return textResult(
-						ownerResultText(result.text),
-						ownerResultDetails(details),
-						result.exitCode !== 0,
-						sumChildUsage(details.results.map((child) => child.usage)),
-					);
-				}
-				const text = results
-					.map((task) => `### [${task.agent}] ${task.exitCode === 0 ? "completed" : "failed"}\n\n${ownerResultText(task.text)}`)
-					.join("\n\n---\n\n");
-				return textResult(
-					text,
-					ownerResultDetails(details),
-					false,
-					sumChildUsage(details.results.map((child) => child.usage)),
-				);
-			} catch (err) {
-				const now = new Date().toISOString();
-				const failureMessage = err instanceof Error ? err.message : String(err);
-				for (let i = 0; i < spawnChildren.length; i++) {
-					const c = spawnChildren[i];
-					if (c !== undefined && (c.state === "queued" || c.state === "running")) {
-						spawnChildren[i] = {
-							...c,
-							state: signal?.aborted ? "cancelled" : "failed",
-							updatedAt: now,
-							endedAt: now,
-							errorMessage: failureMessage,
-						};
-					}
-				}
-				await spawnRecordWriter?.flush();
-				if (err instanceof WorktreeError) {
-					return textResult(err.message, {}, true);
-				}
-				return textResult(failureMessage, {}, true);
-			} finally {
-				spawnRecordWriter?.dispose();
-			}
+			return textResult(JSON.stringify(receipt), receipt);
 		},
 	});
 
 	pi.registerTool({
 		name: "dstack_result",
 		label: "dstack result",
-		description: "Read a bounded summary for a background dstack task. Use detail=full only when the complete child transcript is necessary.",
+		description:
+			"Read a bounded summary for a background dstack task. Use detail=full only when the complete child transcript is necessary. Call after receiving a completion notification or a stale wake-up.",
 		parameters: ResultParams,
 		async execute(_id, params, signal, _onUpdate, ctx) {
+			if (nestedTaskRegistry.has(params.taskId)) {
+				const record = nestedTaskRegistry.get(params.taskId)!;
+				const result = projectNestedResult(record, params.detail);
+				const usage = record.status !== "running" && record.details !== undefined && !record.usageClaimed
+					? sumChildUsage(record.details.results.map((child) => child.usage))
+					: undefined;
+				if (usage !== undefined) record.usageClaimed = true;
+				nestedTaskRegistry.prune();
+				return textResult(JSON.stringify(result), result, false, usage);
+			}
+
 			const files = createTaskResultFiles(sessionId);
 			const result = await readDstackResult({
 				taskId: params.taskId,
@@ -1412,6 +937,113 @@ export default function dstack(pi: ExtensionAPI) {
 				}
 			}
 			return textResult(JSON.stringify(result), result, false, usage);
+		},
+	});
+
+	pi.registerTool({
+		name: "dstack_kill",
+		label: "dstack kill",
+		description:
+			"Cancel or abort a running dstack task by task id. Idempotent for already-terminal tasks.",
+		parameters: KillParams,
+		async execute(_id, params, signal, _onUpdate, ctx) {
+			if (nestedTaskRegistry.has(params.taskId)) {
+				const record = nestedTaskRegistry.get(params.taskId)!;
+				if (record.status !== "running") {
+					const killRes: DstackKillResult = {
+						taskId: params.taskId,
+						status: "already_terminal",
+						message: "Task is already terminal.",
+					};
+					return textResult(JSON.stringify(killRes), killRes);
+				}
+				nestedTaskRegistry.cancel(params.taskId);
+				await record.completionPromise;
+				const killRes: DstackKillResult = {
+					taskId: params.taskId,
+					status: "killed",
+					message: "Task cancelled successfully.",
+				};
+				return textResult(JSON.stringify(killRes), killRes);
+			}
+
+			let parentDepth: ReturnType<typeof spawnableDepth>;
+			try {
+				parentDepth = spawnableDepth();
+			} catch {
+				parentDepth = 0;
+			}
+
+			if (parentDepth === 0) {
+				const port = getEventBusPort();
+				let task: CompanionTaskState | undefined;
+				try {
+					task = await port.statusExact(params.taskId, signal);
+				} catch (err) {
+					const killRes: DstackKillResult = {
+						taskId: params.taskId,
+						status: "kill_failed",
+						message: err instanceof Error ? err.message : String(err),
+					};
+					return textResult(JSON.stringify(killRes), killRes, true);
+				}
+
+				if (task === undefined) {
+					const killRes: DstackKillResult = {
+						taskId: params.taskId,
+						status: "unknown_task",
+						message: `No task exists with id ${params.taskId}.`,
+					};
+					return textResult(JSON.stringify(killRes), killRes);
+				}
+
+				if (task.status === "completed" || task.status === "failed" || task.status === "killed") {
+					const killRes: DstackKillResult = {
+						taskId: params.taskId,
+						status: "already_terminal",
+						message: "Task is already terminal.",
+					};
+					return textResult(JSON.stringify(killRes), killRes);
+				}
+
+				try {
+					await port.kill(params.taskId, signal);
+					const killRes: DstackKillResult = {
+						taskId: params.taskId,
+						status: "killed",
+						message: "Task cancelled successfully.",
+					};
+					if (activeWorkflow?.taskId === params.taskId) {
+						if (ctx) lastContext = ctx;
+						ambientStatus = undefined;
+						if (lastContext?.hasUI) {
+							lastContext.ui.setWidget("dstack-tree", undefined);
+						}
+						persistActiveWorkflow(undefined);
+						stopTreeTimer();
+					}
+					return textResult(JSON.stringify(killRes), killRes);
+				} catch (err) {
+					let latest: CompanionTaskState | undefined;
+					try {
+						latest = await port.statusExact(params.taskId, signal);
+					} catch {}
+					const terminal = latest?.status === "completed" || latest?.status === "failed" || latest?.status === "killed";
+					const killRes: DstackKillResult = {
+						taskId: params.taskId,
+						status: terminal ? "already_terminal" : "kill_failed",
+						message: terminal ? "Task is already terminal." : err instanceof Error ? err.message : String(err),
+					};
+					return textResult(JSON.stringify(killRes), killRes, !terminal);
+				}
+			}
+
+			const killRes: DstackKillResult = {
+				taskId: params.taskId,
+				status: "unknown_task",
+				message: `No task exists with id ${params.taskId}.`,
+			};
+			return textResult(JSON.stringify(killRes), killRes);
 		},
 	});
 
