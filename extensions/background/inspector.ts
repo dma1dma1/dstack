@@ -177,6 +177,11 @@ export async function boundedTailRead(
 	}
 }
 
+export type WorkflowManifestState =
+	| Readonly<{ kind: "pending" }>
+	| Readonly<{ kind: "corrupt" }>
+	| Readonly<{ kind: "ok"; createdAt: string; playbook?: string }>;
+
 export type WorkflowSummary = Readonly<{
 	workflowId: string;
 	taskId: string;
@@ -185,7 +190,7 @@ export type WorkflowSummary = Readonly<{
 	committed: boolean;
 	createdAt: string;
 	playbook?: string;
-	unreadable?: boolean;
+	manifest: WorkflowManifestState;
 }>;
 
 type BindingFile = Readonly<{ taskId: string; workflowId: string }>;
@@ -235,18 +240,27 @@ export async function listSessionWorkflows(sessionId: string): Promise<WorkflowS
 
 			let createdAt = "";
 			let playbook: string | undefined;
-			let unreadable = false;
+			let manifest: WorkflowManifestState;
 			try {
 				const manifestBytes = await readFile(join(artifactDir, "manifest.json"), "utf8");
-				const parsed = parseManifestForTree(JSON.parse(manifestBytes));
-				if (parsed !== undefined) {
-					createdAt = parsed.createdAt;
-					playbook = parsed.specs[0]?.playbook;
-				} else {
-					unreadable = true;
+				try {
+					const parsed = parseManifestForTree(JSON.parse(manifestBytes));
+					if (parsed !== undefined) {
+						createdAt = parsed.createdAt;
+						playbook = parsed.specs[0]?.playbook;
+						manifest = { kind: "ok", createdAt, playbook };
+					} else {
+						manifest = { kind: "corrupt" };
+					}
+				} catch {
+					manifest = { kind: "corrupt" };
 				}
-			} catch {
-				unreadable = true;
+			} catch (error) {
+				if (hasErrorCode(error, "ENOENT")) {
+					manifest = { kind: "pending" };
+				} else {
+					manifest = { kind: "corrupt" };
+				}
 			}
 
 			if (createdAt === "") {
@@ -267,7 +281,7 @@ export async function listSessionWorkflows(sessionId: string): Promise<WorkflowS
 				committed,
 				createdAt,
 				playbook,
-				unreadable,
+				manifest,
 			});
 		}
 	} catch (error) {
@@ -986,7 +1000,8 @@ export class AgentInspector implements Component {
 			await this.refreshSnapshots();
 			if (this.disposed) return;
 
-			const hasRunning = Array.from(this.snapshots.values()).some((s) => !s.committed || s.counts.running > 0);
+			const hasRunning = Array.from(this.snapshots.values()).some((s) => !s.committed || s.counts.running > 0)
+				|| this.workflows.some((w) => !w.committed && w.manifest.kind === "pending");
 			if (!hasRunning && this.workflows.length > 0) {
 				this.showHistory = true;
 			}
@@ -1025,7 +1040,7 @@ export class AgentInspector implements Component {
 		const todoPath = this.options.todoPath ?? todoFilePath(this.options.sessionId);
 		for (const wf of this.workflows) {
 			if (this.disposed) return;
-			if (wf.unreadable) continue;
+			if (wf.manifest.kind === "corrupt") continue;
 			try {
 				const snapshot = await this.getSnapshotFn({
 					taskId: wf.taskId,
@@ -1516,11 +1531,15 @@ export class AgentInspector implements Component {
 		let sharedSlots: number | undefined;
 		for (const wf of this.workflows) {
 			const s = this.snapshots.get(wf.workflowId);
-			if (s !== undefined && (!s.committed || s.counts.running > 0)) {
-				activeWorkflowCount++;
-				if (sharedSlots === undefined && typeof s.slots?.active === "number") {
-					sharedSlots = s.slots.active;
+			if (s !== undefined) {
+				if (!s.committed || s.counts.running > 0) {
+					activeWorkflowCount++;
+					if (sharedSlots === undefined && typeof s.slots?.active === "number") {
+						sharedSlots = s.slots.active;
+					}
 				}
+			} else if (!wf.committed) {
+				activeWorkflowCount++;
 			}
 		}
 
@@ -1537,14 +1556,25 @@ export class AgentInspector implements Component {
 		const filteredWorkflows = this.workflows.filter((wf) => {
 			if (this.showHistory) return true;
 			const s = this.snapshots.get(wf.workflowId);
-			if (s === undefined) return !wf.committed;
+			if (s === undefined) {
+				return !wf.committed;
+			}
 			return !s.committed || s.counts.running > 0;
 		});
 
 		const rows: Array<{ item: NavigableItem; text: string }> = [];
 		for (const wf of filteredWorkflows) {
 			const snapshot = this.snapshots.get(wf.workflowId);
-			if (wf.unreadable || snapshot === undefined) {
+			if (wf.manifest.kind === "pending" && snapshot === undefined) {
+				const title = `  dstack · launching (${wf.workflowId.slice(0, 8)})`;
+				rows.push({
+					item: { type: "workflow", workflowId: wf.workflowId },
+					text: this.theme.fg("accent", title),
+				});
+				continue;
+			}
+
+			if (wf.manifest.kind === "corrupt" || snapshot === undefined) {
 				const title = `  dstack · (unreadable workflow ${wf.workflowId.slice(0, 8)})`;
 				rows.push({
 					item: { type: "workflow", workflowId: wf.workflowId },
