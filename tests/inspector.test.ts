@@ -2056,7 +2056,7 @@ test("AgentInspector calculates Final view row budget with fully populated envel
 	inspector.dispose();
 });
 
-test("formatJournalEntry and formatRecentActivity format discriminated variants and drop spawn noise", () => {
+test("formatRecentActivity shows all human-readable semantic history without internal tool noise", () => {
 	const spawn: JournalEntry = { seq: 1, timestamp: "2025-01-01T00:00:01.000Z", kind: "spawn", agent: "poteto-agent", task: "orchestrate feature", cwd: "/tmp" };
 	const tool: JournalEntry = { seq: 2, timestamp: "2025-01-01T00:00:05.000Z", kind: "tool", name: "read", gist: "src/tree.ts" };
 	const turn: JournalEntry = { seq: 3, timestamp: "2025-01-01T00:00:10.000Z", kind: "turn", turn: 1, summary: "Read tree sources and planned edit" };
@@ -2071,30 +2071,39 @@ test("formatJournalEntry and formatRecentActivity format discriminated variants 
 	assert.equal(formatJournalEntry(exit), "completed");
 	assert.equal(formatJournalEntry(fail), "failed: process timed out");
 
-	const recentWithSpawn = formatRecentActivity([spawn, tool, turn]);
-	assert.deepEqual(recentWithSpawn, [
-		"→ read src/tree.ts",
-		"turn 1: Read tree sources and planned edit",
+	const screenshotRepro: JournalEntry[] = [
+		spawn,
+		{ seq: 2, timestamp: "2025-01-01T00:00:02.000Z", kind: "turn", turn: 4, summary: "" },
+		{ seq: 3, timestamp: "2025-01-01T00:00:03.000Z", kind: "tool", name: "bash", gist: "cd /Users/dma/.dma/worktrees/dstack/example && git diff" },
+		{ seq: 4, timestamp: "2025-01-01T00:00:04.000Z", kind: "tool", name: "read", gist: "/Users/dma/.dma/worktrees/dstack/example/extensions/background/journal.ts" },
+		{ seq: 5, timestamp: "2025-01-01T00:00:05.000Z", kind: "turn", turn: 5, summary: "" },
+		{ seq: 6, timestamp: "2025-01-01T00:00:06.000Z", kind: "turn", turn: 6, summary: "Reviewed the activity history" },
+		{ seq: 7, timestamp: "2025-01-01T00:00:07.000Z", kind: "phase", phase: "verify", note: "checking the inspector output" },
+	];
+	assert.deepEqual(formatRecentActivity(screenshotRepro), [
+		"Reviewed the activity history",
+		"verify: checking the inspector output",
 	]);
 
-	assert.deepEqual(formatRecentActivity([spawn]), ["spawned (poteto-agent)"]);
+	assert.deepEqual(formatRecentActivity([spawn]), []);
 	assert.deepEqual(formatRecentActivity([]), []);
 	assert.deepEqual(formatRecentActivity(undefined), []);
-	assert.deepEqual(formatRecentActivity([spawn, tool], 0), []);
-	assert.deepEqual(formatRecentActivity([spawn, tool], -1), []);
-	assert.deepEqual(formatRecentActivity([spawn, tool], Number.NaN), []);
 
-	const manyEntries: JournalEntry[] = [
-		spawn,
-		{ seq: 2, timestamp: "2025-01-01T00:00:02.000Z", kind: "tool", name: "read", gist: "1.ts" },
-		{ seq: 3, timestamp: "2025-01-01T00:00:03.000Z", kind: "tool", name: "read", gist: "2.ts" },
-		{ seq: 4, timestamp: "2025-01-01T00:00:04.000Z", kind: "tool", name: "read", gist: "3.ts" },
-		{ seq: 5, timestamp: "2025-01-01T00:00:05.000Z", kind: "tool", name: "read", gist: "4.ts" },
-		{ seq: 6, timestamp: "2025-01-01T00:00:06.000Z", kind: "tool", name: "read", gist: "5.ts" },
-	];
-	const capped = formatRecentActivity(manyEntries, 3);
-	assert.equal(capped.length, 3);
-	assert.deepEqual(capped, ["→ read 3.ts", "→ read 4.ts", "→ read 5.ts"]);
+	const allRelevant: JournalEntry[] = Array.from({ length: 6 }, (_, index) => ({
+		seq: index + 1,
+		timestamp: `2025-01-01T00:00:0${index + 1}.000Z`,
+		kind: "turn",
+		turn: index + 1,
+		summary: `Completed step ${index + 1}`,
+	}));
+	assert.deepEqual(formatRecentActivity(allRelevant), [
+		"Completed step 1",
+		"Completed step 2",
+		"Completed step 3",
+		"Completed step 4",
+		"Completed step 5",
+		"Completed step 6",
+	]);
 });
 
 test("AgentInspector displays Recent Activity and Semantic Status for running depth-1 and depth-2 agents", async () => {
@@ -2187,16 +2196,18 @@ test("AgentInspector displays Recent Activity and Semantic Status for running de
 	assert.ok(topDetailLines.some((l) => l.includes("Activity:") && l.includes("integrate: running integration tests")));
 	assert.ok(topDetailLines.some((l) => l.includes("⚠ Stale")));
 	assert.ok(topDetailLines.some((l) => l.includes("Recent Activity:")));
-	assert.ok(topDetailLines.some((l) => l.includes("→ read src/tree.ts")));
-	assert.ok(topDetailLines.some((l) => l.includes("turn 2: reviewed tree renderer changes")));
+	assert.ok(topDetailLines.some((l) => l.includes("reviewed tree renderer changes")));
+	assert.ok(!topDetailLines.some((l) => l.includes("→ read src/tree.ts")));
+	assert.ok(!topDetailLines.some((l) => l.includes("turn 2: reviewed tree renderer changes")));
 	assert.ok(topDetailLines.some((l) => l.includes("integrate: running integration tests")));
 
 	inspector.handleInput("\r");
 	const nestedDetailLines = inspector.render(100);
 	assert.ok(nestedDetailLines.some((l) => l.includes("nested agent: general-purpose (depth 2)")));
 	assert.ok(nestedDetailLines.some((l) => l.includes("Recent Activity:")));
-	assert.ok(nestedDetailLines.some((l) => l.includes("→ bash npm test")));
-	assert.ok(nestedDetailLines.some((l) => l.includes("turn 1: all 188 tests passed")));
+	assert.ok(nestedDetailLines.some((l) => l.includes("all 188 tests passed")));
+	assert.ok(!nestedDetailLines.some((l) => l.includes("→ bash npm test")));
+	assert.ok(!nestedDetailLines.some((l) => l.includes("turn 1: all 188 tests passed")));
 
 	inspector.dispose();
 });
