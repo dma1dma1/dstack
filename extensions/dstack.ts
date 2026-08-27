@@ -83,7 +83,7 @@ import {
 	type JournalEntry,
 	type SemanticStatus,
 } from "./background/journal.ts";
-import { readDstackResult, type DstackResultView } from "./background/result.ts";
+import { readDstackResult, type CommittedResult, type DstackResultView } from "./background/result.ts";
 import { acquireChildSlot } from "./background/scheduler.ts";
 import { DSTACK_ARTIFACT_DIR_ENV, DSTACK_CHILD_INDEX_ENV, ROOT_WORKFLOW_ENV, SCHEDULER_ROOT_ENV } from "./background/workflow.ts";
 import { activityLines, buildTreeSnapshot, latestActivity, parseTreeSnapshot, renderTreeLines, taskPreviewOf, type SpawnChildV1, type SpawnRecordV1, type TreeSnapshot } from "./background/tree.ts";
@@ -189,9 +189,9 @@ function textResult(text: string, details: unknown = {}, isError = false, usage?
 	return { content: [{ type: "text" as const, text }], details, isError, ...(usage ? { usage } : {}) };
 }
 
-function resultUsage(result: DstackResultView): Usage | undefined {
-	if (result.kind === "complete") return sumChildUsage(result.package.results.map((child) => child.usage));
-	if (result.kind === "artifact") return result.usage;
+function committedUsage(committed: CommittedResult): Usage | undefined {
+	if (committed.kind === "complete") return sumChildUsage(committed.package.results.map((child) => child.usage));
+	if (committed.kind === "artifact") return committed.usage;
 	return undefined;
 }
 
@@ -1403,10 +1403,13 @@ export default function dstack(pi: ExtensionAPI) {
 				stopTreeTimer();
 			}
 			let usage: Usage | undefined;
-			const unreportedUsage = resultUsage(result);
-			if (unreportedUsage !== undefined) {
+			if (result.kind === "complete" || result.kind === "artifact") {
 				const binding = await files.readBinding(params.taskId);
-				if (binding !== undefined && await files.claimUsage(binding)) usage = unreportedUsage;
+				if (binding !== undefined) {
+					const committed = await files.readCommittedResult(binding);
+					const unreportedUsage = committed !== undefined ? committedUsage(committed) : undefined;
+					if (unreportedUsage !== undefined && await files.claimUsage(binding)) usage = unreportedUsage;
+				}
 			}
 			return textResult(JSON.stringify(result), result, false, usage);
 		},
