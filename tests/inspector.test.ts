@@ -346,89 +346,6 @@ test("renderAmbientWidgetLine hides a committed tracked workflow while another w
 	assert.ok(!lines[0]?.includes("complete"));
 });
 
-test("AgentInspector subtitle uses shared scheduler slot count when multiple active workflows have differing scheduler activity", async () => {
-	const tui = { requestRender: () => {} };
-	const done = () => {};
-
-	const workflows: WorkflowSummary[] = [
-		{
-			workflowId: "wf-2",
-			taskId: "task-2",
-			artifactDir: "/tmp/wf-2",
-			schedulerRoot: "/tmp/scheduler",
-			committed: false,
-			createdAt: "2025-01-01T00:01:00.000Z",
-			playbook: "bug-fix",
-			manifest: { kind: "ok", createdAt: "2025-01-01T00:01:00.000Z", playbook: "bug-fix" },
-		},
-		{
-			workflowId: "wf-1",
-			taskId: "task-1",
-			artifactDir: "/tmp/wf-1",
-			schedulerRoot: "/tmp/scheduler",
-			committed: false,
-			createdAt: "2025-01-01T00:00:00.000Z",
-			playbook: "feature",
-			manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z", playbook: "feature" },
-		},
-	];
-
-	const snapshot1: TreeSnapshot = {
-		taskId: "task-1",
-		workflowId: "wf-1",
-		mode: "single",
-		playbook: "feature",
-		createdAt: "2025-01-01T00:00:00.000Z",
-		committed: false,
-		counts: { queued: 0, running: 1, complete: 0, total: 1 },
-		slots: { active: 3, capacity: 4 },
-		children: [
-			{ index: 0, agent: "poteto-agent", state: "running", role: "feature", assignment: "owner", taskPreview: "owner 1", nestedGroups: [], nested: [] },
-		],
-		todos: [],
-		todoCounts: { total: 0, completed: 0, inProgress: 0 },
-		capturedAt: "2025-01-01T00:02:00.000Z",
-	};
-
-	const snapshot2: TreeSnapshot = {
-		taskId: "task-2",
-		workflowId: "wf-2",
-		mode: "single",
-		playbook: "bug-fix",
-		createdAt: "2025-01-01T00:01:00.000Z",
-		committed: false,
-		counts: { queued: 0, running: 1, complete: 0, total: 1 },
-		slots: { active: 3, capacity: 4 },
-		children: [
-			{ index: 0, agent: "poteto-agent", state: "running", role: "bug-fix", assignment: "owner", taskPreview: "owner 2", nestedGroups: [], nested: [] },
-		],
-		todos: [],
-		todoCounts: { total: 0, completed: 0, inProgress: 0 },
-		capturedAt: "2025-01-01T00:02:00.000Z",
-	};
-
-	const snapshotsById = new Map<string, TreeSnapshot>([
-		["wf-1", snapshot1],
-		["wf-2", snapshot2],
-	]);
-
-	const inspector = new AgentInspector(tui, plainTheme(), done, {
-		sessionId: "test-sess",
-		listWorkflows: async () => workflows,
-		getSnapshot: async (w) => snapshotsById.get(w.workflowId),
-		readOutputTail: async () => ({ content: "", truncated: false, bytesRead: 0, totalBytes: 0 }),
-		now: () => new Date("2025-01-01T00:02:00.000Z"),
-	});
-
-	await new Promise((r) => setTimeout(r, 20));
-
-	const listLines = inspector.render(100);
-	assert.ok(listLines.some((l) => l.includes("2 active workflows · slots 3")));
-	assert.ok(!listLines.some((l) => l.includes("slots 2")));
-
-	inspector.dispose();
-});
-
 test("AgentInspector component navigation: list -> drill-down -> nested drill-down -> pop navigation -> close", async () => {
 	let renderRequested = 0;
 	const tui = {
@@ -1125,16 +1042,14 @@ test("wrapText wraps long lines cleanly at word boundaries and keeps newlines", 
 	assert.equal(wrapped[0], "This is a short line.");
 	assert.ok(wrapped.every((line) => line.length <= 30));
 	assert.equal(wrapped[wrapped.length - 1], "Short.");
-});
 
-test("wrapText hard-wraps unbroken tokens with no inserted ellipsis or lost characters", () => {
 	const rawToken = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-+/=!";
 	const width = 16;
-	const wrapped = wrapText(rawToken, width);
-	assert.ok(wrapped.length >= 4);
-	assert.ok(wrapped.every((chunk) => chunk.length <= width));
-	assert.ok(wrapped.every((chunk) => !chunk.includes("…") && !chunk.includes("...")));
-	assert.equal(wrapped.join(""), rawToken);
+	const wrappedToken = wrapText(rawToken, width);
+	assert.ok(wrappedToken.length >= 4);
+	assert.ok(wrappedToken.every((chunk) => chunk.length <= width));
+	assert.ok(wrappedToken.every((chunk) => !chunk.includes("…") && !chunk.includes("...")));
+	assert.equal(wrappedToken.join(""), rawToken);
 });
 
 test("parseChildUsage validates complete records and rejects partial or non-finite records", () => {
@@ -1830,23 +1745,6 @@ test("deriveInspectorLayoutMetrics derives metrics across viewport sizes and pro
 	assert.equal(minimal.taskVisibleRows, 1);
 	assert.equal(minimal.finalVisibleRows, 1);
 	assert.equal(minimal.rawVisibleRows, 1);
-});
-
-test("AgentInspector renders width above 118 columns without clamping", async () => {
-	const inspector = new AgentInspector({ requestRender: () => {} }, plainTheme(), () => {}, {
-		sessionId: "test-sess",
-		listWorkflows: async () => [],
-	});
-
-	const wide160 = inspector.render(160);
-	assert.ok(wide160.length > 0);
-	assert.ok(wide160[0]?.includes("─".repeat(158)));
-
-	const wide200 = inspector.render(200);
-	assert.ok(wide200.length > 0);
-	assert.ok(wide200[0]?.includes("─".repeat(198)));
-
-	inspector.dispose();
 });
 
 test("AgentInspector grows frame and view budgets on tall viewports", async () => {

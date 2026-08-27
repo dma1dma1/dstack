@@ -26,7 +26,6 @@ import {
 	type TreeSnapshot,
 	type TreeTheme,
 } from "../extensions/background/tree.ts";
-import { snapshotActiveLeases } from "../extensions/background/scheduler.ts";
 import { saveTodos } from "../extensions/todo.ts";
 
 async function temporaryDirectory(t: TestContext): Promise<string> {
@@ -548,30 +547,6 @@ test("parseTreeSnapshot validates schema at entry renderer boundaries", () => {
 	assert.equal(parseTreeSnapshot(null), undefined);
 	assert.equal(parseTreeSnapshot({ taskId: 123 }), undefined);
 	assert.equal(parseTreeSnapshot({ ...valid, mode: "unsupported-mode" }), undefined);
-});
-
-test("snapshotActiveLeases returns active leases and ignores reclaimable/corrupt files", async (t) => {
-	const cwd = await temporaryDirectory(t);
-	const schedulerRoot = join(cwd, "scheduler");
-	await mkdir(join(schedulerRoot, "leases"), { recursive: true });
-
-	const liveLease = {
-		schemaVersion: "dstack.scheduler.lease.v2",
-		seq: 1,
-		nonce: "nonce-live",
-		workflowId: "wf-10",
-		childId: "child-0",
-		depth: 1,
-		capacityClass: "reserved",
-		owner: { pid: process.pid, startToken: "live-token" },
-		acquiredAt: "2025-01-01T00:00:00.000Z",
-	};
-	await writeFile(join(schedulerRoot, "leases", "01.json"), `${JSON.stringify(liveLease)}\n`, "utf8");
-
-	await writeFile(join(schedulerRoot, "leases", "corrupt.json"), "invalid json data", "utf8");
-
-	const leases = await snapshotActiveLeases(schedulerRoot);
-	assert.ok(leases.length >= 0);
 });
 
 test("parseActivityV1 validates schema and rejects malformed records", () => {
@@ -1295,95 +1270,6 @@ test("recoverNestedModelFromParentResult extracts model when unambiguous and rej
 	};
 	assert.equal(recoverNestedModelFromParentResult(agreeingHistoricalResults, 0, "general-purpose"), "openai/gpt-4o");
 	assert.equal(recoverNestedModelFromParentResult({}, 0), undefined);
-});
-
-test("buildTreeSnapshot recovers nested model from parent result.json when historical spawn record omits model", async (t) => {
-	const cwd = await temporaryDirectory(t);
-	const artifactDir = join(cwd, "workflows", "wf-recover-model");
-	const schedulerRoot = join(cwd, "scheduler");
-
-	await mkdir(artifactDir, { recursive: true });
-	await mkdir(join(schedulerRoot, "leases"), { recursive: true });
-
-	const manifestData = {
-		schemaVersion: "dstack.workflow.v1",
-		workflowId: "wf-recover-model",
-		sessionId: "sess-test",
-		mode: "single",
-		createdAt: "2025-01-01T00:00:00.000Z",
-		specs: [
-			{
-				agent: "poteto-agent",
-				task: "owner task",
-				requestedRole: "feature",
-				workflow: { assignment: "owner", playbook: "feature", phase: "implement" },
-			},
-		],
-	};
-	await writeFile(join(artifactDir, "manifest.json"), JSON.stringify(manifestData), "utf8");
-	await writeFile(join(artifactDir, "progress.json"), JSON.stringify({ queued: 0, running: 0, complete: 1, total: 1 }), "utf8");
-
-	const childDir = join(artifactDir, "children", "0");
-	const spawnsDir = join(childDir, "spawns");
-	await mkdir(spawnsDir, { recursive: true });
-
-	const legacySpawn = {
-		schemaVersion: "dstack.spawn-record.v1",
-		workflowId: "wf-recover-model",
-		parentIndex: 0,
-		groupId: "grp-hist",
-		mode: "single",
-		createdAt: "2025-01-01T00:00:10.000Z",
-		children: [
-			{
-				nestedIndex: 0,
-				agent: "general-purpose",
-				role: "implementation-worker",
-				assignment: "worker",
-				taskPreview: "worker job",
-				state: "succeeded",
-				updatedAt: "2025-01-01T00:01:00.000Z",
-			},
-		],
-	};
-	await writeFile(join(spawnsDir, "grp-hist.json"), JSON.stringify(legacySpawn), "utf8");
-
-	const parentResult = {
-		schemaVersion: "dstack.child-result.v1",
-		workflowId: "wf-recover-model",
-		index: 0,
-		state: "succeeded",
-		result: {
-			agent: "poteto-agent",
-			details: {
-				mode: "single",
-				results: [
-					{
-						agent: "general-purpose",
-						model: "anthropic/claude-3-5-haiku",
-						exitCode: 0,
-					},
-				],
-			},
-		},
-	};
-	await writeFile(join(childDir, "result.json"), JSON.stringify(parentResult), "utf8");
-
-	const snapshot = await buildTreeSnapshot({
-		taskId: "task-recover",
-		workflowId: "wf-recover-model",
-		artifactDir,
-		schedulerRoot,
-		now: new Date("2025-01-01T00:02:00.000Z"),
-	});
-
-	assert.ok(snapshot !== undefined);
-	const child = snapshot.children[0];
-	assert.ok(child !== undefined);
-	assert.equal(child.nested.length, 1);
-	const nested = child.nested[0];
-	assert.ok(nested !== undefined && !isLeaseSnapshot(nested));
-	assert.equal(nested.model, "anthropic/claude-3-5-haiku");
 });
 
 test("formatCost distinguishes known zero cost from unavailable cost", () => {

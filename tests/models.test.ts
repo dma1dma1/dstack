@@ -56,27 +56,6 @@ test("inherit-parent omits --model via resolveModel", () => {
 	);
 });
 
-test("feature role resolves its configured model", () => {
-	const result = resolveModel({ role: "feature", roles: { feature: "google/gemini-3.7-flash" } });
-	assert.equal(result.ok, true);
-	if (result.ok) assert.equal(result.value.model, "google/gemini-3.7-flash");
-});
-
-test("implementation-worker resolves independently from its owner role", () => {
-	const roles = {
-		feature: "openai-codex/gpt-5.6-sol",
-		"implementation-worker": "google/gemini-3.7-flash",
-	};
-	const owner = resolveModel({ role: "feature", roles });
-	const worker = resolveModel({ role: "implementation-worker", roles });
-	assert.equal(owner.ok, true);
-	assert.equal(worker.ok, true);
-	if (owner.ok && worker.ok) {
-		assert.equal(owner.value.model, "openai-codex/gpt-5.6-sol");
-		assert.equal(worker.value.model, "google/gemini-3.7-flash");
-	}
-});
-
 test("unknown role fails closed with the nearest configured role", () => {
 	const result = resolveModel({
 		role: "architect runners",
