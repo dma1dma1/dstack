@@ -8,7 +8,7 @@ export type ChildStateView = Readonly<{
 	index: number;
 	state: "queued" | "running" | "succeeded" | "failed" | "cancelled" | "skipped";
 	agent: string;
-	task: string;
+	task?: string;
 	cwd?: string;
 	model?: string;
 	latestStatus?: SemanticStatus;
@@ -125,19 +125,7 @@ export async function readDstackResult(input: ResultReader): Promise<DstackResul
 		case "running":
 			try {
 				const progress = await input.readProgress(binding);
-				const hasChildren = progress.children !== undefined && progress.children.length > 0;
-				const latestStatus = hasChildren
-					? progress.children
-						.flatMap((child) => child.latestStatus ?? [])
-						.sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))[0]
-					: undefined;
-				return {
-					kind: "running",
-					taskId: input.taskId,
-					progress,
-					...(hasChildren ? { children: progress.children } : {}),
-					...(latestStatus !== undefined ? { latestStatus } : {}),
-				};
+				return projectRunning(input.taskId, progress, input.detail ?? "summary");
 			} catch (error) {
 				return infrastructureFailure(input.taskId, task, `dstack progress read failed: ${errorMessage(error)}`);
 			}
@@ -185,6 +173,39 @@ async function readCommitted(input: ResultReader, binding: TaskBinding, task?: C
 			result: infrastructureFailure(input.taskId, task, `dstack committed result read failed: ${errorMessage(error)}`),
 		};
 	}
+}
+
+export function projectRunning(
+	taskId: string,
+	progress: WorkflowProgress,
+	detail: "summary" | "full" = "summary",
+): Extract<DstackResultView, { kind: "running" }> {
+	const sourceChildren = progress.children ?? [];
+	const children = detail === "full"
+		? sourceChildren
+		: sourceChildren.map((child) => ({
+			index: child.index,
+			state: child.state,
+			agent: child.agent,
+			...(child.latestStatus !== undefined ? { latestStatus: child.latestStatus } : {}),
+			...(child.latestActivity !== undefined ? { latestActivity: child.latestActivity } : {}),
+			...(child.lastActiveAt !== undefined ? { lastActiveAt: child.lastActiveAt } : {}),
+			...((child.journalCount ?? child.journal?.length) !== undefined
+				? { journalCount: child.journalCount ?? child.journal?.length }
+				: {}),
+			...(child.exitCode !== undefined ? { exitCode: child.exitCode } : {}),
+		}));
+	const latestStatus = sourceChildren
+		.flatMap((child) => child.latestStatus ?? [])
+		.sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))[0];
+	const { children: _children, ...counts } = progress;
+	return {
+		kind: "running",
+		taskId,
+		progress: detail === "full" ? progress : counts,
+		...(children.length > 0 ? { children } : {}),
+		...(latestStatus !== undefined ? { latestStatus } : {}),
+	};
 }
 
 export type TaskSummaryResult = Readonly<{

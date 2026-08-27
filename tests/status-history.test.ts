@@ -213,17 +213,18 @@ test("dstack_status tool registers only in child processes and writes status fil
 	}
 });
 
-test("dstack_result exposes live child state, latest semantic status, freshness, and recent journal", async () => {
+test("dstack_result keeps running summaries compact and reserves task and journal text for full detail", async () => {
 	const binding: TaskBinding = { taskId: "task-live-1", workflowId: "wf-live-1" };
+	const longTask = "build feature ".repeat(1_000);
 	const journalEntries: JournalEntry[] = [
-		{ seq: 1, timestamp: "2026-02-26T10:00:00.000Z", kind: "spawn", agent: "poteto-agent", task: "build feature", cwd: "/tmp" },
+		{ seq: 1, timestamp: "2026-02-26T10:00:00.000Z", kind: "spawn", agent: "poteto-agent", task: longTask, cwd: "/tmp" },
 		{ seq: 2, timestamp: "2026-02-26T10:00:05.000Z", kind: "phase", phase: "grounding", note: "reading files" },
 		{ seq: 3, timestamp: "2026-02-26T10:00:10.000Z", kind: "tool", name: "read", gist: "src/main.ts" },
 	];
 	const status: SemanticStatus = { phase: "grounding", note: "reading files", updatedAt: "2026-02-26T10:00:05.000Z" };
-
-	const view = await readDstackResult({
+	const read = (detail?: "summary" | "full") => readDstackResult({
 		taskId: "task-live-1",
+		detail,
 		statusExact: async () => ({
 			id: "task-live-1",
 			name: "dstack",
@@ -237,33 +238,42 @@ test("dstack_result exposes live child state, latest semantic status, freshness,
 			running: 1,
 			complete: 0,
 			total: 1,
-			children: [
-				{
-					index: 0,
-					state: "running",
-					agent: "poteto-agent",
-					task: "build feature",
-					latestStatus: status,
-					latestActivity: "grounding: reading files",
-					lastActiveAt: "2026-02-26T10:00:10.000Z",
-					journal: journalEntries,
-				},
-			],
+			children: [{
+				index: 0,
+				state: "running",
+				agent: "poteto-agent",
+				task: longTask,
+				latestStatus: status,
+				latestActivity: "grounding: reading files",
+				lastActiveAt: "2026-02-26T10:00:10.000Z",
+				journal: journalEntries,
+			}],
 		}),
 		readCommittedResult: async () => undefined,
 	});
 
-	assert.equal(view.kind, "running");
-	if (view.kind === "running") {
-		assert.equal(view.progress.running, 1);
-		assert.equal(view.children?.length, 1);
-		const child = view.children?.[0];
+	const summary = await read("summary");
+	assert.equal(summary.kind, "running");
+	if (summary.kind === "running") {
+		const child = summary.children?.[0];
+		assert.equal(summary.progress.running, 1);
+		assert.equal(summary.progress.children, undefined);
 		assert.equal(child?.agent, "poteto-agent");
 		assert.equal(child?.state, "running");
 		assert.equal(child?.latestStatus?.phase, "grounding");
 		assert.equal(child?.latestActivity, "grounding: reading files");
 		assert.equal(child?.lastActiveAt, "2026-02-26T10:00:10.000Z");
-		assert.equal(child?.journal?.length, 3);
+		assert.equal(child?.journalCount, 3);
+		assert.equal(child?.task, undefined);
+		assert.equal(child?.journal, undefined);
+		assert.ok(Buffer.byteLength(JSON.stringify(summary)) < 1_000);
+	}
+
+	const full = await read("full");
+	assert.equal(full.kind, "running");
+	if (full.kind === "running") {
+		assert.equal(full.children?.[0]?.task, longTask);
+		assert.equal(full.children?.[0]?.journal?.length, 3);
 	}
 });
 

@@ -42,6 +42,7 @@ import {
 	type TreeSnapshot,
 } from "./background/tree.ts";
 import {
+	projectRunning,
 	summaryPackage,
 	type ChildStateView,
 	type DstackResultView,
@@ -351,9 +352,6 @@ export function projectNestedResult(record: NestedTaskRecord, detail: "summary" 
 						? c.lifecycle.exitCode
 						: undefined,
 		}));
-		const latestStatus = childViews
-			.flatMap((c) => c.latestStatus ?? [])
-			.sort((l, r) => Date.parse(r.updatedAt) - Date.parse(l.updatedAt))[0];
 		const progress: WorkflowProgress = {
 			queued,
 			running,
@@ -361,13 +359,7 @@ export function projectNestedResult(record: NestedTaskRecord, detail: "summary" 
 			total: record.children.length,
 			children: childViews,
 		};
-		return {
-			kind: "running",
-			taskId: record.taskId,
-			progress,
-			children: childViews,
-			...(latestStatus !== undefined ? { latestStatus } : {}),
-		};
+		return projectRunning(record.taskId, progress, detail);
 	}
 
 	if (record.status === "cancelled") {
