@@ -81,6 +81,8 @@ test("listSessionWorkflows enumerates session workflows, maps bindings, and sort
 	await mkdir(join(sRoot, "workflows", "wf-older"), { recursive: true });
 	await mkdir(join(sRoot, "workflows", "wf-newer"), { recursive: true });
 	await mkdir(join(sRoot, "workflows", "wf-corrupt"), { recursive: true });
+	await mkdir(join(sRoot, "workflows", "wf-corrupt-schema"), { recursive: true });
+	await mkdir(join(sRoot, "workflows", "wf-pending"), { recursive: true });
 
 	await writeFile(
 		join(sRoot, "bindings", "task-older.json"),
@@ -90,6 +92,11 @@ test("listSessionWorkflows enumerates session workflows, maps bindings, and sort
 	await writeFile(
 		join(sRoot, "bindings", "task-newer.json"),
 		JSON.stringify({ taskId: "task-newer", workflowId: "wf-newer" }),
+		"utf8",
+	);
+	await writeFile(
+		join(sRoot, "bindings", "task-pending.json"),
+		JSON.stringify({ taskId: "task-pending", workflowId: "wf-pending" }),
 		"utf8",
 	);
 
@@ -121,23 +128,38 @@ test("listSessionWorkflows enumerates session workflows, maps bindings, and sort
 	);
 
 	await writeFile(join(sRoot, "workflows", "wf-corrupt", "manifest.json"), "invalid json", "utf8");
+	await writeFile(join(sRoot, "workflows", "wf-corrupt-schema", "manifest.json"), JSON.stringify({ invalid: true }), "utf8");
 
 	const list = await listSessionWorkflows(sessionId);
-	assert.equal(list.length, 3);
-	assert.equal(list[0]?.workflowId, "wf-corrupt");
-	assert.equal(list[0]?.unreadable, true);
+	assert.equal(list.length, 5);
 
-	assert.equal(list[1]?.workflowId, "wf-older");
-	assert.equal(list[1]?.taskId, "task-older");
-	assert.equal(list[1]?.committed, true);
-	assert.equal(list[1]?.playbook, "feature");
-	assert.equal(list[1]?.unreadable, false);
+	const corruptWf = list.find((w) => w.workflowId === "wf-corrupt");
+	assert.ok(corruptWf);
+	assert.deepEqual(corruptWf.manifest, { kind: "corrupt" });
 
-	assert.equal(list[2]?.workflowId, "wf-newer");
-	assert.equal(list[2]?.taskId, "task-newer");
-	assert.equal(list[2]?.committed, false);
-	assert.equal(list[2]?.playbook, "explore");
-	assert.equal(list[2]?.unreadable, false);
+	const corruptSchemaWf = list.find((w) => w.workflowId === "wf-corrupt-schema");
+	assert.ok(corruptSchemaWf);
+	assert.deepEqual(corruptSchemaWf.manifest, { kind: "corrupt" });
+
+	const pendingWf = list.find((w) => w.workflowId === "wf-pending");
+	assert.ok(pendingWf);
+	assert.equal(pendingWf.taskId, "task-pending");
+	assert.equal(pendingWf.committed, false);
+	assert.deepEqual(pendingWf.manifest, { kind: "pending" });
+
+	const olderWf = list.find((w) => w.workflowId === "wf-older");
+	assert.ok(olderWf);
+	assert.equal(olderWf.taskId, "task-older");
+	assert.equal(olderWf.committed, true);
+	assert.equal(olderWf.playbook, "feature");
+	assert.deepEqual(olderWf.manifest, { kind: "ok", createdAt: timeOlder, playbook: "feature" });
+
+	const newerWf = list.find((w) => w.workflowId === "wf-newer");
+	assert.ok(newerWf);
+	assert.equal(newerWf.taskId, "task-newer");
+	assert.equal(newerWf.committed, false);
+	assert.equal(newerWf.playbook, "explore");
+	assert.deepEqual(newerWf.manifest, { kind: "ok", createdAt: timeNewer, playbook: "explore" });
 });
 
 test("readChildResultDetails and readChildActivityDetails parse usage telemetry", async (t) => {
@@ -337,7 +359,7 @@ test("AgentInspector subtitle uses shared scheduler slot count when multiple act
 			committed: false,
 			createdAt: "2025-01-01T00:01:00.000Z",
 			playbook: "bug-fix",
-			unreadable: false,
+			manifest: { kind: "ok", createdAt: "2025-01-01T00:01:00.000Z", playbook: "bug-fix" },
 		},
 		{
 			workflowId: "wf-1",
@@ -347,7 +369,7 @@ test("AgentInspector subtitle uses shared scheduler slot count when multiple act
 			committed: false,
 			createdAt: "2025-01-01T00:00:00.000Z",
 			playbook: "feature",
-			unreadable: false,
+			manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z", playbook: "feature" },
 		},
 	];
 
@@ -428,7 +450,7 @@ test("AgentInspector component navigation: list -> drill-down -> nested drill-do
 			committed: false,
 			createdAt: "2025-01-01T00:00:00.000Z",
 			playbook: "feature",
-			unreadable: false,
+			manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z", playbook: "feature" },
 		},
 	];
 
@@ -582,7 +604,7 @@ test("AgentInspector history toggle and empty states", async () => {
 			committed: true,
 			createdAt: "2025-01-01T00:00:00.000Z",
 			playbook: "feature",
-			unreadable: false,
+			manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z", playbook: "feature" },
 		},
 	];
 
@@ -647,7 +669,7 @@ test("AgentInspector stale state and explicit raw output tail scrolling behavior
 			committed: false,
 			createdAt: "2025-01-01T00:00:00.000Z",
 			playbook: "feature",
-			unreadable: false,
+			manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z", playbook: "feature" },
 		},
 	];
 
@@ -767,7 +789,7 @@ test("AgentInspector task view displays full multiline task with vertical scroll
 				committed: false,
 				createdAt: "2025-01-01T00:00:00.000Z",
 				playbook: "feature",
-				unreadable: false,
+				manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z", playbook: "feature" },
 			},
 		],
 		getSnapshot: async () => snapshot,
@@ -834,7 +856,7 @@ test("AgentInspector final response view renders free-form text with labeled env
 				committed: true,
 				createdAt: "2025-01-01T00:00:00.000Z",
 				playbook: "feature",
-				unreadable: false,
+				manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z", playbook: "feature" },
 			},
 		],
 		getSnapshot: async () => snapshot,
@@ -961,7 +983,7 @@ test("AgentInspector depth-2 agent parity in views, labeled fields, and unavaila
 				committed: false,
 				createdAt: "2025-01-01T00:00:00.000Z",
 				playbook: "feature",
-				unreadable: false,
+				manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z", playbook: "feature" },
 			},
 		],
 		getSnapshot: async () => snapshot,
@@ -1201,7 +1223,7 @@ test("AgentInspector summary view bounds viewport, shows line-range indicator, a
 				committed: false,
 				createdAt: "2025-01-01T00:00:00.000Z",
 				playbook: "feature",
-				unreadable: false,
+				manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z", playbook: "feature" },
 			},
 		],
 		getSnapshot: async () => snapshot,
@@ -1289,7 +1311,7 @@ test("AgentInspector dispose halts refresh timer and prevents post-dispose rende
 			committed: false,
 			createdAt: "2025-01-01T00:00:00.000Z",
 			playbook: "feature",
-			unreadable: false,
+			manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z", playbook: "feature" },
 		},
 	]);
 
@@ -1336,7 +1358,7 @@ test("AgentInspector freezes committed workflow elapsed time using child end tim
 			committed: true,
 			createdAt: "2025-01-01T00:00:00.000Z",
 			playbook: "feature",
-			unreadable: false,
+			manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z", playbook: "feature" },
 		},
 	];
 
@@ -1488,7 +1510,7 @@ test("AgentInspector renders inherited model for running depth-2 child", async (
 				committed: false,
 				createdAt: "2025-01-01T00:00:00.000Z",
 				playbook: "feature",
-				unreadable: false,
+				manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z", playbook: "feature" },
 			},
 		],
 		getSnapshot: async () => snapshot,
@@ -1570,7 +1592,7 @@ test("AgentInspector renders child-reported model for completed depth-2 child in
 				committed: false,
 				createdAt: "2025-01-01T00:00:00.000Z",
 				playbook: "feature",
-				unreadable: false,
+				manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z", playbook: "feature" },
 			},
 		],
 		getSnapshot: async () => snapshot,
@@ -1674,7 +1696,7 @@ test("AgentInspector recovers nested model from historical sealed result on disk
 				committed: true,
 				createdAt: "2025-01-01T00:00:00.000Z",
 				playbook: "feature",
-				unreadable: false,
+				manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z", playbook: "feature" },
 			},
 		],
 	});
@@ -1754,7 +1776,7 @@ test("AgentInspector renders Model: unavailable for historical records without s
 				committed: true,
 				createdAt: "2025-01-01T00:00:00.000Z",
 				playbook: "feature",
-				unreadable: false,
+				manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z", playbook: "feature" },
 			},
 		],
 	});
@@ -1868,7 +1890,7 @@ test("AgentInspector grows frame and view budgets on tall viewports", async () =
 				committed: false,
 				createdAt: "2025-01-01T00:00:00.000Z",
 				playbook: "feature",
-				unreadable: false,
+				manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z", playbook: "feature" },
 			},
 		],
 		getSnapshot: async () => snapshot,
@@ -1949,7 +1971,7 @@ test("AgentInspector bounds frame and preserves borders, footer, and scrolling o
 				committed: false,
 				createdAt: "2025-01-01T00:00:00.000Z",
 				playbook: "feature",
-				unreadable: false,
+				manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z", playbook: "feature" },
 			},
 		],
 		getSnapshot: async () => snapshot,
@@ -2071,7 +2093,7 @@ test("AgentInspector calculates Final view row budget with fully populated envel
 				committed: true,
 				createdAt: "2025-01-01T00:00:00.000Z",
 				playbook: "feature",
-				unreadable: false,
+				manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z", playbook: "feature" },
 			},
 		],
 		getSnapshot: async () => snapshot,
@@ -2230,7 +2252,7 @@ test("AgentInspector renders numbered task groups, compact ordering cue, and fai
 			committed: false,
 			createdAt: "2025-01-01T00:00:00.000Z",
 			playbook: "feature",
-			unreadable: false,
+			manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z", playbook: "feature" },
 		},
 	];
 
@@ -2401,7 +2423,7 @@ test("AgentInspector displays Recent Activity and Semantic Status for running de
 				committed: false,
 				createdAt: "2025-01-01T00:00:00.000Z",
 				playbook: "feature",
-				unreadable: false,
+				manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z", playbook: "feature" },
 			},
 		],
 		getSnapshot: async () => snapshot,
@@ -2478,7 +2500,7 @@ test("AgentInspector does not display Recent Activity for completed agents to pr
 				committed: true,
 				createdAt: "2025-01-01T00:00:00.000Z",
 				playbook: "feature",
-				unreadable: false,
+				manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z", playbook: "feature" },
 			},
 		],
 		getSnapshot: async () => snapshot,
@@ -2495,6 +2517,124 @@ test("AgentInspector does not display Recent Activity for completed agents to pr
 	assert.ok(lines.some((l) => l.includes("Status:") && l.includes("succeeded")));
 	assert.ok(lines.some((l) => l.includes("Outcome:") && l.includes("All deliverables verified")));
 	assert.ok(!lines.some((l) => l.includes("Recent Activity:")));
+
+	inspector.dispose();
+});
+
+test("AgentInspector distinguishes pending launches from corrupt workflows", async () => {
+	const tui = { requestRender: () => {} };
+	const done = () => {};
+
+	const workflows: WorkflowSummary[] = [
+		{
+			workflowId: "wf-launching-123456",
+			taskId: "task-launching",
+			artifactDir: "/tmp/wf-launching",
+			schedulerRoot: "/tmp/scheduler",
+			committed: false,
+			createdAt: "2025-01-01T00:00:00.000Z",
+			manifest: { kind: "pending" },
+		},
+		{
+			workflowId: "wf-corrupt-123456",
+			taskId: "task-corrupt",
+			artifactDir: "/tmp/wf-corrupt",
+			schedulerRoot: "/tmp/scheduler",
+			committed: false,
+			createdAt: "2025-01-01T00:00:00.000Z",
+			manifest: { kind: "corrupt" },
+		},
+	];
+
+	const inspector = new AgentInspector(tui, plainTheme(), done, {
+		sessionId: "test-sess",
+		listWorkflows: async () => workflows,
+		getSnapshot: async () => undefined,
+		now: () => new Date("2025-01-01T00:02:00.000Z"),
+	});
+
+	await new Promise((r) => setTimeout(r, 20));
+
+	const lines = inspector.render(100);
+	assert.ok(lines.some((l) => l.includes("2 active workflows")));
+	assert.ok(lines.some((l) => l.includes("dstack · launching (wf-launc)")));
+	assert.ok(lines.some((l) => l.includes("dstack · (unreadable workflow wf-corru)")));
+
+	inspector.handleInput("h");
+	const historyLines = inspector.render(100);
+	assert.ok(historyLines.some((l) => l.includes("2 active · 2 total")));
+	assert.ok(historyLines.some((l) => l.includes("dstack · launching (wf-launc)")));
+	assert.ok(historyLines.some((l) => l.includes("dstack · (unreadable workflow wf-corru)")));
+
+	inspector.dispose();
+});
+
+test("AgentInspector snapshot refresh and retry transition from pending to ok", async () => {
+	const tui = { requestRender: () => {} };
+	const done = () => {};
+
+	let currentWorkflows: WorkflowSummary[] = [
+		{
+			workflowId: "wf-transition-1",
+			taskId: "task-transition-1",
+			artifactDir: "/tmp/wf-transition-1",
+			schedulerRoot: "/tmp/scheduler",
+			committed: false,
+			createdAt: "2025-01-01T00:00:00.000Z",
+			manifest: { kind: "pending" },
+		},
+	];
+
+	let snapshotReturned: TreeSnapshot | undefined = undefined;
+
+	const inspector = new AgentInspector(tui, plainTheme(), done, {
+		sessionId: "test-sess",
+		listWorkflows: async () => currentWorkflows,
+		getSnapshot: async () => snapshotReturned,
+		now: () => new Date("2025-01-01T00:02:00.000Z"),
+	});
+
+	await new Promise((r) => setTimeout(r, 20));
+
+	const initialLines = inspector.render(100);
+	assert.ok(initialLines.some((l) => l.includes("dstack · launching (wf-trans)")));
+	assert.ok(initialLines.some((l) => l.includes("1 active workflow")));
+
+	currentWorkflows = [
+		{
+			workflowId: "wf-transition-1",
+			taskId: "task-transition-1",
+			artifactDir: "/tmp/wf-transition-1",
+			schedulerRoot: "/tmp/scheduler",
+			committed: false,
+			createdAt: "2025-01-01T00:00:00.000Z",
+			playbook: "feature",
+			manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z", playbook: "feature" },
+		},
+	];
+	snapshotReturned = {
+		taskId: "task-transition-1",
+		workflowId: "wf-transition-1",
+		mode: "single",
+		playbook: "feature",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		committed: false,
+		counts: { queued: 0, running: 1, complete: 0, total: 1 },
+		slots: { active: 1, capacity: 4 },
+		children: [
+			{ index: 0, agent: "poteto-agent", state: "running", role: "feature", assignment: "owner", taskPreview: "owner task", nestedGroups: [], nested: [] },
+		],
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		capturedAt: "2025-01-01T00:02:00.000Z",
+	};
+
+	await (inspector as unknown as { poll: () => Promise<void> }).poll();
+
+	const refreshedLines = inspector.render(100);
+	assert.ok(refreshedLines.some((l) => l.includes("dstack · feature · 0/1 done")));
+	assert.ok(refreshedLines.some((l) => l.includes("owner poteto-agent")));
+	assert.ok(refreshedLines.some((l) => l.includes("1 active workflow")));
 
 	inspector.dispose();
 });
