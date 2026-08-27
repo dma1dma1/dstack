@@ -452,17 +452,35 @@ export function formatJournalEntry(entry: JournalEntry): string {
 
 export function formatRecentActivity(
 	journal: readonly JournalEntry[] | undefined,
-	limit = 4,
 ): readonly string[] {
 	if (!journal || journal.length === 0) return [];
-	const boundedLimit = typeof limit === "number" && Number.isFinite(limit)
-		? Math.min(MAX_JOURNAL_ENTRIES, Math.max(0, Math.floor(limit)))
-		: 0;
-	if (boundedLimit === 0) return [];
-	const nonSpawn = journal.filter((e) => e.kind !== "spawn");
-	const candidates = nonSpawn.length > 0 ? nonSpawn : journal;
-	const startIndex = Math.max(0, candidates.length - boundedLimit);
-	return candidates.slice(startIndex).map(formatJournalEntry);
+	const results: string[] = [];
+	for (const entry of journal) {
+		switch (entry.kind) {
+			case "turn": {
+				if (entry.summary && entry.summary.trim().length > 0) {
+					results.push(entry.summary.trim());
+				}
+				break;
+			}
+			case "phase":
+			case "exit":
+			case "failure": {
+				results.push(formatJournalEntry(entry));
+				break;
+			}
+			case "spawn":
+			case "tool": {
+				break;
+			}
+			default: {
+				const _exhaustive: never = entry;
+				void _exhaustive;
+				break;
+			}
+		}
+	}
+	return results;
 }
 
 export function allowStatusTool(tools: string | undefined): string | undefined {

@@ -1528,14 +1528,14 @@ export function renderTreeLines(snapshot: TreeSnapshot, opts: RenderTreeOptions)
 				lines.push(truncateToWidth(`    task [${child.agent}]: ${child.taskFull}`, width));
 			}
 			if (child.state === "running" && child.journal && child.journal.length > 0) {
-				const recent = formatRecentActivity(child.journal, 4);
+				const recent = formatRecentActivity(child.journal);
 				for (const act of recent) {
 					lines.push(truncateToWidth(`    ${theme.fg("dim", "•")} ${act}`, width));
 				}
 			}
 			for (const n of child.nested) {
 				if (!isLeaseSnapshot(n) && n.state === "running" && n.journal && n.journal.length > 0) {
-					const recent = formatRecentActivity(n.journal, 4);
+					const recent = formatRecentActivity(n.journal);
 					for (const act of recent) {
 						lines.push(truncateToWidth(`      ${theme.fg("dim", "•")} ${act}`, width));
 					}

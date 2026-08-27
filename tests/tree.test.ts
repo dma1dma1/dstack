@@ -1774,12 +1774,13 @@ test("renderTreeLines expanded view exposes compact recent activity history for 
 	assert.ok(lines.some((l) => l.includes("task [poteto-agent]: orchestrate feature implementation in full details")));
 	assert.ok(lines.some((l) => l.includes("task [general-purpose]: ground codebase full task description")));
 
-	assert.ok(lines.some((l) => l.includes("• → read src/tree.ts")));
-	assert.ok(lines.some((l) => l.includes("• → edit src/tree.ts")));
+	assert.ok(!lines.some((l) => l.includes("• → read src/tree.ts")));
+	assert.ok(!lines.some((l) => l.includes("• → edit src/tree.ts")));
 	assert.ok(lines.some((l) => l.includes("• implement: editing tree renderer")));
 
-	assert.ok(lines.some((l) => l.includes("• → bash npm test")));
-	assert.ok(lines.some((l) => l.includes("• turn 1: tests running suite 1")));
+	assert.ok(!lines.some((l) => l.includes("• → bash npm test")));
+	assert.ok(!lines.some((l) => l.includes("• turn 1: tests running suite 1")));
+	assert.ok(lines.some((l) => l.includes("• tests running suite 1")));
 
 	assert.ok(lines.some((l) => l.includes("✓ worker general-purpose (1m00s) — Codebase mapped cleanly")));
 	assert.ok(!lines.some((l) => l.includes("• → read README.md")));

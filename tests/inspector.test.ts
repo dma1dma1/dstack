@@ -2196,16 +2196,18 @@ test("AgentInspector displays Recent Activity and Semantic Status for running de
 	assert.ok(topDetailLines.some((l) => l.includes("Activity:") && l.includes("integrate: running integration tests")));
 	assert.ok(topDetailLines.some((l) => l.includes("⚠ Stale")));
 	assert.ok(topDetailLines.some((l) => l.includes("Recent Activity:")));
-	assert.ok(topDetailLines.some((l) => l.includes("→ read src/tree.ts")));
-	assert.ok(topDetailLines.some((l) => l.includes("turn 2: reviewed tree renderer changes")));
+	assert.ok(topDetailLines.some((l) => l.includes("reviewed tree renderer changes")));
+	assert.ok(!topDetailLines.some((l) => l.includes("→ read src/tree.ts")));
+	assert.ok(!topDetailLines.some((l) => l.includes("turn 2: reviewed tree renderer changes")));
 	assert.ok(topDetailLines.some((l) => l.includes("integrate: running integration tests")));
 
 	inspector.handleInput("\r");
 	const nestedDetailLines = inspector.render(100);
 	assert.ok(nestedDetailLines.some((l) => l.includes("nested agent: general-purpose (depth 2)")));
 	assert.ok(nestedDetailLines.some((l) => l.includes("Recent Activity:")));
-	assert.ok(nestedDetailLines.some((l) => l.includes("→ bash npm test")));
-	assert.ok(nestedDetailLines.some((l) => l.includes("turn 1: all 188 tests passed")));
+	assert.ok(nestedDetailLines.some((l) => l.includes("all 188 tests passed")));
+	assert.ok(!nestedDetailLines.some((l) => l.includes("→ bash npm test")));
+	assert.ok(!nestedDetailLines.some((l) => l.includes("turn 1: all 188 tests passed")));
 
 	inspector.dispose();
 });
