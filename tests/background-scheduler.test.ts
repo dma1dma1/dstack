@@ -161,6 +161,16 @@ async function ticketFiles(root: string): Promise<readonly string[]> {
 	return listJsonFiles(join(root, "tickets"));
 }
 
+async function queueEventRecords(root: string): Promise<readonly Record<string, unknown>[]> {
+	const records: Record<string, unknown>[] = [];
+	for (const name of await listJsonFiles(join(root, "events"))) {
+		const value: unknown = JSON.parse(await readFile(join(root, "events", name), "utf8"));
+		assert.ok(typeof value === "object" && value !== null && !Array.isArray(value));
+		records.push(Object.fromEntries(Object.entries(value)));
+	}
+	return records;
+}
+
 async function leaseChildIds(root: string): Promise<readonly string[]> {
 	const dir = join(root, "leases");
 	const ids: string[] = [];
@@ -264,6 +274,23 @@ test("four slots cap admission; releasing one admits the fifth waiter", async (t
 		await worker.waitForLine("released");
 	}
 	assert.deepEqual(await leaseFiles(root), []);
+
+	const events = await queueEventRecords(root);
+	assert.equal(events.length, 10);
+	assert.equal(new Set(events.map((event) => event["eventId"])).size, 10);
+	assert.equal(events.filter((event) => event["kind"] === "ticket_created").length, 5);
+	assert.equal(events.filter((event) => event["kind"] === "slot_acquired").length, 5);
+	for (const event of events) {
+		assert.equal(event["schemaVersion"], "dstack.scheduler.queue-event.v1");
+		assert.match(String(event["eventId"]), /^dstack\.scheduler-queue-event\.v1:/u);
+		assert.match(String(event["ticketId"]), /^dstack\.scheduler-ticket\.v2:/u);
+		assert.deepEqual(
+			Object.keys(event).sort(),
+			event["kind"] === "slot_acquired"
+				? ["capacityClass", "childId", "depth", "eventId", "kind", "occurredAt", "schemaVersion", "seq", "slotAcquisitionId", "ticketId", "workflowId"]
+				: ["capacityClass", "childId", "depth", "eventId", "kind", "occurredAt", "schemaVersion", "seq", "ticketId", "workflowId"],
+		);
+	}
 });
 
 test("the nesting reserve holds and terminal tickets bypass a blocked reserved ticket", async (t) => {

@@ -23,6 +23,7 @@ import type { AbsolutePath } from "./artifacts.ts";
  *                            lock; corruption fails closed and never resets
  *   <root>/tickets/*.json    one file per waiting acquisition
  *   <root>/leases/*.json     one file per admitted child slot
+ *   <root>/events/*.json     immutable ticket and slot telemetry records
  *
  * Admission rules (safety before fairness):
  *   - at most MAX_ACTIVE_CHILDREN leases exist at once;
@@ -59,6 +60,7 @@ export type LeaseSnapshot = Readonly<{
 
 const TICKET_SCHEMA = "dstack.scheduler.ticket.v2";
 const LEASE_SCHEMA = "dstack.scheduler.lease.v2";
+export const QUEUE_EVENT_SCHEMA = "dstack.scheduler.queue-event.v1" as const;
 const LOCK_SCHEMA = "dstack.scheduler.lock.v2";
 const CLAIM_SCHEMA = "dstack.scheduler.lockclaim.v1";
 const UNPROVABLE_START_TOKEN = "unprovable";
@@ -149,6 +151,33 @@ type LeaseRecord = Readonly<{
 	child?: OwnerIdentity;
 	childBoundAt?: string;
 }>;
+
+export type QueueEventV1 =
+	| Readonly<{
+			schemaVersion: typeof QUEUE_EVENT_SCHEMA;
+			eventId: string;
+			kind: "ticket_created";
+			ticketId: string;
+			workflowId: string;
+			childId: string;
+			seq: number;
+			depth: ChildDepth;
+			capacityClass: CapacityClass;
+			occurredAt: string;
+		}>
+	| Readonly<{
+			schemaVersion: typeof QUEUE_EVENT_SCHEMA;
+			eventId: string;
+			kind: "slot_acquired";
+			ticketId: string;
+			slotAcquisitionId: string;
+			workflowId: string;
+			childId: string;
+			seq: number;
+			depth: ChildDepth;
+			capacityClass: CapacityClass;
+			occurredAt: string;
+		}>;
 
 type LockRecord = Readonly<{ nonce: string; owner: OwnerIdentity }>;
 type ClaimRecord = Readonly<{ lockNonce: string; owner: OwnerIdentity }>;
@@ -444,7 +473,7 @@ async function readDirOrEmpty(path: string): Promise<readonly string[]> {
 	}
 }
 
-const SCHEDULER_SUBDIRS = ["tickets", "leases", "lock-claims"] as const;
+const SCHEDULER_SUBDIRS = ["tickets", "leases", "events", "lock-claims"] as const;
 
 /**
  * Create scheduler directories and validate realpath containment: the root
@@ -567,6 +596,70 @@ async function jsonFileNames(dir: string): Promise<readonly string[]> {
 	return (await readDirOrEmpty(dir)).filter((name) => name.endsWith(".json")).sort();
 }
 
+function ticketId(nonce: string): string {
+	return `dstack.scheduler-ticket.v2:${nonce}`;
+}
+
+function queueEventId(kind: QueueEventV1["kind"], nonce: string): string {
+	return `dstack.scheduler-queue-event.v1:${kind}:${nonce}`;
+}
+
+function queueEventFileName(kind: QueueEventV1["kind"], nonce: string): string {
+	return `${nonce}-${kind}.json`;
+}
+
+function queueEventMatches(value: unknown, event: QueueEventV1): boolean {
+	if (!isRecord(value)) return false;
+	const expected = Object.entries(event);
+	return Object.keys(value).length === expected.length && expected.every(([key, field]) => value[key] === field);
+}
+
+async function publishQueueEvent(root: AbsolutePath, event: QueueEventV1): Promise<void> {
+	const nonce = event.ticketId.slice("dstack.scheduler-ticket.v2:".length);
+	const path = join(root, "events", queueEventFileName(event.kind, nonce));
+	const existing = await readJsonFile(path);
+	if (existing.kind === "value" && queueEventMatches(existing.value, event)) return;
+	if (existing.kind !== "missing") {
+		throw corruptStateError(`queue event ${event.eventId} conflicts with an existing record`);
+	}
+	if (await publishExclusive(path, JSON.stringify(event))) return;
+	const raced = await readJsonFile(path);
+	if (raced.kind !== "value" || !queueEventMatches(raced.value, event)) {
+		throw corruptStateError(`queue event ${event.eventId} conflicts with an existing record`);
+	}
+}
+
+async function ensureTicketCreatedEvent(root: AbsolutePath, ticket: TicketRecord): Promise<void> {
+	await publishQueueEvent(root, {
+		schemaVersion: QUEUE_EVENT_SCHEMA,
+		eventId: queueEventId("ticket_created", ticket.nonce),
+		kind: "ticket_created",
+		ticketId: ticketId(ticket.nonce),
+		workflowId: ticket.workflowId,
+		childId: ticket.childId,
+		seq: ticket.seq,
+		depth: ticket.depth,
+		capacityClass: ticket.capacityClass,
+		occurredAt: ticket.createdAt,
+	});
+}
+
+async function ensureSlotAcquiredEvent(root: AbsolutePath, lease: LeaseRecord): Promise<void> {
+	await publishQueueEvent(root, {
+		schemaVersion: QUEUE_EVENT_SCHEMA,
+		eventId: queueEventId("slot_acquired", lease.nonce),
+		kind: "slot_acquired",
+		ticketId: ticketId(lease.nonce),
+		slotAcquisitionId: `dstack.scheduler-slot-acquisition.v1:${lease.nonce}`,
+		workflowId: lease.workflowId,
+		childId: lease.childId,
+		seq: lease.seq,
+		depth: lease.depth,
+		capacityClass: lease.capacityClass,
+		occurredAt: lease.acquiredAt,
+	});
+}
+
 async function collectLeases(root: AbsolutePath, cache: LivenessCache): Promise<CollectedLeases> {
 	const dir = join(root, "leases");
 	const active: LeaseRecord[] = [];
@@ -584,6 +677,7 @@ async function collectLeases(root: AbsolutePath, cache: LivenessCache): Promise<
 			opaqueCount += 1;
 			continue;
 		}
+		await ensureSlotAcquiredEvent(root, lease);
 		if (await leaseIsReclaimable(lease, cache)) {
 			await rm(path, { force: true });
 			continue;
@@ -631,6 +725,7 @@ async function collectTickets(root: AbsolutePath, cache: LivenessCache): Promise
 			opaqueCount += 1;
 			continue;
 		}
+		await ensureTicketCreatedEvent(root, ticket);
 		if (await ownerLiveness(ticket.owner, cache) === "dead") {
 			await rm(path, { force: true });
 			continue;
@@ -678,12 +773,14 @@ async function nextSequence(root: AbsolutePath): Promise<number> {
 
 // --- Admission --------------------------------------------------------------
 
-function makeLease(root: AbsolutePath, nonce: string): ChildSlotLease {
+function makeLease(root: AbsolutePath, lease: LeaseRecord): ChildSlotLease {
+	const nonce = lease.nonce;
 	let released: Promise<void> | undefined;
 	const release = (): Promise<void> => {
 		released ??= (async () => {
 			const detached = new AbortController();
 			await withSchedulerLock(root, detached.signal, async () => {
+				await ensureSlotAcquiredEvent(root, lease);
 				await rm(join(root, "leases", `${nonce}.json`), { force: true });
 			});
 		})();
@@ -758,8 +855,10 @@ async function tryAdmit(root: AbsolutePath, ticket: TicketRecord): Promise<Child
 		acquiredAt: new Date().toISOString(),
 	};
 	await writeFileAtomic(join(root, "leases", `${ticket.nonce}.json`), JSON.stringify(lease));
+	await ensureTicketCreatedEvent(root, ticket);
+	await ensureSlotAcquiredEvent(root, lease);
 	await rm(join(root, "tickets", ticketFileName(ticket)), { force: true });
-	return makeLease(root, ticket.nonce);
+	return makeLease(root, lease);
 }
 
 async function removeTicketBestEffort(root: AbsolutePath, ticket: TicketRecord): Promise<void> {
@@ -800,6 +899,7 @@ export async function acquireChildSlot(input: AcquireChildSlotInput): Promise<Ch
 			createdAt: new Date().toISOString(),
 		};
 		await writeFileAtomic(join(schedulerRoot, "tickets", ticketFileName(record)), JSON.stringify(record));
+		await ensureTicketCreatedEvent(schedulerRoot, record);
 		return record;
 	});
 	try {
