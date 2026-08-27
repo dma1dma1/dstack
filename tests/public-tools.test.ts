@@ -297,8 +297,18 @@ test("depth 1 keeps the synchronous execution path", async () => {
 	await runtime.handlers.get("session_start")?.({}, runtime.ctx);
 	const previousDepth = process.env.DSTACK_NESTING;
 	const previousAssignment = process.env.DSTACK_ASSIGNMENT;
+	const previousRootWorkflow = process.env[ROOT_WORKFLOW_ENV];
+	const previousArtifactDir = process.env[DSTACK_ARTIFACT_DIR_ENV];
+	const previousChildIndex = process.env[DSTACK_CHILD_INDEX_ENV];
+	const previousSchedulerRoot = process.env[SCHEDULER_ROOT_ENV];
+
 	process.env.DSTACK_NESTING = "1";
 	delete process.env.DSTACK_ASSIGNMENT;
+	delete process.env[ROOT_WORKFLOW_ENV];
+	delete process.env[DSTACK_ARTIFACT_DIR_ENV];
+	delete process.env[DSTACK_CHILD_INDEX_ENV];
+	delete process.env[SCHEDULER_ROOT_ENV];
+
 	try {
 		const result = await runtime.tools.get("dstack_task")?.execute(
 			"nested-call",
@@ -316,6 +326,14 @@ test("depth 1 keeps the synchronous execution path", async () => {
 		else process.env.DSTACK_NESTING = previousDepth;
 		if (previousAssignment === undefined) delete process.env.DSTACK_ASSIGNMENT;
 		else process.env.DSTACK_ASSIGNMENT = previousAssignment;
+		if (previousRootWorkflow === undefined) delete process.env[ROOT_WORKFLOW_ENV];
+		else process.env[ROOT_WORKFLOW_ENV] = previousRootWorkflow;
+		if (previousArtifactDir === undefined) delete process.env[DSTACK_ARTIFACT_DIR_ENV];
+		else process.env[DSTACK_ARTIFACT_DIR_ENV] = previousArtifactDir;
+		if (previousChildIndex === undefined) delete process.env[DSTACK_CHILD_INDEX_ENV];
+		else process.env[DSTACK_CHILD_INDEX_ENV] = previousChildIndex;
+		if (previousSchedulerRoot === undefined) delete process.env[SCHEDULER_ROOT_ENV];
+		else process.env[SCHEDULER_ROOT_ENV] = previousSchedulerRoot;
 	}
 });
 
@@ -688,18 +706,21 @@ test("dtree resolves manifest playbook when inspecting another task", async (t) 
 	const runtime = testRuntime(events);
 	await runtime.handlers.get("session_start")?.({}, runtime.ctx);
 
-	const sRoot = join(home, ".pi", "agent", "dstack", "background", "public-tools-session");
+	const backgroundRoot = join(home, ".pi", "agent", "dstack", "background");
+	const sRoot = join(backgroundRoot, "public-tools-session");
+	const priorRoot = join(backgroundRoot, "prior-session");
 	await mkdir(join(sRoot, "bindings"), { recursive: true });
-	await mkdir(join(sRoot, "workflows", "wf-other"), { recursive: true });
 	await mkdir(join(sRoot, "workflows", "wf-active"), { recursive: true });
+	await mkdir(join(priorRoot, "bindings"), { recursive: true });
+	await mkdir(join(priorRoot, "workflows", "wf-other"), { recursive: true });
 
 	await writeFile(
-		join(sRoot, "bindings", "task-other.json"),
+		join(priorRoot, "bindings", "task-other.json"),
 		JSON.stringify({ taskId: "task-other", workflowId: "wf-other" }),
 		"utf8",
 	);
 	await writeFile(
-		join(sRoot, "workflows", "wf-other", "manifest.json"),
+		join(priorRoot, "workflows", "wf-other", "manifest.json"),
 		JSON.stringify({
 			workflowId: "wf-other",
 			mode: "single",

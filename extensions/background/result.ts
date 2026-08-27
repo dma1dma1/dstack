@@ -51,6 +51,7 @@ export type DstackResultView =
 export type TaskBinding = Readonly<{
 	taskId: string;
 	workflowId: string;
+	root?: string;
 }>;
 
 type ResultReader = Readonly<{
@@ -70,16 +71,25 @@ export async function readDstackResult(input: ResultReader): Promise<DstackResul
 		return infrastructureFailure(input.taskId, undefined, `background task status failed: ${errorMessage(error)}`);
 	}
 
-	if (task === undefined) {
-		return { kind: "unknown_task", taskId: input.taskId, message: `No background task exists with id ${input.taskId}.` };
-	}
-
 	let binding: TaskBinding | undefined;
 	try {
 		binding = await input.readBinding(input.taskId);
 	} catch (error) {
 		return infrastructureFailure(input.taskId, task, `dstack binding read failed: ${errorMessage(error)}`);
 	}
+
+	if (task === undefined) {
+		if (binding === undefined || binding.taskId !== input.taskId) {
+			return { kind: "unknown_task", taskId: input.taskId, message: `No background task exists with id ${input.taskId}.` };
+		}
+		const committed = await readCommitted(input, binding, undefined);
+		if (committed.kind === "read_failure") return committed.result;
+		if (committed.result === undefined) {
+			return infrastructureFailure(input.taskId, undefined, "The background task has a durable binding, but no committed result or live status exists.");
+		}
+		return projectCommitted(input.taskId, committed.result, input.detail ?? "summary");
+	}
+
 	if (binding === undefined || binding.taskId !== input.taskId) {
 		return infrastructureFailure(input.taskId, task, "The background task exists, but its dstack binding is missing or invalid.");
 	}
@@ -126,7 +136,7 @@ type CommittedRead =
 	| Readonly<{ kind: "read"; result: CommittedResult | undefined }>
 	| Readonly<{ kind: "read_failure"; result: InfrastructureFailure }>;
 
-async function readCommitted(input: ResultReader, binding: TaskBinding, task: CompanionTaskState): Promise<CommittedRead> {
+async function readCommitted(input: ResultReader, binding: TaskBinding, task?: CompanionTaskState): Promise<CommittedRead> {
 	try {
 		return { kind: "read", result: await input.readCommittedResult(binding) };
 	} catch (error) {

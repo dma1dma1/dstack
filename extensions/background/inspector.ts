@@ -4,7 +4,10 @@ import { matchesKey, truncateToWidth, visibleWidth, type Component, type TUI } f
 import {
 	buildTreeSnapshot,
 	formatElapsed,
+	formatGroupLabel,
+	groupNestedChildren,
 	isLeaseSnapshot,
+	nestedChildDetail,
 	parseActivityV1,
 	parseChildUsage,
 	parseManifestForTree,
@@ -12,6 +15,7 @@ import {
 	taskPreviewOf,
 	type BuildTreeSnapshotInput,
 	type NestedChild,
+	type NestedGroup,
 	type SpawnNestedChild,
 	type TreeChild,
 	type TreeChildState,
@@ -270,7 +274,7 @@ export async function listSessionWorkflows(sessionId: string): Promise<WorkflowS
 		throw error;
 	}
 
-	return summaries.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+	return summaries.sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
 }
 
 export type ChildResultDetails = Readonly<{
@@ -579,7 +583,7 @@ export function buildAgentInspection(
 			return {
 				identity: {
 					depth: 2,
-					agent: "nested",
+					agent: "agent details pending",
 					workflowId: snapshot.workflowId,
 					childIndex: child.index,
 					parentIdentity: { agent: child.agent, childIndex: child.index },
@@ -655,7 +659,7 @@ export function buildAgentInspection(
 				phase: nested.workflow?.phase ?? child.phase,
 				activity: nested.activity,
 				stale: nested.stale,
-				outcome: nested.state === "failed" ? (nested.errorMessage ?? "failed") : undefined,
+				outcome: nested.state === "failed" ? (nested.errorMessage ?? nested.stderr ?? "failed") : undefined,
 			},
 			timing: {
 				createdAt: nested.updatedAt,
@@ -787,6 +791,12 @@ export type Frame =
 export type NavigableItem =
 	| Readonly<{ type: "workflow"; workflowId: string }>
 	| Readonly<{ type: "child"; workflowId: string; childIndex: number }>
+	| Readonly<{
+			type: "nested-group";
+			workflowId: string;
+			childIndex: number;
+			groupId: string;
+	  }>
 	| Readonly<{
 			type: "nested";
 			workflowId: string;
@@ -1164,6 +1174,31 @@ export class AgentInspector implements Component {
 				this.tui.requestRender();
 				return;
 			}
+			if (item.type === "nested-group") {
+				const snapshot = this.snapshots.get(item.workflowId);
+				const child = snapshot?.children[item.childIndex];
+				const childGroups = child?.nestedGroups ?? (child?.nested ? groupNestedChildren(child.nested) : []);
+				const group = childGroups.find((g) => g.groupId === item.groupId);
+				const firstChild = group?.children[0];
+				if (firstChild !== undefined && !isLeaseSnapshot(firstChild)) {
+					this.stack.push({
+						kind: "agent-detail",
+						workflowId: item.workflowId,
+						childIndex: item.childIndex,
+						nestedGroupId: firstChild.groupId,
+						nestedIndex: firstChild.nestedIndex,
+					});
+					this.detailView = "summary";
+					this.summaryScrollTop = 0;
+					this.taskScrollTop = 0;
+					this.finalScrollTop = 0;
+					this.detailFollow = true;
+					this.detailScrollTop = 0;
+					void this.refreshDetailData();
+					this.tui.requestRender();
+				}
+				return;
+			}
 			if (item.type === "nested") {
 				this.stack.push({
 					kind: "agent-detail",
@@ -1520,7 +1555,8 @@ export class AgentInspector implements Component {
 				for (let i = 0; i < snapshot.children.length; i++) {
 					const child = snapshot.children[i];
 					if (child === undefined) continue;
-					const isLastChild = i === snapshot.children.length - 1 && child.nested.length === 0;
+					const childGroups = child.nestedGroups ?? (child.nested ? groupNestedChildren(child.nested) : []);
+					const isLastChild = i === snapshot.children.length - 1 && childGroups.length === 0;
 					const guide = this.theme.fg("dim", isLastChild ? "    └─ " : "    ├─ ");
 					const glyph = glyphForState(child.state, this.theme);
 					const role = child.assignment ? `${child.assignment} ${child.agent}` : child.role ? `${child.role} ${child.agent}` : child.agent;
@@ -1546,37 +1582,58 @@ export class AgentInspector implements Component {
 						text: childRow,
 					});
 
-					for (let j = 0; j < child.nested.length; j++) {
-						const nested = child.nested[j];
-						if (nested === undefined) continue;
-						const isLastNested = j === child.nested.length - 1;
-						const nestedGuide = this.theme.fg("dim", isLastNested ? "       └─ " : "       ├─ ");
-						if (isLeaseSnapshot(nested)) {
-							const leaseElapsed = formatElapsed(Math.max(0, nowMs - Date.parse(nested.acquiredAt)));
-							const nestedRow = `${nestedGuide}${this.theme.fg("accent", "◐")} nested (${leaseElapsed})`;
-							rows.push({
-								item: { type: "child", workflowId: wf.workflowId, childIndex: i },
-								text: nestedRow,
-							});
-						} else {
-							const nGlyph = glyphForState(nested.state, this.theme);
-							const nRole = nested.assignment ? `${nested.assignment} ${nested.agent}` : nested.role ? `${nested.role} ${nested.agent}` : nested.agent;
-							const nDuration = nested.startedAt
-								? ` (${formatElapsed(Math.max(0, (nested.endedAt ? Date.parse(nested.endedAt) : nowMs) - Date.parse(nested.startedAt)))})`
-								: "";
-							const nDetail = nested.activity ? ` — ${nested.activity}` : nested.taskPreview ? ` ${nested.taskPreview}` : "";
-							const nStale = nested.stale ? ` ${this.theme.fg("warning", "⚠ stale")}` : "";
-							const nestedRow = `${nestedGuide}${nGlyph} ${nRole}${nDuration}${nStale}${nDetail}`;
-							rows.push({
-								item: {
-									type: "nested",
-									workflowId: wf.workflowId,
-									childIndex: i,
-									nestedGroupId: nested.groupId,
-									nestedIndex: nested.nestedIndex,
-								},
-								text: nestedRow,
-							});
+					for (let gIdx = 0; gIdx < childGroups.length; gIdx++) {
+						const group = childGroups[gIdx];
+						if (group === undefined) continue;
+						const isLastGroup = gIdx === childGroups.length - 1;
+						const groupGuide = this.theme.fg("dim", isLastGroup ? "       └─ " : "       ├─ ");
+						const groupLabelText = formatGroupLabel(group);
+
+						rows.push({
+							item: {
+								type: "nested-group",
+								workflowId: wf.workflowId,
+								childIndex: i,
+								groupId: group.groupId,
+							},
+							text: `${groupGuide}${this.theme.fg("dim", groupLabelText)}`,
+						});
+
+						for (let j = 0; j < group.children.length; j++) {
+							const nested = group.children[j];
+							if (nested === undefined) continue;
+							const isLastNested = j === group.children.length - 1;
+							const nestedPrefix = isLastGroup ? "          " : "       │  ";
+							const nestedGuide = this.theme.fg("dim", `${nestedPrefix}${isLastNested ? "└─ " : "├─ "}`);
+
+							if (isLeaseSnapshot(nested)) {
+								const leaseElapsed = formatElapsed(Math.max(0, nowMs - Date.parse(nested.acquiredAt)));
+								const nestedRow = `${nestedGuide}${this.theme.fg("accent", "◐")} agent details pending (${leaseElapsed})`;
+								rows.push({
+									item: { type: "child", workflowId: wf.workflowId, childIndex: i },
+									text: nestedRow,
+								});
+							} else {
+								const nGlyph = glyphForState(nested.state, this.theme);
+								const nRole = nested.assignment ? `${nested.assignment} ${nested.agent}` : nested.role ? `${nested.role} ${nested.agent}` : nested.agent;
+								const nDuration = nested.startedAt
+									? ` (${formatElapsed(Math.max(0, (nested.endedAt ? Date.parse(nested.endedAt) : nowMs) - Date.parse(nested.startedAt)))})`
+									: "";
+								const nDetailText = nestedChildDetail(nested);
+								const nDetail = nDetailText ? (nested.state === "queued" || nested.state === "skipped" ? ` ${nDetailText}` : ` — ${nDetailText}`) : "";
+								const nStale = nested.stale ? ` ${this.theme.fg("warning", "⚠ stale")}` : "";
+								const nestedRow = `${nestedGuide}${nGlyph} ${nRole}${nDuration}${nStale}${nDetail}`;
+								rows.push({
+									item: {
+										type: "nested",
+										workflowId: wf.workflowId,
+										childIndex: i,
+										nestedGroupId: nested.groupId,
+										nestedIndex: nested.nestedIndex,
+									},
+									text: nestedRow,
+								});
+							}
 						}
 					}
 				}
@@ -1595,7 +1652,7 @@ export class AgentInspector implements Component {
 		} else {
 			subtitleParts.push(activeWorkflowCount > 0 ? `${activeWorkflowCount} active workflow${activeWorkflowCount === 1 ? "" : "s"}` : "No active workflows");
 		}
-		subtitleParts.push(`slots ${activeSlots}`);
+		subtitleParts.push(`slots ${activeSlots}`, "oldest at top · newest at bottom");
 		const subtitle = subtitleParts.join(" · ");
 
 		const listVisibleRows = this.layoutMetrics.listVisibleRows;
@@ -1666,7 +1723,10 @@ export class AgentInspector implements Component {
 
 		let nestedMatch: NestedChild | undefined;
 		if (frame.nestedGroupId !== undefined && frame.nestedIndex !== undefined) {
-			nestedMatch = child.nested.find((n) => !isLeaseSnapshot(n) && n.groupId === frame.nestedGroupId && n.nestedIndex === frame.nestedIndex);
+			const allNested = child.nested.length > 0
+				? child.nested
+				: (child.nestedGroups ?? []).flatMap((g) => g.children);
+			nestedMatch = allNested.find((n) => !isLeaseSnapshot(n) && n.groupId === frame.nestedGroupId && n.nestedIndex === frame.nestedIndex);
 		}
 
 		const rawResult: BoundedReadResult | undefined = this.detailLines.length > 0 || this.tailBytesRead > 0
@@ -1877,15 +1937,16 @@ export class AgentInspector implements Component {
 			for (const n of child.nested) {
 				if (isLeaseSnapshot(n)) {
 					const leaseElapsed = formatElapsed(Math.max(0, nowMs - Date.parse(n.acquiredAt)));
-					lines.push(`   ${this.theme.fg("accent", "◐")} nested (${leaseElapsed})`);
+					lines.push(`   ${this.theme.fg("accent", "◐")} agent details pending (${leaseElapsed})`);
 				} else {
 					const nGlyph = glyphForState(n.state, this.theme);
-					const nRole = n.assignment ? `${n.assignment} ${n.agent}` : n.agent;
+					const nRole = n.assignment ? `${n.assignment} ${n.agent}` : n.role ? `${n.role} ${n.agent}` : n.agent;
 					const nDuration = n.startedAt
 						? ` (${formatElapsed(Math.max(0, (n.endedAt ? Date.parse(n.endedAt) : nowMs) - Date.parse(n.startedAt)))})`
 						: "";
-					const nTask = n.taskPreview ? ` — ${n.taskPreview}` : "";
-					lines.push(`   ${nGlyph} ${nRole}${nDuration}${nTask}`);
+					const nDetailText = nestedChildDetail(n);
+					const nDetail = nDetailText ? ` — ${nDetailText}` : "";
+					lines.push(`   ${nGlyph} ${nRole}${nDuration}${nDetail}`);
 				}
 			}
 		}

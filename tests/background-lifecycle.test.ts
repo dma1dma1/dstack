@@ -1,14 +1,17 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { createEventBus } from "@earendil-works/pi-coding-agent";
 import { test, type TestContext } from "node:test";
-import { readOutputArtifact, toAbsolutePath, toSha256 } from "../extensions/background/artifacts.ts";
+import { readOutputArtifact, toAbsolutePath, toSha256, writeSealedArtifact } from "../extensions/background/artifacts.ts";
 import { createEventBusV1Port } from "../extensions/background/eventbus-v1.ts";
+import { createTaskResultFiles } from "../extensions/background/launch.ts";
+import { commitWorkflowResult } from "../extensions/background/runner.ts";
 import {
 	readDstackResult,
 	type CommittedResult,
@@ -248,6 +251,134 @@ test("dstack_result projects every companion and committed-result state", async 
 		readCommittedResult: async () => { throw new Error("commit is incomplete"); },
 	});
 	assert.deepEqual(killedWithUnreadableCommit, { kind: "cancelled", taskId, message: "The background task was cancelled." });
+});
+
+test("dstack_result recovers committed result from durable bindings across prior sessions when live status is absent", async (t) => {
+	const home = await temporaryDirectory(t);
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	t.after(() => {
+		process.env.HOME = previousHome;
+	});
+
+	const priorSessionId = "prior-session-999";
+	const currentSessionId = "current-session-001";
+	const crossTaskId = "task-cross-session-123";
+	const crossWorkflowId = "wf-cross-session-456";
+
+	const bgRoot = join(home, ".pi", "agent", "dstack", "background");
+	const priorSessRoot = join(bgRoot, encodeURIComponent(priorSessionId));
+	const priorBindingsDir = join(priorSessRoot, "bindings");
+	const priorWorkflowDir = join(priorSessRoot, "workflows", crossWorkflowId);
+	const priorChildDir = join(priorWorkflowDir, "children", "0");
+
+	await mkdir(priorBindingsDir, { recursive: true });
+	await mkdir(priorChildDir, { recursive: true });
+
+	const binding = { taskId: crossTaskId, workflowId: crossWorkflowId };
+	await writeFile(join(priorBindingsDir, `${encodeURIComponent(crossTaskId)}.json`), JSON.stringify(binding), "utf8");
+
+	const manifest = {
+		schemaVersion: "dstack.workflow.v1" as const,
+		workflowId: crossWorkflowId,
+		sessionId: priorSessionId,
+		mode: "single" as const,
+		createdAt: "2025-01-01T00:00:00.000Z",
+		artifactDir: toAbsolutePath(priorWorkflowDir),
+		schedulerRoot: toAbsolutePath(join(priorSessRoot, "scheduler")),
+		extensionPath: "/tmp/ext.ts",
+		piChildLaunch: { executable: "node", argvPrefix: [] },
+		childDepth: 1 as const,
+		specs: [{ index: 0, agent: "poteto-agent", task: "cross session task", cwd: "/workspace", requestedRole: "feature" }] as const,
+	};
+	const manifestBytes = Buffer.from(`${JSON.stringify(manifest)}\n`);
+	const manifestSha256 = createHash("sha256").update(manifestBytes).digest("hex");
+	await writeFile(join(priorWorkflowDir, "manifest.json"), manifestBytes);
+
+	const output = await writeSealedArtifact(join(priorChildDir, "output.txt"), "");
+	const childMetadata = {
+		schemaVersion: "dstack.child-result.v1",
+		workflowId: crossWorkflowId,
+		index: 0,
+		state: "succeeded",
+		startedAt: "2025-01-01T00:00:01.000Z",
+		endedAt: "2025-01-01T00:01:00.000Z",
+		result: {
+			agent: "poteto-agent",
+			cwd: "/workspace",
+			task: "cross session task",
+			text: "Cross session result text completed successfully.",
+			exitCode: 0,
+			stderr: "",
+			messages: [],
+			usage: { turns: 2, input: 100, output: 50, cost: 0.01, contextTokens: 1000, cacheRead: 0, cacheWrite: 0 },
+		},
+		output,
+	};
+	const childResultSeal = await writeSealedArtifact(join(priorChildDir, "result.json"), `${JSON.stringify(childMetadata)}\n`);
+
+	const index = {
+		schemaVersion: "dstack.result-index.v1" as const,
+		workflowId: crossWorkflowId,
+		manifestSha256,
+		mode: "single" as const,
+		outcome: "succeeded" as const,
+		summary: { total: 1, succeeded: 1, failed: 0, cancelled: 0 },
+		package: {
+			mode: "single" as const,
+			results: [childMetadata.result],
+		},
+		children: [{ index: 0, state: "succeeded" as const, output, result: childResultSeal }],
+	};
+	await commitWorkflowResult(manifest, index);
+
+	const currentFiles = createTaskResultFiles(currentSessionId);
+	const result = await readDstackResult({
+		taskId: crossTaskId,
+		statusExact: async () => undefined,
+		readBinding: currentFiles.readBinding,
+		readProgress: currentFiles.readProgress,
+		readCommittedResult: currentFiles.readCommittedResult,
+	});
+
+	assert.equal(result.kind, "complete");
+	if (result.kind === "complete" && result.detail === "summary") {
+		assert.equal(result.taskId, crossTaskId);
+		assert.equal(result.package.results[0]?.summary, "Cross session result text completed successfully.");
+	}
+});
+
+test("dstack_result returns infrastructure failure when binding exists but no committed result or live status exists", async () => {
+	const result = await readDstackResult({
+		taskId: "task-abandoned-123",
+		statusExact: async () => undefined,
+		readBinding: async () => ({ taskId: "task-abandoned-123", workflowId: "wf-abandoned" }),
+		readProgress: async () => ({ queued: 0, running: 1, complete: 0, total: 1 }),
+		readCommittedResult: async () => undefined,
+	});
+
+	assert.equal(result.kind, "infrastructure_failure");
+	if (result.kind === "infrastructure_failure") {
+		assert.equal(result.taskId, "task-abandoned-123");
+		assert.equal(result.companionOutputPath, null);
+		assert.ok(result.message.includes("no committed result or live status exists"));
+	}
+});
+
+test("dstack_result preserves true unknown behavior when no live status and no binding exists", async () => {
+	const result = await readDstackResult({
+		taskId: "task-never-existed",
+		statusExact: async () => undefined,
+		readBinding: async () => undefined,
+		readProgress: async () => ({ queued: 0, running: 0, complete: 0, total: 0 }),
+		readCommittedResult: async () => undefined,
+	});
+
+	assert.deepEqual(result, {
+		kind: "unknown_task",
+		taskId: "task-never-existed",
+		message: "No background task exists with id task-never-existed.",
+	});
 });
 
 test("dstack_result defaults to a bounded summary with a sealed full-output pointer", async () => {

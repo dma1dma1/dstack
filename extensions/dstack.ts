@@ -665,7 +665,7 @@ export default function dstack(pi: ExtensionAPI) {
 				return;
 			}
 
-			const root = sessionRoot(sessionId);
+			const root = binding.root ?? sessionRoot(sessionId);
 			const artifactDir = join(root, "workflows", binding.workflowId);
 			const schedulerRoot = join(root, "scheduler");
 			const snapshot = await buildTreeSnapshot({
@@ -1212,6 +1212,7 @@ export default function dstack(pi: ExtensionAPI) {
 				return textResult(text, ownerResultDetails(details));
 			} catch (err) {
 				const now = new Date().toISOString();
+				const failureMessage = err instanceof Error ? err.message : String(err);
 				for (let i = 0; i < spawnChildren.length; i++) {
 					const c = spawnChildren[i];
 					if (c !== undefined && (c.state === "queued" || c.state === "running")) {
@@ -1220,6 +1221,7 @@ export default function dstack(pi: ExtensionAPI) {
 							state: signal?.aborted ? "cancelled" : "failed",
 							updatedAt: now,
 							endedAt: now,
+							errorMessage: failureMessage,
 						};
 					}
 				}
@@ -1227,7 +1229,7 @@ export default function dstack(pi: ExtensionAPI) {
 				if (err instanceof WorktreeError) {
 					return textResult(err.message, {}, true);
 				}
-				return textResult(err instanceof Error ? err.message : String(err), {}, true);
+				return textResult(failureMessage, {}, true);
 			} finally {
 				spawnRecordWriter?.dispose();
 			}
