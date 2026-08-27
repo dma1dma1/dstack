@@ -215,7 +215,10 @@ async function probeStartToken(pid: number): Promise<StartTokenProbe> {
 	// Unsupported liveness (e.g. Windows) fails closed as unknown.
 	if (process.platform === "win32") return { kind: "unknown" };
 	try {
-		const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "lstart="]);
+		const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "lstart="], {
+			timeout: 1_000,
+			killSignal: "SIGKILL",
+		});
 		const raw = stdout.trim();
 		return raw === "" ? { kind: "dead" } : { kind: "token", token: `posix-lstart:${raw}` };
 	} catch (error) {

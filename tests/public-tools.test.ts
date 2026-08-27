@@ -1469,9 +1469,7 @@ test("nested depth-1 task dstack_kill releases scheduler lease and restores capa
 	t.after(() => rm(cwd, { recursive: true, force: true }));
 
 	const schedulerRoot = join(cwd, "scheduler");
-	const artifactDir = join(cwd, "artifacts");
 	await mkdir(schedulerRoot, { recursive: true });
-	await mkdir(artifactDir, { recursive: true });
 
 	const previousDepth = process.env.DSTACK_NESTING;
 	const previousAssignment = process.env.DSTACK_ASSIGNMENT;
@@ -1484,8 +1482,8 @@ test("nested depth-1 task dstack_kill releases scheduler lease and restores capa
 	process.env.DSTACK_ASSIGNMENT = "owner";
 	process.env[ROOT_WORKFLOW_ENV] = "wf-sched-kill";
 	process.env[SCHEDULER_ROOT_ENV] = schedulerRoot;
-	process.env[DSTACK_CHILD_INDEX_ENV] = "0";
-	process.env[DSTACK_ARTIFACT_DIR_ENV] = artifactDir;
+	delete process.env[DSTACK_CHILD_INDEX_ENV];
+	delete process.env[DSTACK_ARTIFACT_DIR_ENV];
 
 	const events = createEventBus();
 	const runtime = testRuntime(events);
@@ -1493,8 +1491,9 @@ test("nested depth-1 task dstack_kill releases scheduler lease and restores capa
 
 	try {
 		const taskTool = runtime.tools.get("dstack_task");
+		const resultTool = runtime.tools.get("dstack_result");
 		const killTool = runtime.tools.get("dstack_kill");
-		assert.ok(taskTool && killTool);
+		assert.ok(taskTool && resultTool && killTool);
 
 		const launch = await taskTool.execute(
 			"sched-call",
@@ -1506,7 +1505,12 @@ test("nested depth-1 task dstack_kill releases scheduler lease and restores capa
 		assert.equal(launch.isError, false);
 		const receipt = launch.details as { taskId: string };
 
-		await waitUntil(async () => (await snapshotActiveLeases(schedulerRoot)).length === 1);
+		try {
+			await waitUntil(async () => (await snapshotActiveLeases(schedulerRoot)).length === 1, 5_000);
+		} catch {
+			const current = await resultTool.execute("r-lease", { taskId: receipt.taskId }, undefined, undefined, runtime.ctx);
+			assert.fail(`nested task did not acquire a scheduler lease: ${JSON.stringify(current.details)}`);
+		}
 		const killed = await killTool.execute("k1", { taskId: receipt.taskId }, undefined, undefined, runtime.ctx);
 		assert.equal((killed.details as { status: string }).status, "killed");
 		assert.equal((await snapshotActiveLeases(schedulerRoot)).length, 0);
