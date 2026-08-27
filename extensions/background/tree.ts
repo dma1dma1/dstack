@@ -51,6 +51,7 @@ export type ChildActivityV1 = Readonly<{
 	updatedAt: string;
 	turns: number;
 	contextTokens: number;
+	cost?: number;
 }>;
 
 export type SpawnChildV1 = Readonly<{
@@ -162,6 +163,7 @@ export type TreeChild = ProgressChildV1 & Readonly<{
 	model?: string;
 	tools?: string;
 	nestedGroups: readonly NestedGroup[];
+	cost?: number;
 	nested: readonly NestedChild[];
 }>;
 
@@ -276,7 +278,7 @@ function isWorkflowAssignment(value: unknown): value is "owner" | "worker" | "re
 
 export function parseActivityV1(raw: unknown): ChildActivityV1 | undefined {
 	if (!isRecord(raw)) return undefined;
-	const { schemaVersion, workflowId, index, activity, updatedAt, turns, contextTokens } = raw;
+	const { schemaVersion, workflowId, index, activity, updatedAt, turns, contextTokens, cost } = raw;
 	if (schemaVersion !== "dstack.child-activity.v1") return undefined;
 	if (typeof workflowId !== "string" || workflowId === "") return undefined;
 	if (typeof index !== "number" || !Number.isSafeInteger(index) || index < 0) return undefined;
@@ -284,6 +286,7 @@ export function parseActivityV1(raw: unknown): ChildActivityV1 | undefined {
 	if (typeof updatedAt !== "string" || updatedAt === "") return undefined;
 	if (typeof turns !== "number" || !Number.isSafeInteger(turns) || turns < 0) return undefined;
 	if (typeof contextTokens !== "number" || !Number.isSafeInteger(contextTokens) || contextTokens < 0) return undefined;
+	if (cost !== undefined && (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0)) return undefined;
 
 	return {
 		schemaVersion: "dstack.child-activity.v1",
@@ -293,6 +296,7 @@ export function parseActivityV1(raw: unknown): ChildActivityV1 | undefined {
 		updatedAt,
 		turns,
 		contextTokens,
+		...(typeof cost === "number" ? { cost } : {}),
 	};
 }
 
@@ -601,7 +605,19 @@ type TerminalChildProjection = Readonly<{
 	startedAt?: string;
 	endedAt: string;
 	outcome?: string;
+	cost?: number;
 }>;
+
+function extractTerminalCost(raw: Record<string, unknown>): number | undefined {
+	const resultObj = isRecord(raw.result) ? raw.result : raw;
+	if (isRecord(resultObj.usage)) {
+		const cost = resultObj.usage.cost;
+		if (typeof cost === "number" && Number.isFinite(cost) && cost >= 0) {
+			return cost;
+		}
+	}
+	return undefined;
+}
 
 function firstNonEmptyLine(text: string, maxLen = 80): string | undefined {
 	const line = text.split("\n").map((l) => l.trim()).find((l) => l.length > 0);
@@ -675,6 +691,7 @@ async function readTerminalChild(artifactDir: string, index: number): Promise<Te
 			startedAt: typeof raw.startedAt === "string" && raw.startedAt !== "" ? raw.startedAt : undefined,
 			endedAt: typeof raw.endedAt === "string" && raw.endedAt !== "" ? raw.endedAt : file.mtime.toISOString(),
 			outcome: extractOutcome(raw, state),
+			cost: extractTerminalCost(raw),
 		};
 	} catch {
 		return undefined;
@@ -972,6 +989,11 @@ export function parseTreeSnapshot(raw: unknown): TreeSnapshot | undefined {
 			activityObj = { text: child.activity.text, updatedAt: child.activity.updatedAt };
 		}
 
+		let cost: number | undefined;
+		if (typeof child.cost === "number" && Number.isFinite(child.cost) && child.cost >= 0) {
+			cost = child.cost;
+		}
+
 		validatedChildren.push({
 			index: child.index,
 			agent: child.agent,
@@ -993,6 +1015,7 @@ export function parseTreeSnapshot(raw: unknown): TreeSnapshot | undefined {
 			model: typeof child.model === "string" ? child.model : undefined,
 			tools: typeof child.tools === "string" ? child.tools : undefined,
 			nestedGroups,
+			cost,
 			nested,
 		});
 	}
@@ -1248,6 +1271,33 @@ export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<
 			});
 		}
 
+		const nested = nestedGroups.flatMap((group) => group.children);
+		const rawCost = terminalChild !== undefined
+			? terminalChild.cost
+			: activityRecord !== undefined
+				? activityRecord.cost
+				: undefined;
+
+		let cost: number | undefined;
+		if (rawCost !== undefined && terminalChild === undefined) {
+			cost = rawCost;
+		} else if (rawCost !== undefined) {
+			let nestedCostSum = 0;
+			let nestedCostsComplete = true;
+			for (const n of nested) {
+				if (isLeaseSnapshot(n) || n.state === "queued" || n.state === "running") continue;
+				if (n.usage?.cost === undefined || !Number.isFinite(n.usage.cost)) {
+					nestedCostsComplete = false;
+					break;
+				}
+				nestedCostSum += n.usage.cost;
+			}
+			if (nestedCostsComplete) {
+				const direct = rawCost - nestedCostSum;
+				cost = direct <= 1e-9 ? 0 : Math.round(direct * 1_000_000) / 1_000_000;
+			}
+		}
+
 		return {
 			index,
 			agent: progressChild?.agent ?? spec.agent,
@@ -1268,8 +1318,9 @@ export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<
 			cwd: spec.cwd,
 			model: spec.model,
 			tools: spec.tools,
+			cost,
 			nestedGroups,
-			nested: nestedGroups.flatMap((g) => g.children),
+			nested,
 		};
 	});
 
@@ -1416,6 +1467,11 @@ function childDurationText(child: TreeChild, createdAt: string, nowMs: number): 
 	return durationFormatted;
 }
 
+export function formatCost(cost: number | undefined): string | undefined {
+	if (cost === undefined || !Number.isFinite(cost) || cost < 0) return undefined;
+	return `$${cost.toFixed(4)}`;
+}
+
 type PreparedTreeRow = Readonly<{
 	kind: "child" | "nested";
 	priority: number;
@@ -1523,6 +1579,8 @@ export function renderTreeLines(snapshot: TreeSnapshot, opts: RenderTreeOptions)
 				const glyph = glyphForState(currentChild.state, rowTheme);
 				const role = roleLabel(currentChild);
 				const duration = childDurationText(currentChild, snapshot.createdAt, nowMs);
+				const costToken = formatCost(currentChild.cost);
+				const costSuffix = costToken !== undefined ? ` ${costToken}` : "";
 
 				let detail = "";
 				if (currentChild.state === "queued") {
@@ -1554,12 +1612,14 @@ export function renderTreeLines(snapshot: TreeSnapshot, opts: RenderTreeOptions)
 					}
 				}
 
-				const rawLine = `${guide}${glyph} ${role} ${duration}${detail}`;
+				const rawLine = `${guide}${glyph} ${role} ${duration}${costSuffix}${detail}`;
 				return truncateToWidth(rawLine, renderWidth);
 			},
 		});
 
-		const childGroups = currentChild.nestedGroups ?? (currentChild.nested ? groupNestedChildren(currentChild.nested) : []);
+		const childGroups = currentChild.nestedGroups.length > 0
+			? currentChild.nestedGroups
+			: groupNestedChildren(currentChild.nested);
 
 		for (let gIdx = 0; gIdx < childGroups.length; gIdx++) {
 			const group = childGroups[gIdx];
@@ -1630,6 +1690,8 @@ export function renderTreeLines(snapshot: TreeSnapshot, opts: RenderTreeOptions)
 							role = `${nestedChild.role} ${nestedChild.agent}`;
 						}
 
+						const costToken = formatCost(nestedChild.usage?.cost);
+						const costSuffix = costToken !== undefined ? ` ${costToken}` : "";
 						let durationStr = "";
 						let detail = "";
 						if (nestedChild.state === "queued") {
@@ -1672,7 +1734,7 @@ export function renderTreeLines(snapshot: TreeSnapshot, opts: RenderTreeOptions)
 							detail = detailText.length > 0 ? ` — ${detailText}` : "";
 						}
 
-						const rawLine = `${guide}${glyph} ${role} ${durationStr}${detail}`;
+						const rawLine = `${guide}${glyph} ${role} ${durationStr}${costSuffix}${detail}`;
 						return truncateToWidth(rawLine, renderWidth);
 					},
 				});

@@ -18,6 +18,7 @@ import {
 	resolveAgent,
 	runChildProcess,
 	spawnableDepth,
+	sumChildUsage,
 	type ChildResult,
 } from "../extensions/spawn.ts";
 import { MAX_CONCURRENCY, MAX_PARALLEL_TASKS, NESTING_ENV } from "../extensions/types.ts";
@@ -186,6 +187,140 @@ test("child JSON events retain live text, tools, and nested agent updates", () =
 		agents: [{ agent: "poteto-agent", exitCode: 0, text: "Done" }],
 	});
 	assert.equal(applyJsonEvent({ type: "message_update" }, state), false);
+});
+
+test("tool result usage accumulates without changing assistant state", () => {
+	const result: ChildResult = {
+		text: "assistant text",
+		exitCode: 0,
+		stderr: "",
+		messages: [],
+		stopReason: "stop",
+		errorMessage: "existing error",
+		model: "provider/model",
+		usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5, contextTokens: 10, turns: 1 },
+	};
+	applyJsonEvent(
+		{
+			type: "message_end",
+			message: {
+				role: "toolResult",
+				toolCallId: "nested-call-1",
+				content: [],
+				usage: {
+					input: 10,
+					output: 20,
+					cacheRead: 30,
+					cacheWrite: 40,
+					totalTokens: 100,
+					cost: { total: 1.25 },
+				},
+			},
+		},
+		{ messages: result.messages, result },
+	);
+	assert.deepEqual(result.usage, {
+		input: 11,
+		output: 22,
+		cacheRead: 33,
+		cacheWrite: 44,
+		cost: 1.75,
+		contextTokens: 10,
+		turns: 1,
+	});
+	assert.equal(result.text, "assistant text");
+	assert.equal(result.model, "provider/model");
+	assert.equal(result.stopReason, "stop");
+	assert.equal(result.errorMessage, "existing error");
+	assert.equal(result.messages.length, 1);
+
+	assert.equal(applyJsonEvent(
+		{
+			type: "tool_result_end",
+			message: {
+				role: "toolResult",
+				toolCallId: "nested-call-1",
+				content: [],
+				usage: {
+					input: 10,
+					output: 20,
+					cacheRead: 30,
+					cacheWrite: 40,
+					totalTokens: 100,
+					cost: { total: 1.25 },
+				},
+			},
+		},
+		{ messages: result.messages, result },
+	), false);
+	assert.equal(result.usage.cost, 1.75);
+	assert.equal(result.messages.length, 1);
+});
+
+test("assistant usage still updates the child result", () => {
+	const result: ChildResult = {
+		text: "",
+		exitCode: 0,
+		stderr: "",
+		messages: [],
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+	};
+	applyJsonEvent(
+		{
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "done" }],
+				provider: "provider",
+				responseModel: "model",
+				stopReason: "stop",
+				usage: {
+					input: 10,
+					output: 20,
+					cacheRead: 30,
+					cacheWrite: 40,
+					totalTokens: 100,
+					cost: { total: 1.25 },
+				},
+			},
+		},
+		{ messages: result.messages, result },
+	);
+	assert.deepEqual(result.usage, {
+		input: 10,
+		output: 20,
+		cacheRead: 30,
+		cacheWrite: 40,
+		cost: 1.25,
+		contextTokens: 100,
+		turns: 1,
+	});
+	assert.equal(result.text, "done");
+	assert.equal(result.model, "provider/model");
+	assert.equal(result.stopReason, "stop");
+});
+
+test("sumChildUsage returns undefined for all-zero usage", () => {
+	assert.equal(sumChildUsage([
+		{ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 10, turns: 1 },
+	]), undefined);
+});
+
+test("sumChildUsage sums token fields and total cost", () => {
+	assert.deepEqual(
+		sumChildUsage([
+			{ input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.25, contextTokens: 10, turns: 1 },
+			{ input: 10, output: 20, cacheRead: 30, cacheWrite: 40, cost: 1.5, contextTokens: 100, turns: 2 },
+		]),
+		{
+			input: 11,
+			output: 22,
+			cacheRead: 33,
+			cacheWrite: 44,
+			totalTokens: 110,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 1.75 },
+		},
+	);
 });
 
 test("child usage reports model, tokens, context, turns, and cost", () => {

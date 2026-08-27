@@ -1,3 +1,4 @@
+import type { Usage } from "@earendil-works/pi-ai";
 import type { TaskDetails, TaskResult } from "../dstack.ts";
 import type { AbsolutePath, OutputArtifactSeal, Sha256 } from "./artifacts.ts";
 import type { CompanionTaskState } from "./eventbus-v1.ts";
@@ -45,6 +46,7 @@ export type CommittedResult =
 		sha256: Sha256;
 		bytes: number;
 		summary: TaskSummary;
+		usage?: Usage;
 	}>
 	| Readonly<{ kind: "cancelled"; message: string }>;
 
@@ -66,6 +68,7 @@ export type DstackResultView =
 		sha256: Sha256;
 		bytes: number;
 		summary: TaskSummary;
+		usage?: Usage;
 	}>
 	| Readonly<{ kind: "runner_failed"; taskId: string; message: string; companionOutputPath: string }>
 	| Readonly<{ kind: "cancelled"; taskId: string; message: string }>
@@ -246,7 +249,16 @@ function projectCommitted(taskId: string, committed: CommittedResult, detail: "s
 				? { kind: "complete", taskId, detail, package: committed.package }
 				: { kind: "complete", taskId, detail, package: summaryPackage(committed) };
 		case "artifact":
-			return { kind: "artifact", taskId, outcome: committed.outcome, path: committed.path, sha256: committed.sha256, bytes: committed.bytes, summary: committed.summary };
+			return {
+				kind: "artifact",
+				taskId,
+				outcome: committed.outcome,
+				path: committed.path,
+				sha256: committed.sha256,
+				bytes: committed.bytes,
+				summary: committed.summary,
+				...(committed.usage !== undefined ? { usage: committed.usage } : {}),
+			};
 		case "cancelled":
 			return { kind: "cancelled", taskId, message: committed.message };
 		default: {

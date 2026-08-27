@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import {
 	buildTreeSnapshot,
+	formatCost,
 	formatElapsed,
 	isLeaseSnapshot,
 	parseActivityV1,
@@ -513,6 +514,7 @@ test("parseTreeSnapshot validates schema at entry renderer boundaries", () => {
 				agent: "general-purpose",
 				state: "succeeded",
 				taskPreview: "done task",
+				cost: 0.042,
 				nested: [],
 			},
 		],
@@ -524,6 +526,24 @@ test("parseTreeSnapshot validates schema at entry renderer boundaries", () => {
 	const parsed = parseTreeSnapshot(valid);
 	assert.ok(parsed !== undefined);
 	assert.equal(parsed.taskId, "task-1");
+	assert.equal(parsed.children[0]?.cost, 0.042);
+
+	const withInvalidCost = {
+		...valid,
+		children: [
+			{
+				index: 0,
+				agent: "general-purpose",
+				state: "succeeded",
+				taskPreview: "done task",
+				cost: -1,
+				nested: [],
+			},
+		],
+	};
+	const parsedInvalidCost = parseTreeSnapshot(withInvalidCost);
+	assert.ok(parsedInvalidCost !== undefined);
+	assert.equal(parsedInvalidCost.children[0]?.cost, undefined);
 
 	assert.equal(parseTreeSnapshot(null), undefined);
 	assert.equal(parseTreeSnapshot({ taskId: 123 }), undefined);
@@ -563,8 +583,20 @@ test("parseActivityV1 validates schema and rejects malformed records", () => {
 		updatedAt: "2025-01-01T00:01:00.000Z",
 		turns: 3,
 		contextTokens: 1200,
+		cost: 0.084,
 	};
 	assert.deepEqual(parseActivityV1(valid), valid);
+
+	const withoutCost = {
+		schemaVersion: "dstack.child-activity.v1",
+		workflowId: "wf-1",
+		index: 0,
+		activity: "running",
+		updatedAt: "2025-01-01T00:01:00.000Z",
+		turns: 1,
+		contextTokens: 100,
+	};
+	assert.deepEqual(parseActivityV1(withoutCost), withoutCost);
 
 	assert.equal(parseActivityV1(null), undefined);
 	assert.equal(parseActivityV1({ ...valid, schemaVersion: "invalid" }), undefined);
@@ -573,6 +605,10 @@ test("parseActivityV1 validates schema and rejects malformed records", () => {
 	assert.equal(parseActivityV1({ ...valid, turns: -1 }), undefined);
 	assert.equal(parseActivityV1({ ...valid, contextTokens: -5 }), undefined);
 	assert.equal(parseActivityV1({ ...valid, updatedAt: "" }), undefined);
+	assert.equal(parseActivityV1({ ...valid, cost: -0.01 }), undefined);
+	assert.equal(parseActivityV1({ ...valid, cost: Number.NaN }), undefined);
+	assert.equal(parseActivityV1({ ...valid, cost: Number.POSITIVE_INFINITY }), undefined);
+	assert.equal(parseActivityV1({ ...valid, cost: "0.084" }), undefined);
 });
 
 test("parseSpawnRecordV1 validates schema and per-child records", () => {
@@ -1348,6 +1384,318 @@ test("buildTreeSnapshot recovers nested model from parent result.json when histo
 	const nested = child.nested[0];
 	assert.ok(nested !== undefined && !isLeaseSnapshot(nested));
 	assert.equal(nested.model, "anthropic/claude-3-5-haiku");
+});
+
+test("formatCost distinguishes known zero cost from unavailable cost", () => {
+	assert.equal(formatCost(0.084), "$0.0840");
+	assert.equal(formatCost(1.25), "$1.2500");
+	assert.equal(formatCost(0.0001), "$0.0001");
+	assert.equal(formatCost(0), "$0.0000");
+	assert.equal(formatCost(-0.5), undefined);
+	assert.equal(formatCost(undefined), undefined);
+	assert.equal(formatCost(Number.NaN), undefined);
+});
+
+test("buildTreeSnapshot calculates direct cost subtracting terminal nested children and preserving running nested costs", async (t) => {
+	const cwd = await temporaryDirectory(t);
+	const artifactDir = join(cwd, "workflows", "wf-cost-calc");
+	const schedulerRoot = join(cwd, "scheduler");
+
+	await mkdir(join(artifactDir, "children", "0", "spawns"), { recursive: true });
+	await mkdir(join(artifactDir, "children", "1", "spawns"), { recursive: true });
+	await mkdir(join(artifactDir, "children", "2", "spawns"), { recursive: true });
+	await mkdir(join(artifactDir, "children", "3"), { recursive: true });
+	await mkdir(join(schedulerRoot, "leases"), { recursive: true });
+
+	const manifest = {
+		schemaVersion: "dstack.workflow.v1",
+		workflowId: "wf-cost-calc",
+		sessionId: "sess-cost",
+		mode: "parallel",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		specs: [
+			{ agent: "poteto-agent", task: "terminal parent" },
+			{ agent: "poteto-agent", task: "live parent" },
+			{ agent: "poteto-agent", task: "zero-cost clamp parent" },
+			{ agent: "general-purpose", task: "legacy no-cost child" },
+		],
+	};
+	await writeFile(join(artifactDir, "manifest.json"), JSON.stringify(manifest), "utf8");
+
+	const child0Spawns = {
+		schemaVersion: "dstack.spawn-record.v1",
+		workflowId: "wf-cost-calc",
+		parentIndex: 0,
+		groupId: "grp-0",
+		mode: "parallel",
+		phase: "implement",
+		createdAt: "2025-01-01T00:01:00.000Z",
+		children: [
+			{
+				nestedIndex: 0,
+				agent: "general-purpose",
+				role: "implementation-worker",
+				assignment: "worker",
+				taskPreview: "worker 1",
+				state: "succeeded",
+				updatedAt: "2025-01-01T00:02:00.000Z",
+				startedAt: "2025-01-01T00:01:00.000Z",
+				endedAt: "2025-01-01T00:02:00.000Z",
+				usage: { input: 500, output: 200, cacheRead: 0, cacheWrite: 0, cost: 0.05, contextTokens: 700, turns: 2 },
+			},
+			{
+				nestedIndex: 1,
+				agent: "general-purpose",
+				role: "implementation-worker",
+				assignment: "worker",
+				taskPreview: "worker 2",
+				state: "failed",
+				updatedAt: "2025-01-01T00:02:00.000Z",
+				startedAt: "2025-01-01T00:01:00.000Z",
+				endedAt: "2025-01-01T00:02:00.000Z",
+				usage: { input: 300, output: 100, cacheRead: 0, cacheWrite: 0, cost: 0.03, contextTokens: 400, turns: 1 },
+			},
+		],
+	};
+	await writeFile(join(artifactDir, "children", "0", "spawns", "grp-0.json"), JSON.stringify(child0Spawns), "utf8");
+	await writeFile(join(artifactDir, "children", "0", "result.json"), JSON.stringify({
+		schemaVersion: "dstack.child-result.v1",
+		workflowId: "wf-cost-calc",
+		index: 0,
+		state: "succeeded",
+		result: {
+			agent: "poteto-agent",
+			text: "done",
+			usage: { input: 1200, output: 500, cacheRead: 0, cacheWrite: 0, cost: 0.12, contextTokens: 1700, turns: 5 },
+		},
+	}), "utf8");
+
+	const child1Spawns = {
+		schemaVersion: "dstack.spawn-record.v1",
+		workflowId: "wf-cost-calc",
+		parentIndex: 1,
+		groupId: "grp-1",
+		mode: "parallel",
+		phase: "implement",
+		createdAt: "2025-01-01T00:01:00.000Z",
+		children: [
+			{
+				nestedIndex: 0,
+				agent: "general-purpose",
+				role: "implementation-worker",
+				assignment: "worker",
+				taskPreview: "running nested worker",
+				state: "running",
+				updatedAt: "2025-01-01T00:01:30.000Z",
+				startedAt: "2025-01-01T00:01:00.000Z",
+				usage: { input: 200, output: 100, cacheRead: 0, cacheWrite: 0, cost: 0.02, contextTokens: 300, turns: 1 },
+			},
+			{
+				nestedIndex: 1,
+				agent: "general-purpose",
+				role: "implementation-worker",
+				assignment: "worker",
+				taskPreview: "completed nested worker",
+				state: "succeeded",
+				updatedAt: "2025-01-01T00:01:20.000Z",
+				startedAt: "2025-01-01T00:01:00.000Z",
+				endedAt: "2025-01-01T00:01:20.000Z",
+				usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: 0.01, contextTokens: 150, turns: 1 },
+			},
+		],
+	};
+	await writeFile(join(artifactDir, "children", "1", "spawns", "grp-1.json"), JSON.stringify(child1Spawns), "utf8");
+	await writeFile(join(artifactDir, "children", "1", "activity.json"), JSON.stringify({
+		schemaVersion: "dstack.child-activity.v1",
+		workflowId: "wf-cost-calc",
+		index: 1,
+		activity: "waiting on nested worker",
+		updatedAt: "2025-01-01T00:01:45.000Z",
+		turns: 3,
+		contextTokens: 1000,
+		cost: 0.06,
+	}), "utf8");
+
+	const child2Spawns = {
+		schemaVersion: "dstack.spawn-record.v1",
+		workflowId: "wf-cost-calc",
+		parentIndex: 2,
+		groupId: "grp-2",
+		mode: "single",
+		createdAt: "2025-01-01T00:01:00.000Z",
+		children: [
+			{
+				nestedIndex: 0,
+				agent: "general-purpose",
+				taskPreview: "worker",
+				state: "succeeded",
+				updatedAt: "2025-01-01T00:02:00.000Z",
+				usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, contextTokens: 150, turns: 1 },
+			},
+		],
+	};
+	await writeFile(join(artifactDir, "children", "2", "spawns", "grp-2.json"), JSON.stringify(child2Spawns), "utf8");
+	await writeFile(join(artifactDir, "children", "2", "result.json"), JSON.stringify({
+		schemaVersion: "dstack.child-result.v1",
+		workflowId: "wf-cost-calc",
+		index: 2,
+		state: "succeeded",
+		result: {
+			agent: "poteto-agent",
+			text: "done",
+			usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: 0.05, contextTokens: 150, turns: 1 },
+		},
+	}), "utf8");
+
+	await writeFile(join(artifactDir, "children", "3", "result.json"), JSON.stringify({
+		schemaVersion: "dstack.child-result.v1",
+		workflowId: "wf-cost-calc",
+		index: 3,
+		state: "succeeded",
+		result: {
+			agent: "general-purpose",
+			text: "legacy done",
+		},
+	}), "utf8");
+
+	const snapshot = await buildTreeSnapshot({
+		taskId: "task-cost-calc",
+		workflowId: "wf-cost-calc",
+		artifactDir,
+		schedulerRoot,
+		activeLeases: [
+			{
+				workflowId: "wf-cost-calc",
+				childId: "1",
+				depth: 1,
+				acquiredAt: "2025-01-01T00:00:00.000Z",
+			},
+			{
+				workflowId: "wf-cost-calc",
+				childId: "grp-1-0",
+				depth: 2,
+				acquiredAt: "2025-01-01T00:01:00.000Z",
+			},
+		],
+		now: new Date("2025-01-01T00:02:00.000Z"),
+	});
+
+	assert.ok(snapshot !== undefined);
+
+	const child0 = snapshot.children[0];
+	assert.ok(child0 !== undefined);
+	assert.equal(child0.cost, 0.04);
+	assert.equal(child0.nested.length, 2);
+	const c0n0 = child0.nested[0];
+	assert.ok(c0n0 !== undefined && !isLeaseSnapshot(c0n0));
+	assert.equal(c0n0.usage?.cost, 0.05);
+	const c0n1 = child0.nested[1];
+	assert.ok(c0n1 !== undefined && !isLeaseSnapshot(c0n1));
+	assert.equal(c0n1.usage?.cost, 0.03);
+
+	const child1 = snapshot.children[1];
+	assert.ok(child1 !== undefined);
+	assert.equal(child1.state, "running");
+	assert.equal(child1.cost, 0.06);
+	const c1n0 = child1.nested[0];
+	assert.ok(c1n0 !== undefined && !isLeaseSnapshot(c1n0));
+	assert.equal(c1n0.state, "running");
+	assert.equal(c1n0.usage?.cost, 0.02);
+	const c1n1 = child1.nested[1];
+	assert.ok(c1n1 !== undefined && !isLeaseSnapshot(c1n1));
+	assert.equal(c1n1.state, "succeeded");
+	assert.equal(c1n1.usage?.cost, 0.01);
+
+	assert.equal(snapshot.children[2]?.cost, undefined);
+	assert.equal(snapshot.children[3]?.cost, undefined);
+});
+
+test("renderTreeLines formats known costs and omits unavailable costs", () => {
+	const snapshot: TreeSnapshot = {
+		taskId: "task-render-cost",
+		workflowId: "wf-render-cost",
+		mode: "single",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		committed: false,
+		counts: { queued: 0, running: 1, complete: 0, total: 1 },
+		slots: { active: 1, capacity: 4 },
+		capturedAt: "2025-01-01T00:03:00.000Z",
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		children: [
+			{
+				index: 0,
+				agent: "poteto-agent",
+				state: "running",
+				assignment: "owner",
+				taskPreview: "orchestrator",
+				startedAt: "2025-01-01T00:00:00.000Z",
+				cost: 0.084,
+				nestedGroups: [],
+				nested: [
+					{
+						groupId: "g-1",
+						nestedIndex: 0,
+						agent: "general-purpose",
+						assignment: "worker",
+						taskPreview: "worker with cost",
+						state: "succeeded",
+						activity: "completed work",
+						startedAt: "2025-01-01T00:01:00.000Z",
+						endedAt: "2025-01-01T00:01:45.000Z",
+						updatedAt: "2025-01-01T00:01:45.000Z",
+						live: false,
+						usage: { input: 500, output: 200, cacheRead: 0, cacheWrite: 0, cost: 0.042, contextTokens: 700, turns: 2 },
+					},
+					{
+						groupId: "g-1",
+						nestedIndex: 1,
+						agent: "general-purpose",
+						assignment: "worker",
+						taskPreview: "worker with zero cost",
+						state: "succeeded",
+						activity: "free work",
+						startedAt: "2025-01-01T00:02:00.000Z",
+						endedAt: "2025-01-01T00:02:30.000Z",
+						updatedAt: "2025-01-01T00:02:30.000Z",
+						live: false,
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 1 },
+					},
+					{
+						groupId: "g-1",
+						nestedIndex: 2,
+						agent: "general-purpose",
+						assignment: "worker",
+						taskPreview: "worker without usage",
+						state: "succeeded",
+						activity: "legacy work",
+						startedAt: "2025-01-01T00:02:00.000Z",
+						endedAt: "2025-01-01T00:02:30.000Z",
+						updatedAt: "2025-01-01T00:02:30.000Z",
+						live: false,
+					},
+					{
+						workflowId: "wf-render-cost",
+						childId: "g-1-3",
+						depth: 2,
+						acquiredAt: "2025-01-01T00:02:40.000Z",
+					},
+				],
+			},
+		],
+	};
+
+	const lines = renderTreeLines(snapshot, {
+		width: 100,
+		maxLines: Infinity,
+		now: new Date("2025-01-01T00:03:00.000Z"),
+	});
+
+	assert.ok(lines.some((l) => l.includes("owner poteto-agent 3m00s $0.0840 orchestrator")), `Expected top-level cost in: ${lines.join("\n")}`);
+	assert.ok(lines.some((l) => l.includes("worker general-purpose (0m45s) $0.0420 — completed work")), `Expected nested cost in: ${lines.join("\n")}`);
+	assert.ok(lines.some((l) => l.includes("worker general-purpose (0m30s) $0.0000 — free work")), `Expected known zero cost in: ${lines.join("\n")}`);
+	assert.ok(lines.some((l) => l.includes("worker general-purpose (0m30s) — legacy work")), `Expected unavailable cost omission in: ${lines.join("\n")}`);
+	assert.ok(lines.some((l) => l.includes("agent details pending (0m20s)")), `Expected lease row in: ${lines.join("\n")}`);
 });
 
 test("buildTreeSnapshot preserves invocation group identity and orders groups chronologically (oldest at top)", async (t) => {

@@ -375,6 +375,7 @@ export async function executeWorkflow(
 							updatedAt: new Date().toISOString(),
 							turns: partial.usage.turns,
 							contextTokens: partial.usage.contextTokens,
+							cost: partial.usage.cost,
 						});
 						journalUpdates = journalUpdates.then(async () => {
 							recorder.recordMessages(partial.messages);

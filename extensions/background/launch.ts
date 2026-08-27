@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFile, readdir, realpath } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { AgentConfig } from "../agents.ts";
@@ -181,6 +181,7 @@ export function createTaskResultFiles(sessionId: string): Readonly<{
 	readBinding: (taskId: string) => Promise<TaskBinding | undefined>;
 	readProgress: (binding: TaskBinding) => Promise<WorkflowProgress>;
 	readCommittedResult: (binding: TaskBinding) => Promise<CommittedResult | undefined>;
+	claimUsage: (binding: TaskBinding) => Promise<boolean>;
 }> {
 	const currentRoot = sessionRoot(sessionId);
 	const bgRoot = backgroundRoot();
@@ -314,6 +315,15 @@ export function createTaskResultFiles(sessionId: string): Readonly<{
 				...base,
 				...(children && children.length > 0 ? { children } : {}),
 			};
+		},
+		async claimUsage(binding) {
+			try {
+				await mkdir(join(workflowDir(binding), "USAGE_REPORTED"));
+				return true;
+			} catch (error) {
+				if (typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST") return false;
+				throw error;
+			}
 		},
 		async readCommittedResult(binding) {
 			const artifactDir = workflowDir(binding);

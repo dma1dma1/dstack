@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { constants, existsSync } from "node:fs";
 import { access, realpath, stat } from "node:fs/promises";
 import { basename, delimiter, join } from "node:path";
+import type { Usage } from "@earendil-works/pi-ai";
 import {
 	ASSIGNMENT_ENV,
 	COMMENT_SICKO_TOOLS,
@@ -267,6 +268,7 @@ export type ChildContentPart =
 export type ChildMessage = {
 	role: string;
 	content: ChildContentPart[];
+	toolCallId?: string;
 	stopReason?: string;
 	errorMessage?: string;
 	provider?: string;
@@ -302,6 +304,23 @@ export type ChildResult = {
 	model?: string;
 	usage: ChildUsage;
 };
+
+export function sumChildUsage(usages: readonly ChildUsage[]): Usage | undefined {
+	const input = usages.reduce((total, usage) => total + usage.input, 0);
+	const output = usages.reduce((total, usage) => total + usage.output, 0);
+	const cacheRead = usages.reduce((total, usage) => total + usage.cacheRead, 0);
+	const cacheWrite = usages.reduce((total, usage) => total + usage.cacheWrite, 0);
+	const total = usages.reduce((sum, usage) => sum + usage.cost, 0);
+	if (input === 0 && output === 0 && cacheRead === 0 && cacheWrite === 0 && total === 0) return undefined;
+	return {
+		input,
+		output,
+		cacheRead,
+		cacheWrite,
+		totalTokens: input + output + cacheRead + cacheWrite,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total },
+	};
+}
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -352,6 +371,7 @@ function parseMessage(value: unknown): ChildMessage | undefined {
 	return {
 		role: value.role,
 		content,
+		toolCallId: optionalString(value.toolCallId),
 		stopReason: optionalString(value.stopReason),
 		errorMessage: optionalString(value.errorMessage),
 		provider: optionalString(value.provider),
@@ -425,8 +445,21 @@ export function applyJsonEvent(event: unknown, state: { messages: ChildMessage[]
 	if (event.type !== "message_end" && event.type !== "tool_result_end") return false;
 	const message = parseMessage(event.message);
 	if (!message) return false;
+	if (
+		message.role === "toolResult" &&
+		message.toolCallId !== undefined &&
+		state.messages.some((existing) => existing.role === "toolResult" && existing.toolCallId === message.toolCallId)
+	) return false;
 	state.messages.push(message);
 	state.result.messages = state.messages;
+	if (message.role === "toolResult" && message.usage) {
+		state.result.usage.input += message.usage.input ?? 0;
+		state.result.usage.output += message.usage.output ?? 0;
+		state.result.usage.cacheRead += message.usage.cacheRead ?? 0;
+		state.result.usage.cacheWrite += message.usage.cacheWrite ?? 0;
+		state.result.usage.cost += message.usage.cost?.total ?? 0;
+		return true;
+	}
 	if (message.role !== "assistant") return true;
 	state.result.usage.turns += 1;
 	const usage = message.usage;
