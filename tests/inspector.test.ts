@@ -7,6 +7,7 @@ import {
 	AgentInspector,
 	boundedTailRead,
 	buildAgentInspection,
+	deriveInspectorLayoutMetrics,
 	listSessionWorkflows,
 	parseChildResultDetails,
 	readChildActivityDetails,
@@ -1699,5 +1700,352 @@ test("AgentInspector renders Model: unavailable for historical records without s
 	assert.ok(lines.some((l) => l.includes("Agent:") && l.includes("general-purpose") && l.includes("depth 2")));
 	assert.ok(lines.some((l) => l.includes("Model:") && l.includes("unavailable")));
 	assert.ok(!lines.some((l) => l.includes("Model:") && l.includes("implementation-worker")));
+	inspector.dispose();
+});
+
+test("deriveInspectorLayoutMetrics derives metrics across viewport sizes and provides backward-compatible fallback", () => {
+	const fallback = deriveInspectorLayoutMetrics(undefined);
+	assert.equal(fallback.terminalRows, 26);
+	assert.equal(fallback.frameHeight, 23);
+	assert.equal(fallback.bodyRows, 16);
+	assert.equal(fallback.listVisibleRows, 14);
+	assert.equal(fallback.summaryVisibleRows, 14);
+	assert.equal(fallback.taskVisibleRows, 14);
+	assert.equal(fallback.finalVisibleRows, 12);
+	assert.equal(fallback.rawVisibleRows, 12);
+
+	const tall = deriveInspectorLayoutMetrics(60);
+	assert.equal(tall.terminalRows, 60);
+	assert.equal(tall.frameHeight, 54);
+	assert.equal(tall.bodyRows, 47);
+	assert.equal(tall.listVisibleRows, 45);
+	assert.equal(tall.summaryVisibleRows, 45);
+	assert.equal(tall.taskVisibleRows, 44);
+	assert.equal(tall.finalVisibleRows, 43);
+	assert.equal(tall.rawVisibleRows, 43);
+
+	const small = deriveInspectorLayoutMetrics(15);
+	assert.equal(small.terminalRows, 15);
+	assert.equal(small.frameHeight, 13);
+	assert.equal(small.bodyRows, 6);
+	assert.equal(small.listVisibleRows, 4);
+	assert.equal(small.summaryVisibleRows, 4);
+	assert.equal(small.taskVisibleRows, 3);
+	assert.equal(small.finalVisibleRows, 2);
+	assert.equal(small.rawVisibleRows, 2);
+
+	const minimal = deriveInspectorLayoutMetrics(4);
+	assert.equal(minimal.terminalRows, 8);
+	assert.equal(minimal.frameHeight, 8);
+	assert.equal(minimal.bodyRows, 1);
+	assert.equal(minimal.listVisibleRows, 1);
+	assert.equal(minimal.summaryVisibleRows, 1);
+	assert.equal(minimal.taskVisibleRows, 1);
+	assert.equal(minimal.finalVisibleRows, 1);
+	assert.equal(minimal.rawVisibleRows, 1);
+});
+
+test("AgentInspector renders width above 118 columns without clamping", async () => {
+	const inspector = new AgentInspector({ requestRender: () => {} }, plainTheme(), () => {}, {
+		sessionId: "test-sess",
+		listWorkflows: async () => [],
+	});
+
+	const wide160 = inspector.render(160);
+	assert.ok(wide160.length > 0);
+	assert.ok(wide160[0]?.includes("─".repeat(158)));
+
+	const wide200 = inspector.render(200);
+	assert.ok(wide200.length > 0);
+	assert.ok(wide200[0]?.includes("─".repeat(198)));
+
+	inspector.dispose();
+});
+
+test("AgentInspector grows frame and view budgets on tall viewports", async () => {
+	const snapshot: TreeSnapshot = {
+		workflowId: "wf-tall",
+		taskId: "task-tall",
+		mode: "single",
+		committed: false,
+		createdAt: "2025-01-01T00:00:00.000Z",
+		counts: { queued: 0, total: 1, running: 1, complete: 0 },
+		slots: { active: 1, capacity: 4 },
+		playbook: "feature",
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		children: [
+			{
+				index: 0,
+				agent: "poteto-agent",
+				state: "running",
+				startedAt: "2025-01-01T00:00:01.000Z",
+				taskPreview: "tall viewport task",
+				assignment: "owner",
+				phase: "implement",
+				nested: [],
+			},
+		],
+		capturedAt: "2025-01-01T00:01:00.000Z",
+	};
+
+	const inspector = new AgentInspector({ requestRender: () => {} }, plainTheme(), () => {}, {
+		sessionId: "test-sess",
+		initialTaskId: "task-tall",
+		terminalRows: 60,
+		listWorkflows: async () => [
+			{
+				workflowId: "wf-tall",
+				taskId: "task-tall",
+				artifactDir: "/tmp/wf-tall",
+				schedulerRoot: "/tmp/scheduler",
+				committed: false,
+				createdAt: "2025-01-01T00:00:00.000Z",
+				playbook: "feature",
+				unreadable: false,
+			},
+		],
+		getSnapshot: async () => snapshot,
+	});
+
+	await new Promise((r) => setTimeout(r, 20));
+
+	assert.equal(inspector.layoutMetrics.terminalRows, 60);
+	assert.equal(inspector.layoutMetrics.frameHeight, 54);
+	assert.equal(inspector.layoutMetrics.bodyRows, 47);
+
+	const summaryLines = inspector.render(100);
+	assert.equal(summaryLines.length, 54);
+	assert.ok(summaryLines[0]?.includes("╭"));
+	assert.ok(summaryLines[summaryLines.length - 1]?.includes("╰"));
+	assert.ok(summaryLines[summaryLines.length - 2]?.includes("Esc/← back"));
+
+	inspector.handleInput("t");
+	const taskLines = inspector.render(100);
+	assert.equal(taskLines.length, 54);
+	assert.ok(taskLines[taskLines.length - 2]?.includes("Esc/← back"));
+
+	inspector.handleInput("f");
+	const finalLines = inspector.render(100);
+	assert.equal(finalLines.length, 54);
+	assert.ok(finalLines[finalLines.length - 2]?.includes("Esc/← back"));
+
+	inspector.handleInput("o");
+	const rawLines = inspector.render(100);
+	assert.equal(rawLines.length, 54);
+	assert.ok(rawLines[rawLines.length - 2]?.includes("Esc/← back"));
+
+	inspector.handleInput("\x1b[D");
+	const listLines = inspector.render(100);
+	assert.equal(listLines.length, 54);
+	assert.ok(listLines[listLines.length - 2]?.includes("Esc/q close"));
+
+	inspector.dispose();
+});
+
+test("AgentInspector bounds frame and preserves borders, footer, and scrolling on small viewports", async () => {
+	const children = Array.from({ length: 10 }, (_, i) => ({
+		index: i,
+		agent: "poteto-agent",
+		state: "running" as const,
+		startedAt: "2025-01-01T00:00:01.000Z",
+		taskPreview: `step ${i + 1} task preview description`,
+		assignment: "worker" as const,
+		phase: `phase-${i + 1}`,
+		nested: [],
+	}));
+
+	const snapshot: TreeSnapshot = {
+		workflowId: "wf-small",
+		taskId: "task-small",
+		mode: "parallel",
+		committed: false,
+		createdAt: "2025-01-01T00:00:00.000Z",
+		counts: { queued: 0, total: 10, running: 10, complete: 0 },
+		slots: { active: 4, capacity: 4 },
+		playbook: "feature",
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		children,
+		capturedAt: "2025-01-01T00:01:00.000Z",
+	};
+
+	const inspector = new AgentInspector({ requestRender: () => {} }, plainTheme(), () => {}, {
+		sessionId: "test-sess",
+		terminalRows: 15,
+		listWorkflows: async () => [
+			{
+				workflowId: "wf-small",
+				taskId: "task-small",
+				artifactDir: "/tmp/wf-small",
+				schedulerRoot: "/tmp/scheduler",
+				committed: false,
+				createdAt: "2025-01-01T00:00:00.000Z",
+				playbook: "feature",
+				unreadable: false,
+			},
+		],
+		getSnapshot: async () => snapshot,
+	});
+
+	await new Promise((r) => setTimeout(r, 20));
+
+	assert.equal(inspector.layoutMetrics.terminalRows, 15);
+	assert.equal(inspector.layoutMetrics.frameHeight, 13);
+	assert.equal(inspector.layoutMetrics.bodyRows, 6);
+	assert.equal(inspector.layoutMetrics.listVisibleRows, 4);
+
+	const initialList = inspector.render(100);
+	assert.equal(initialList.length, 13);
+	assert.ok(initialList[0]?.includes("╭"));
+	assert.ok(initialList[12]?.includes("╰"));
+	assert.ok(initialList[11]?.includes("Esc/q close"));
+
+	inspector.handleInput("\x1b[B");
+	inspector.handleInput("\x1b[B");
+	inspector.handleInput("\x1b[B");
+	inspector.handleInput("\x1b[B");
+	inspector.handleInput("\x1b[B");
+
+	const scrolledList = inspector.render(100);
+	assert.equal(scrolledList.length, 13);
+	assert.ok(scrolledList[0]?.includes("╭"));
+	assert.ok(scrolledList[12]?.includes("╰"));
+	assert.ok(scrolledList[11]?.includes("Esc/q close"));
+
+	inspector.handleInput("\r");
+	const smallDetail = inspector.render(100);
+	assert.equal(smallDetail.length, 13);
+	assert.ok(smallDetail[0]?.includes("╭"));
+	assert.ok(smallDetail[12]?.includes("╰"));
+	assert.ok(smallDetail[11]?.includes("Esc/← back"));
+
+	inspector.handleInput("\x1b[B");
+	inspector.handleInput("\x1b[B");
+	const scrolledDetail = inspector.render(100);
+	assert.equal(scrolledDetail.length, 13);
+	assert.ok(scrolledDetail[11]?.includes("Esc/← back"));
+
+	inspector.handleInput("f");
+	const smallFinal = inspector.render(100);
+	assert.equal(smallFinal.length, 13);
+	assert.ok(smallFinal[9]?.includes("lines 1-1 of 1"));
+	assert.ok(smallFinal[11]?.includes("Esc/← back"));
+	assert.ok(smallFinal[12]?.includes("╰"));
+
+	inspector.dispose();
+});
+
+test("AgentInspector calculates Final view row budget with fully populated envelope and scrolls without truncation", async () => {
+	const snapshot: TreeSnapshot = {
+		workflowId: "wf-final-populated",
+		taskId: "task-final-populated",
+		mode: "single",
+		committed: true,
+		createdAt: "2025-01-01T00:00:00.000Z",
+		counts: { queued: 0, total: 1, running: 0, complete: 1 },
+		slots: { active: 0, capacity: 4 },
+		playbook: "feature",
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		children: [
+			{
+				index: 0,
+				agent: "poteto-agent",
+				state: "succeeded",
+				startedAt: "2025-01-01T00:00:01.000Z",
+				endedAt: "2025-01-01T00:01:00.000Z",
+				taskPreview: "task preview",
+				assignment: "owner",
+				phase: "implement",
+				nested: [],
+			},
+		],
+		capturedAt: "2025-01-01T00:01:00.000Z",
+	};
+
+	const populatedResultDetails = {
+		state: "succeeded" as const,
+		exitCode: 0,
+		stopReason: "completed",
+		model: "anthropic/claude-3-7-sonnet",
+		summaryText: Array.from({ length: 20 }, (_, i) => `Final response paragraph line ${i + 1}`).join("\n"),
+		outputSeal: {
+			path: "/tmp/workflows/wf-final-populated/children/0/output.txt",
+			sha256: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+			bytes: 1234,
+		},
+		usage: {
+			input: 8000,
+			output: 2000,
+			cacheRead: 1000,
+			cacheWrite: 500,
+			turns: 5,
+			contextTokens: 12000,
+			cost: 0.045,
+		},
+		errorMessage: "Recovered non-fatal diagnostic warning",
+		stderr: "Standard error log line 1\nStandard error log line 2",
+	};
+
+	let liveTerminalRows = 26;
+	const inspector = new AgentInspector({ requestRender: () => {} }, plainTheme(), () => {}, {
+		sessionId: "test-sess",
+		initialTaskId: "task-final-populated",
+		initialView: "final",
+		terminalRows: () => liveTerminalRows,
+		listWorkflows: async () => [
+			{
+				workflowId: "wf-final-populated",
+				taskId: "task-final-populated",
+				artifactDir: "/tmp/wf-final-populated",
+				schedulerRoot: "/tmp/scheduler",
+				committed: true,
+				createdAt: "2025-01-01T00:00:00.000Z",
+				playbook: "feature",
+				unreadable: false,
+			},
+		],
+		getSnapshot: async () => snapshot,
+		readChildResult: async () => populatedResultDetails,
+	});
+
+	await new Promise((r) => setTimeout(r, 20));
+
+	const lines = inspector.render(100);
+	assert.equal(lines.length, 23);
+	assert.ok(lines[0]?.includes("╭"));
+	assert.ok(lines[22]?.includes("╰"));
+	assert.ok(lines[21]?.includes("Esc/← back"));
+
+	assert.ok(lines[19]?.includes("lines 1-7 of 20"));
+	assert.ok(lines[19]?.includes("↑/↓ PgUp/PgDn scroll"));
+	assert.ok(lines.some((l) => l.includes("Final response paragraph line 1")));
+	assert.ok(lines.some((l) => l.includes("Final response paragraph line 7")));
+	assert.ok(!lines.some((l) => l.includes("Final response paragraph line 8")));
+
+	inspector.handleInput("\x1b[B");
+	const scrolled1 = inspector.render(100);
+	assert.equal(scrolled1.length, 23);
+	assert.ok(scrolled1[19]?.includes("lines 2-8 of 20"));
+	assert.ok(!scrolled1.some((l) => l.includes("Final response paragraph line 1")));
+	assert.ok(scrolled1.some((l) => l.includes("Final response paragraph line 2")));
+	assert.ok(scrolled1.some((l) => l.includes("Final response paragraph line 8")));
+
+	inspector.handleInput("\x1b[F");
+	const atBottom = inspector.render(100);
+	assert.equal(atBottom.length, 23);
+	assert.ok(atBottom[19]?.includes("lines 14-20 of 20"));
+	assert.ok(atBottom.some((l) => l.includes("Final response paragraph line 14")));
+	assert.ok(atBottom.some((l) => l.includes("Final response paragraph line 20")));
+
+	liveTerminalRows = 60;
+	inspector.handleInput("\x1b[H");
+	const tallLines = inspector.render(100);
+	assert.equal(tallLines.length, 54);
+	assert.ok(tallLines[50]?.includes("lines 1-20 of 20"));
+	assert.ok(tallLines.some((l) => l.includes("Final response paragraph line 1")));
+	assert.ok(tallLines.some((l) => l.includes("Final response paragraph line 20")));
+
 	inspector.dispose();
 });
