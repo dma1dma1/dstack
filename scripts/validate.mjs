@@ -89,6 +89,25 @@ async function runOk(id, cmd, args, opts = {}) {
 	}
 }
 
+async function waitForTask(pi, receipt, ctx, timeoutMs = 60000) {
+	const taskId = receipt.details?.taskId;
+	if (!taskId) return undefined;
+	const resultTool = pi.tools.get("dstack_result");
+	const deadline = Date.now() + timeoutMs;
+	let result;
+	while (Date.now() < deadline) {
+		result = await resultTool.execute("validate-result", { taskId, detail: "full" }, undefined, undefined, ctx);
+		if (result.details?.kind === "complete") return result;
+		if (["artifact", "cancelled", "runner_failed", "unknown_task"].includes(result.details?.kind)) return result;
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	}
+	return result;
+}
+
+function completedPackage(result) {
+	return result?.details?.kind === "complete" ? result.details.package : undefined;
+}
+
 function makeCtx(overrides = {}) {
 	const status = {};
 	const notifies = [];
@@ -395,8 +414,10 @@ async function main() {
 	const sessions = await pi.tools.get("dstack_sessions").execute("9", {}, undefined, undefined, ctx);
 	assert("sessions-lists", !sessions.isError, sessions.content[0].text.slice(0, 160));
 
-	const childRecordCount = () => readdirSync(process.env.DSTACK_VALIDATE_DIR).filter((file) => file.endsWith(".json")).length;
-	const beforeNested = childRecordCount();
+	const childRecords = () => readdirSync(process.env.DSTACK_VALIDATE_DIR).filter((file) => file.endsWith(".json"));
+	const childRecordCount = () => childRecords().length;
+	const beforeNestedKids = new Set(childRecords());
+	const beforeNested = beforeNestedKids.size;
 	process.env.DSTACK_NESTING = "1";
 	const nested = await pi.tools.get("dstack_task").execute(
 		"10",
@@ -405,9 +426,15 @@ async function main() {
 		undefined,
 		ctx,
 	);
+	const nestedDeadline = Date.now() + 15000;
+	while (childRecordCount() < beforeNested + 1 && Date.now() < nestedDeadline) {
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	}
 	assert("nesting-depth-1-spawns", !nested.isError && childRecordCount() === beforeNested + 1, nested.content[0].text);
-	const nestedKids = readdirSync(process.env.DSTACK_VALIDATE_DIR).filter((file) => file.endsWith(".json"));
-	const nestedKid = JSON.parse(readFileSync(join(process.env.DSTACK_VALIDATE_DIR, nestedKids.at(-1)), "utf8"));
+	const newNestedKid = childRecords().find((file) => !beforeNestedKids.has(file));
+	const nestedKid = newNestedKid
+		? JSON.parse(readFileSync(join(process.env.DSTACK_VALIDATE_DIR, newNestedKid), "utf8"))
+		: {};
 	assert("nesting-depth-2-env", nestedKid.nesting === "2", String(nestedKid.nesting));
 
 	const beforeTerminal = childRecordCount();
@@ -440,20 +467,22 @@ async function main() {
 		malformedDepth.content[0].text,
 	);
 
-	// Root groups now launch through the background-task companion. Keep these
-	// child-process assertions on the unchanged depth-1 synchronous path.
 	process.env.DSTACK_NESTING = "1";
-	const single = await pi.tools.get("dstack_task").execute(
+	const taskTool = pi.tools.get("dstack_task");
+	const beforeSingleKids = new Set(childRecords());
+	const single = await taskTool.execute(
 		"11",
 		{ agent: "general-purpose", task: "list tools you have", tools: "read,grep,find,ls" },
 		undefined,
 		undefined,
 		ctx,
 	);
-	assert("spawn-single", !single.isError && single.content[0].text.includes("child-ok"), single.content[0].text);
-	const renderedSingle = pi.tools
-		.get("dstack_task")
-		.renderResult(single, { expanded: false }, { fg: (_color, text) => text })
+	const singleCompleted = await waitForTask(pi, single, ctx);
+	const singlePackage = completedPackage(singleCompleted);
+	const singleResult = singlePackage?.results?.[0];
+	assert("spawn-single", !single.isError && singleResult?.text.includes("child-ok"), singleResult?.text ?? single.content[0].text);
+	const renderedSingle = taskTool
+		.renderResult({ ...(singleCompleted ?? single), details: singlePackage }, { expanded: false }, { fg: (_color, text) => text })
 		.render(160)
 		.join("\n");
 	assert(
@@ -461,14 +490,16 @@ async function main() {
 		renderedSingle.includes("general-purpose: 1 turn ↑1 ↓1 ctx:2 fake-router/concrete-child"),
 		renderedSingle,
 	);
-	const kids = readdirSync(process.env.DSTACK_VALIDATE_DIR).filter((f) => f.endsWith(".json"));
-	const lastKid = JSON.parse(readFileSync(join(process.env.DSTACK_VALIDATE_DIR, kids.at(-1)), "utf8"));
+	const singleKidFile = childRecords().find((file) => !beforeSingleKids.has(file));
+	const lastKid = singleKidFile
+		? JSON.parse(readFileSync(join(process.env.DSTACK_VALIDATE_DIR, singleKidFile), "utf8"))
+		: {};
 	assert("child-no-extensions", lastKid.noExtensions === true);
 	assert("child-explicit-dstack", lastKid.explicitExtension === join(root, "extensions/dstack.ts"), String(lastKid.explicitExtension));
 	assert("child-nesting-env", lastKid.nesting === "2");
-	assert("child-tools-allowlist", lastKid.tools === "read,grep,find,ls", String(lastKid.tools));
+	assert("child-tools-allowlist", lastKid.tools === "read,grep,find,ls,dstack_status", String(lastKid.tools));
 
-	const parallel = await pi.tools.get("dstack_task").execute(
+	const parallel = await taskTool.execute(
 		"12",
 		{
 			tasks: [
@@ -480,14 +511,18 @@ async function main() {
 		undefined,
 		ctx,
 	);
+	const parallelCompleted = await waitForTask(pi, parallel, ctx);
+	const parallelPackage = completedPackage(parallelCompleted);
+	const parallelResults = parallelPackage?.results ?? [];
 	assert(
 		"spawn-parallel",
-		!parallel.isError && parallel.content[0].text.includes("[general-purpose]") && parallel.content[0].text.includes("[comment-sicko]"),
-		parallel.content[0].text.slice(0, 200),
+		!parallel.isError &&
+			parallelResults.some((result) => result.agent === "general-purpose" && result.text.includes("child-ok")) &&
+			parallelResults.some((result) => result.agent === "comment-sicko" && result.text.includes("child-ok")),
+		parallelResults.map((result) => `[${result.agent}] ${result.text}`).join("\n").slice(0, 200),
 	);
-	const renderedParallel = pi.tools
-		.get("dstack_task")
-		.renderResult(parallel, { expanded: false }, { fg: (_color, text) => text })
+	const renderedParallel = taskTool
+		.renderResult({ ...(parallelCompleted ?? parallel), details: parallelPackage }, { expanded: false }, { fg: (_color, text) => text })
 		.render(160)
 		.join("\n");
 	assert(
@@ -497,7 +532,7 @@ async function main() {
 		renderedParallel.slice(-300),
 	);
 
-	const chain = await pi.tools.get("dstack_task").execute(
+	const chain = await taskTool.execute(
 		"12b",
 		{
 			chain: [
@@ -509,9 +544,10 @@ async function main() {
 		undefined,
 		ctx,
 	);
-	const renderedChain = pi.tools
-		.get("dstack_task")
-		.renderResult(chain, { expanded: false }, { fg: (_color, text) => text })
+	const chainCompleted = await waitForTask(pi, chain, ctx);
+	const chainPackage = completedPackage(chainCompleted);
+	const renderedChain = taskTool
+		.renderResult({ ...(chainCompleted ?? chain), details: chainPackage }, { expanded: false }, { fg: (_color, text) => text })
 		.render(160)
 		.join("\n");
 	assert(
@@ -523,7 +559,8 @@ async function main() {
 
 	const repo = await makeRepo();
 	const parentBefore = await git(["status", "--porcelain"], repo);
-	const wt = await pi.tools.get("dstack_task").execute(
+	const wtCtx = { ...ctx, cwd: repo };
+	const wt = await taskTool.execute(
 		"13",
 		{
 			tasks: [
@@ -533,10 +570,11 @@ async function main() {
 		},
 		undefined,
 		undefined,
-		{ ...ctx, cwd: repo },
+		wtCtx,
 	);
+	const wtCompleted = await waitForTask(pi, wt, wtCtx);
 	const parentAfter = await git(["status", "--porcelain"], repo);
-	const results = wt.details?.results ?? [];
+	const results = completedPackage(wtCompleted)?.results ?? [];
 	const dests = results.map((r) => r.cwd);
 	assert("worktree-two-dests", dests.length === 2 && dests[0] !== dests[1] && dests.every((d) => d !== repo), dests.join(" | "));
 	assert(
@@ -547,14 +585,18 @@ async function main() {
 	assert("worktree-not-dot", dests.every((d) => d !== "." && d !== repo));
 
 	const notGit = await mkdtemp(join(tmpdir(), "dstack-nongit-"));
-	const failedWt = await pi.tools.get("dstack_task").execute(
+	const failedWtCtx = { ...ctx, cwd: notGit };
+	const failedWt = await taskTool.execute(
 		"14",
 		{ agent: "general-purpose", task: "should fail closed", worktree: true },
 		undefined,
 		undefined,
-		{ ...ctx, cwd: notGit },
+		failedWtCtx,
 	);
-	assert("worktree-fail-closed", failedWt.isError === true && failedWt.content[0].text.includes("worktree add failed"), failedWt.content[0].text);
+	const failedWtCompleted = await waitForTask(pi, failedWt, failedWtCtx);
+	const failedWtResult = completedPackage(failedWtCompleted)?.results?.[0];
+	const failedWtText = failedWtResult?.errorMessage ?? failedWtResult?.text ?? "";
+	assert("worktree-fail-closed", failedWtResult?.exitCode > 0 && failedWtText.includes("worktree add failed"), failedWtText);
 	assert("worktree-fail-stays-out-of-cwd", readdirSync(notGit).length === 0, readdirSync(notGit).join(","));
 	delete process.env.DSTACK_NESTING;
 
