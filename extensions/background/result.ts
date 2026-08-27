@@ -1,12 +1,30 @@
 import type { TaskDetails, TaskResult } from "../dstack.ts";
 import type { AbsolutePath, OutputArtifactSeal, Sha256 } from "./artifacts.ts";
 import type { CompanionTaskState } from "./eventbus-v1.ts";
+import { recentJournal, type JournalEntry, type SemanticStatus } from "./journal.ts";
+
+export type ChildStateView = Readonly<{
+	index: number;
+	state: "queued" | "running" | "succeeded" | "failed" | "cancelled" | "skipped";
+	agent: string;
+	task: string;
+	cwd?: string;
+	model?: string;
+	latestStatus?: SemanticStatus;
+	latestActivity?: string;
+	lastActiveAt?: string;
+	journal?: readonly JournalEntry[];
+	journalCount?: number;
+	usage?: TaskResult["usage"];
+	exitCode?: number;
+}>;
 
 export type WorkflowProgress = Readonly<{
 	queued: number;
 	running: number;
 	complete: number;
 	total: number;
+	children?: readonly ChildStateView[];
 }>;
 
 export type GroupOutcome = "succeeded" | "failed" | "cancelled";
@@ -31,7 +49,13 @@ export type CommittedResult =
 	| Readonly<{ kind: "cancelled"; message: string }>;
 
 export type DstackResultView =
-	| Readonly<{ kind: "running"; taskId: string; progress: WorkflowProgress }>
+	| Readonly<{
+		kind: "running";
+		taskId: string;
+		progress: WorkflowProgress;
+		children?: readonly ChildStateView[];
+		latestStatus?: SemanticStatus;
+	}>
 	| Readonly<{ kind: "complete"; taskId: string; detail: "summary"; package: TaskSummaryDetails }>
 	| Readonly<{ kind: "complete"; taskId: string; detail: "full"; package: TaskDetails }>
 	| Readonly<{
@@ -87,7 +111,20 @@ export async function readDstackResult(input: ResultReader): Promise<DstackResul
 	switch (task.status) {
 		case "running":
 			try {
-				return { kind: "running", taskId: input.taskId, progress: await input.readProgress(binding) };
+				const progress = await input.readProgress(binding);
+				const hasChildren = progress.children !== undefined && progress.children.length > 0;
+				const latestStatus = hasChildren
+					? progress.children
+						.flatMap((child) => child.latestStatus ?? [])
+						.sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))[0]
+					: undefined;
+				return {
+					kind: "running",
+					taskId: input.taskId,
+					progress,
+					...(hasChildren ? { children: progress.children } : {}),
+					...(latestStatus !== undefined ? { latestStatus } : {}),
+				};
 			} catch (error) {
 				return infrastructureFailure(input.taskId, task, `dstack progress read failed: ${errorMessage(error)}`);
 			}
@@ -150,6 +187,8 @@ export type TaskSummaryResult = Readonly<{
 	usage: TaskResult["usage"];
 	step?: number;
 	fullOutput?: OutputArtifactSeal;
+	status?: SemanticStatus;
+	journal?: readonly JournalEntry[];
 }>;
 
 export type TaskSummaryDetails = Readonly<{
@@ -184,6 +223,8 @@ function summaryPackage(committed: Extract<CommittedResult, { kind: "complete" }
 			usage: { ...result.usage },
 			step: result.step,
 			fullOutput: committed.outputs?.[index],
+			status: result.status,
+			journal: result.journal ? recentJournal(result.journal) : undefined,
 		})),
 	};
 }

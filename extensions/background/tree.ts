@@ -3,9 +3,42 @@ import { join } from "node:path";
 import type { TodoItem, TodoStatus, WorkflowArtifact, WorkflowAssignment, WorkflowContext } from "../types.ts";
 import type { ChildContentPart, ChildMessage, ChildResult, ChildUsage } from "../spawn.ts";
 import { emptyTodos, loadTodos, parseTodoState } from "../todo.ts";
+import {
+	formatJournalEntry,
+	formatRecentActivity,
+	parseChildUsage,
+	parseJournalEntries,
+	parseJournalSnapshot,
+	parseSemanticStatus,
+	readJournalFile,
+	readSemanticStatusFile,
+	recentJournal,
+	type JournalEntry,
+	type SemanticStatus,
+} from "./journal.ts";
 import { MAX_ACTIVE_CHILDREN, snapshotActiveLeases, type LeaseSnapshot } from "./scheduler.ts";
 
+export {
+	formatJournalEntry,
+	formatRecentActivity,
+	parseChildUsage,
+	parseJournalEntries,
+	parseJournalSnapshot,
+	parseSemanticStatus,
+};
+
 export const STALE_ACTIVITY_THRESHOLD_MS = 120_000;
+
+function isFreshActivity(updatedAt: string, nowMs: number): boolean {
+	const updatedMs = Date.parse(updatedAt);
+	return Number.isFinite(updatedMs) && nowMs - updatedMs <= STALE_ACTIVITY_THRESHOLD_MS;
+}
+
+function semanticStatusText(status: SemanticStatus): string | undefined {
+	const parts = [status.phase, status.note].filter((part): part is string => part !== undefined && part.length > 0);
+	if (status.blocking) parts.push("[blocking]");
+	return parts.length > 0 ? parts.join(": ") : undefined;
+}
 
 export type TreeChildState = "queued" | "running" | "succeeded" | "failed" | "cancelled" | "skipped";
 
@@ -27,6 +60,8 @@ export type SpawnChildV1 = Readonly<{
 	taskPreview: string;
 	state: "queued" | "running" | "succeeded" | "failed" | "cancelled" | "skipped";
 	activity?: string;
+	status?: SemanticStatus;
+	journal?: readonly JournalEntry[];
 	updatedAt: string;
 	startedAt?: string;
 	endedAt?: string;
@@ -63,6 +98,8 @@ export type SpawnNestedChild = Readonly<{
 	taskPreview: string;
 	state: "queued" | "running" | "succeeded" | "failed" | "cancelled" | "skipped";
 	activity?: string;
+	status?: SemanticStatus;
+	journal?: readonly JournalEntry[];
 	startedAt?: string;
 	endedAt?: string;
 	updatedAt: string;
@@ -107,6 +144,8 @@ export type TreeChild = ProgressChildV1 & Readonly<{
 	taskFull?: string;
 	phase?: string;
 	activity?: Readonly<{ text: string; updatedAt: string }>;
+	status?: SemanticStatus;
+	journal?: readonly JournalEntry[];
 	stale?: boolean;
 	outcome?: string;
 	workflow?: WorkflowContext;
@@ -282,28 +321,6 @@ export function parseWorkflowContext(raw: unknown): WorkflowContext | undefined 
 	};
 }
 
-export function parseChildUsage(raw: unknown): ChildUsage | undefined {
-	if (!isRecord(raw)) return undefined;
-	const { input, output, cacheRead, cacheWrite, cost, contextTokens, turns } = raw;
-	if (typeof input !== "number" || !Number.isFinite(input)) return undefined;
-	if (typeof output !== "number" || !Number.isFinite(output)) return undefined;
-	if (typeof cacheRead !== "number" || !Number.isFinite(cacheRead)) return undefined;
-	if (typeof cacheWrite !== "number" || !Number.isFinite(cacheWrite)) return undefined;
-	if (typeof cost !== "number" || !Number.isFinite(cost)) return undefined;
-	if (typeof contextTokens !== "number" || !Number.isFinite(contextTokens)) return undefined;
-	if (typeof turns !== "number" || !Number.isFinite(turns)) return undefined;
-
-	return {
-		input,
-		output,
-		cacheRead,
-		cacheWrite,
-		cost,
-		contextTokens,
-		turns,
-	};
-}
-
 export function parseSpawnRecordV1(raw: unknown): SpawnRecordV1 | undefined {
 	if (!isRecord(raw)) return undefined;
 	const { schemaVersion, workflowId, parentIndex, groupId, mode, phase, createdAt, children: rawChildren } = raw;
@@ -326,6 +343,8 @@ export function parseSpawnRecordV1(raw: unknown): SpawnRecordV1 | undefined {
 			taskPreview,
 			state,
 			activity,
+			status,
+			journal,
 			updatedAt,
 			startedAt,
 			endedAt,
@@ -355,6 +374,8 @@ export function parseSpawnRecordV1(raw: unknown): SpawnRecordV1 | undefined {
 			taskPreview,
 			state,
 			activity: typeof activity === "string" && activity !== "" ? activity : undefined,
+			status: parseSemanticStatus(status),
+			journal: parseJournalEntries(journal),
 			updatedAt,
 			startedAt: typeof startedAt === "string" && startedAt !== "" ? startedAt : undefined,
 			endedAt: typeof endedAt === "string" && endedAt !== "" ? endedAt : undefined,
@@ -526,11 +547,42 @@ export function activityLines(result: Pick<ChildResult, "messages">): string[] {
 	return lines;
 }
 
-export function latestActivity(result: Pick<ChildResult, "messages" | "text" | "exitCode">): string {
+export function latestActivity(
+	result: Pick<ChildResult, "messages" | "text" | "exitCode"> & {
+		status?: SemanticStatus;
+		journal?: readonly JournalEntry[];
+	},
+): string {
+	if (result.status?.phase || result.status?.note) {
+		const parts = [result.status.phase, result.status.note].filter(Boolean);
+		if (result.status.blocking) parts.push("[blocking]");
+		return parts.join(": ");
+	}
+	if (result.journal && result.journal.length > 0) {
+		const last = result.journal[result.journal.length - 1]!;
+		if (last.kind === "phase") {
+			const parts = [last.phase, last.note].filter(Boolean);
+			if (last.blocking) parts.push("[blocking]");
+			return parts.join(": ");
+		}
+		if (last.kind === "tool") return `→ ${last.name} ${last.gist}`;
+		if (last.kind === "turn") return last.summary ?? `turn ${last.turn}`;
+		if (last.kind === "spawn") return `spawned (${last.agent})`;
+		if (last.kind === "exit") return last.exitCode === 0 ? "completed" : `failed (exit ${last.exitCode})`;
+		if (last.kind === "failure") return `failed: ${last.error}`;
+	}
 	const part = activityParts(result).at(-1);
 	if (!part) return result.exitCode === -1 ? "running" : oneLine(result.text) || "no output";
 	if (part.type === "toolCall") return `→ ${formatToolCall(part)}`;
-	if (part.type === "toolUpdate") return `↳ ${part.name}: ${oneLine(part.text, 72)}`;
+	if (part.type === "toolUpdate") {
+		if (part.agents.length > 0) {
+			const agentSummary = part.agents
+				.map((agent) => `${agent.agent}:${agent.exitCode === -1 ? "running" : agent.exitCode === 0 ? "ok" : "err"}`)
+				.join(" ");
+			return `→ ${part.name} [${agentSummary}]`;
+		}
+		return `→ ${part.name} ${oneLine(part.text, 72)}`;
+	}
 	return oneLine(part.text) || (result.exitCode === -1 ? "running" : "no output");
 }
 
@@ -782,6 +834,8 @@ export function parseTreeSnapshot(raw: unknown): TreeSnapshot | undefined {
 						taskPreview: typeof item.taskPreview === "string" ? item.taskPreview : "",
 						state,
 						activity: typeof item.activity === "string" ? item.activity : undefined,
+						status: parseSemanticStatus(item.status),
+						journal: parseJournalEntries(item.journal),
 						startedAt: typeof item.startedAt === "string" ? item.startedAt : undefined,
 						endedAt: typeof item.endedAt === "string" ? item.endedAt : undefined,
 						updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : "",
@@ -838,6 +892,8 @@ export function parseTreeSnapshot(raw: unknown): TreeSnapshot | undefined {
 			taskFull: typeof child.taskFull === "string" ? child.taskFull : undefined,
 			phase: typeof child.phase === "string" ? child.phase : undefined,
 			activity: activityObj,
+			status: parseSemanticStatus(child.status),
+			journal: parseJournalEntries(child.journal),
 			stale: typeof child.stale === "boolean" ? child.stale : undefined,
 			outcome: typeof child.outcome === "string" ? child.outcome : undefined,
 			nested,
@@ -934,6 +990,16 @@ export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<
 	const terminalChildren = await Promise.all(
 		manifest.specs.map((_spec, index) => readTerminalChild(input.artifactDir, index)),
 	);
+	const statusRecords = await Promise.all(
+		manifest.specs.map((_spec, index) =>
+			readSemanticStatusFile(join(input.artifactDir, "children", String(index), "status.json")),
+		),
+	);
+	const journalRecords = await Promise.all(
+		manifest.specs.map((_spec, index) =>
+			readJournalFile(join(input.artifactDir, "children", String(index), "journal.json")),
+		),
+	);
 	const activityRecords = await Promise.all(
 		manifest.specs.map((_spec, index) =>
 			terminalChildren[index] === undefined
@@ -969,6 +1035,10 @@ export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<
 	const children: TreeChild[] = manifest.specs.map((spec, index) => {
 		const progressChild = progress.children.find((child) => child.index === index);
 		const terminalChild = terminalChildren[index];
+		const semanticStatus = statusRecords[index];
+		const journalSnapshot = journalRecords[index];
+		const allJournal = journalSnapshot?.entries;
+		const journal = allJournal !== undefined ? recentJournal(allJournal) : undefined;
 		const liveLease = depth1Leases.find((lease) => lease.childId === String(index));
 		const state: TreeChildState = terminalChild?.state ?? progressChild?.state ?? (liveLease === undefined ? "queued" : "running");
 		const role = progressChild?.role ?? spec.requestedRole;
@@ -980,13 +1050,35 @@ export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<
 		const parentResultRaw = parentResultsByChild[index];
 
 		const newestSpawnPhase = spawns.map((s) => s.phase).filter((p): p is string => typeof p === "string" && p.length > 0).at(-1);
-		const phase = newestSpawnPhase ?? spec.phase;
+		const statusText = semanticStatus === undefined ? undefined : semanticStatusText(semanticStatus);
+		const statusIsFresh = semanticStatus !== undefined && isFreshActivity(semanticStatus.updatedAt, nowMs);
+		const phase = statusIsFresh ? semanticStatus.phase ?? newestSpawnPhase ?? spec.phase : newestSpawnPhase ?? spec.phase;
 
+		let activityRecordObj: Readonly<{ text: string; updatedAt: string }> | undefined;
 		let stale = false;
-		if (state === "running" && activityRecord !== undefined) {
-			const updatedMs = Date.parse(activityRecord.updatedAt);
-			if (!Number.isNaN(updatedMs) && nowMs - updatedMs > STALE_ACTIVITY_THRESHOLD_MS) {
-				stale = true;
+
+		if (terminalChild === undefined && state === "running") {
+			const lastJournalEntry = journal?.at(-1);
+			let latestActivityText: string | undefined;
+			let latestUpdatedAt: string | undefined;
+
+			if (statusText !== undefined && (statusIsFresh || (lastJournalEntry === undefined && activityRecord === undefined))) {
+				latestActivityText = statusText;
+				latestUpdatedAt = semanticStatus?.updatedAt;
+			} else if (lastJournalEntry !== undefined) {
+				latestActivityText = formatJournalEntry(lastJournalEntry);
+				latestUpdatedAt = lastJournalEntry.timestamp;
+			} else if (activityRecord !== undefined) {
+				latestActivityText = activityRecord.activity;
+				latestUpdatedAt = activityRecord.updatedAt;
+			}
+
+			if (latestUpdatedAt !== undefined) {
+				stale = !isFreshActivity(latestUpdatedAt, nowMs);
+			}
+
+			if (latestActivityText !== undefined && latestUpdatedAt !== undefined) {
+				activityRecordObj = { text: latestActivityText, updatedAt: latestUpdatedAt };
 			}
 		}
 
@@ -995,8 +1087,21 @@ export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<
 			for (const spawnChild of spawnRecord.children) {
 				const leaseChildId = `${spawnRecord.groupId}-${spawnChild.nestedIndex}`;
 				const matchLease = depth2Leases.find((l) => l.childId === leaseChildId);
-				const childUpdatedMs = Date.parse(spawnChild.updatedAt);
-				const isStale = spawnChild.state === "running" && spawnChild.activity !== undefined && (
+				const nestedStatusText = spawnChild.status === undefined ? undefined : semanticStatusText(spawnChild.status);
+				const nestedStatusIsFresh = spawnChild.status !== undefined && isFreshActivity(spawnChild.status.updatedAt, nowMs);
+				const lastNestedJournalEntry = spawnChild.journal?.at(-1);
+				let nestedActivityText = spawnChild.activity;
+				let nestedUpdatedAt = spawnChild.updatedAt;
+				if (nestedStatusText !== undefined && (nestedStatusIsFresh || lastNestedJournalEntry === undefined)) {
+					nestedActivityText = nestedStatusText;
+					nestedUpdatedAt = spawnChild.status?.updatedAt ?? spawnChild.updatedAt;
+				} else if (lastNestedJournalEntry !== undefined) {
+					nestedActivityText = formatJournalEntry(lastNestedJournalEntry);
+					nestedUpdatedAt = lastNestedJournalEntry.timestamp;
+				}
+
+				const childUpdatedMs = Date.parse(nestedUpdatedAt);
+				const isStale = spawnChild.state === "running" && nestedActivityText !== undefined && (
 					!Number.isNaN(childUpdatedMs) && nowMs - childUpdatedMs > STALE_ACTIVITY_THRESHOLD_MS
 				);
 				const model = spawnChild.model ?? (
@@ -1012,10 +1117,12 @@ export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<
 					assignment: spawnChild.assignment,
 					taskPreview: spawnChild.taskPreview,
 					state: spawnChild.state,
-					activity: spawnChild.activity,
+					activity: nestedActivityText,
+					status: spawnChild.status,
+					journal: spawnChild.journal ? recentJournal(spawnChild.journal) : undefined,
 					startedAt: spawnChild.startedAt,
 					endedAt: spawnChild.endedAt,
-					updatedAt: spawnChild.updatedAt,
+					updatedAt: nestedUpdatedAt,
 					live: matchLease !== undefined,
 					lease: matchLease,
 					stale: isStale || undefined,
@@ -1045,7 +1152,9 @@ export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<
 			taskPreview: taskPreviewOf(spec.task),
 			taskFull: spec.task,
 			phase,
-			activity: activityRecord !== undefined ? { text: activityRecord.activity, updatedAt: activityRecord.updatedAt } : undefined,
+			activity: activityRecordObj,
+			status: semanticStatus,
+			journal,
 			stale: stale || undefined,
 			outcome: terminalChild?.outcome,
 			workflow: spec.workflow,
@@ -1417,6 +1526,20 @@ export function renderTreeLines(snapshot: TreeSnapshot, opts: RenderTreeOptions)
 		for (const child of snapshot.children) {
 			if (child.taskFull !== undefined && child.taskFull !== child.taskPreview) {
 				lines.push(truncateToWidth(`    task [${child.agent}]: ${child.taskFull}`, width));
+			}
+			if (child.state === "running" && child.journal && child.journal.length > 0) {
+				const recent = formatRecentActivity(child.journal, 4);
+				for (const act of recent) {
+					lines.push(truncateToWidth(`    ${theme.fg("dim", "•")} ${act}`, width));
+				}
+			}
+			for (const n of child.nested) {
+				if (!isLeaseSnapshot(n) && n.state === "running" && n.journal && n.journal.length > 0) {
+					const recent = formatRecentActivity(n.journal, 4);
+					for (const act of recent) {
+						lines.push(truncateToWidth(`      ${theme.fg("dim", "•")} ${act}`, width));
+					}
+				}
 			}
 		}
 	}

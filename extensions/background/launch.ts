@@ -13,8 +13,36 @@ import { workflowSystemPrompt } from "../workflow-context.ts";
 import { atomicWriteFile, writeSealedArtifact } from "./artifacts.ts";
 import type { BackgroundTaskPort } from "./eventbus-v1.ts";
 import { readCommittedWorkflowResult } from "./runner.ts";
-import type { CommittedResult, TaskBinding, WorkflowProgress } from "./result.ts";
+import { readJournalFile, readSemanticStatusFile, recentJournal } from "./journal.ts";
+import type { ChildStateView, CommittedResult, TaskBinding, WorkflowProgress } from "./result.ts";
 import type { ResolvedChildSpec, WorkflowManifestV1 } from "./workflow.ts";
+
+type ManifestSpecSummary = Readonly<{
+	agent: string;
+	task: string;
+	cwd?: string;
+	model?: string;
+}>;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseManifestSpecs(raw: unknown): readonly ManifestSpecSummary[] | undefined {
+	if (!isRecord(raw) || !Array.isArray(raw["specs"])) return undefined;
+	const specs: ManifestSpecSummary[] = [];
+	for (const item of raw["specs"]) {
+		if (!isRecord(item)) return undefined;
+		if (typeof item["agent"] !== "string" || typeof item["task"] !== "string") return undefined;
+		specs.push({
+			agent: item["agent"],
+			task: item["task"],
+			cwd: typeof item["cwd"] === "string" ? item["cwd"] : undefined,
+			model: typeof item["model"] === "string" ? item["model"] : undefined,
+		});
+	}
+	return specs;
+}
 
 export type BackgroundReceipt = Readonly<{
 	taskId: string;
@@ -162,13 +190,94 @@ export function createTaskResultFiles(sessionId: string): Readonly<{
 			}
 		},
 		async readProgress(binding) {
-			const value: unknown = JSON.parse(await readFile(join(workflowDir(binding), "progress.json"), "utf8"));
+			const dir = workflowDir(binding);
+			const value: unknown = JSON.parse(await readFile(join(dir, "progress.json"), "utf8"));
 			if (typeof value !== "object" || value === null) throw new Error("progress must be an object");
 			const progress = Object.fromEntries(Object.entries(value));
 			for (const key of ["queued", "running", "complete", "total"] as const) {
 				if (!Number.isSafeInteger(progress[key]) || Number(progress[key]) < 0) throw new Error(`progress.${key} is invalid`);
 			}
-			return { queued: Number(progress.queued), running: Number(progress.running), complete: Number(progress.complete), total: Number(progress.total) };
+			const base = {
+				queued: Number(progress.queued),
+				running: Number(progress.running),
+				complete: Number(progress.complete),
+				total: Number(progress.total),
+			};
+			let children: ChildStateView[] | undefined;
+			try {
+				const manifestBytes = await readFile(join(dir, "manifest.json"), "utf8");
+				const specs = parseManifestSpecs(JSON.parse(manifestBytes));
+				if (specs !== undefined) {
+					const childViews: ChildStateView[] = [];
+					for (const [index, spec] of specs.entries()) {
+						const childDir = join(dir, "children", String(index));
+						const journalSnapshot = await readJournalFile(join(childDir, "journal.json"));
+						const semanticStatus = await readSemanticStatusFile(join(childDir, "status.json"));
+						const allJournal = journalSnapshot?.entries;
+						const journal = allJournal === undefined ? undefined : recentJournal(allJournal);
+						let latestActivity: string | undefined;
+						let lastActiveAt: string | undefined = journalSnapshot?.updatedAt ?? semanticStatus?.updatedAt;
+						let exitCode: number | undefined;
+						let state: ChildStateView["state"] = "queued";
+						if (journal && journal.length > 0) {
+							const last = journal[journal.length - 1]!;
+							lastActiveAt = last.timestamp;
+							if (last.kind === "exit") {
+								exitCode = last.exitCode;
+								state = exitCode === 0 ? "succeeded" : "failed";
+								latestActivity = exitCode === 0 ? "completed" : `failed (exit ${exitCode})`;
+							} else if (last.kind === "failure") {
+								state = "failed";
+								latestActivity = `failed: ${last.error}`;
+							} else {
+								state = "running";
+								if (semanticStatus && (semanticStatus.phase || semanticStatus.note)) {
+									const parts = [semanticStatus.phase, semanticStatus.note].filter(Boolean);
+									if (semanticStatus.blocking) parts.push("[blocking]");
+									latestActivity = parts.join(": ");
+								} else if (last.kind === "phase") {
+									const parts = [last.phase, last.note].filter(Boolean);
+									if (last.blocking) parts.push("[blocking]");
+									latestActivity = parts.join(": ");
+								} else if (last.kind === "tool") {
+									latestActivity = `→ ${last.name} ${last.gist}`;
+								} else if (last.kind === "turn") {
+									latestActivity = last.summary ?? `turn ${last.turn}`;
+								} else if (last.kind === "spawn") {
+									latestActivity = `spawned (${last.agent})`;
+								}
+							}
+						}
+						lastActiveAt = [lastActiveAt, journalSnapshot?.updatedAt, semanticStatus?.updatedAt]
+							.flatMap((value) => value ?? [])
+							.filter((value) => Number.isFinite(Date.parse(value)))
+							.sort((left, right) => Date.parse(right) - Date.parse(left))[0];
+						if (journalSnapshot || semanticStatus) {
+							childViews.push({
+								index,
+								state,
+								agent: spec.agent,
+								task: spec.task,
+								cwd: spec.cwd,
+								model: spec.model,
+								latestStatus: semanticStatus,
+								latestActivity,
+								lastActiveAt,
+								journal,
+								journalCount: allJournal?.length,
+								exitCode,
+							});
+						}
+					}
+					if (childViews.length > 0) {
+						children = childViews;
+					}
+				}
+			} catch {}
+			return {
+				...base,
+				...(children && children.length > 0 ? { children } : {}),
+			};
 		},
 		async readCommittedResult(binding) {
 			const artifactDir = workflowDir(binding);
