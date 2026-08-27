@@ -3,9 +3,10 @@ import { join } from "node:path";
 import type { TaskDetails, TaskResult } from "../dstack.ts";
 import { buildChildArgv, capOutput, childEnv, runChildProcess, type ChildInvocation, type ChildResult } from "../spawn.ts";
 import type { WorkflowContext, WorktreeFrom } from "../types.ts";
-import { MAX_CONCURRENCY, NESTING_ENV } from "../types.ts";
+import { MAX_CONCURRENCY, NESTING_ENV, STATUS_FILE_ENV } from "../types.ts";
 import { createWorktree } from "../worktree.ts";
 import { atomicWriteFile, readOutputArtifact, toAbsolutePath, writeSealedArtifact, type OutputArtifactSeal } from "./artifacts.ts";
+import { allowStatusTool, ChildJournalRecorder } from "./journal.ts";
 import { acquireChildSlot } from "./scheduler.ts";
 import { latestActivity, type ChildActivityV1, type ProgressChildV1, type WorkflowProgressV2 } from "./tree.ts";
 
@@ -319,6 +320,18 @@ export async function executeWorkflow(
 			}
 			const childDirectory = join(manifest.artifactDir, "children", String(index));
 			await mkdir(childDirectory, { recursive: true, mode: 0o700 });
+			const journalPath = join(childDirectory, "journal.json");
+			const statusPath = join(childDirectory, "status.json");
+			const recorder = new ChildJournalRecorder({ journalPath, statusPath });
+			recorder.recordSpawn({
+				agent: spec.agent,
+				task,
+				cwd,
+				model: spec.model,
+				role: spec.requestedRole,
+				step: manifest.mode === "chain" ? index + 1 : undefined,
+			});
+			await recorder.persist();
 			const systemPrompt = spec.systemPrompt;
 			const systemPromptPath = systemPrompt === undefined ? undefined : join(childDirectory, "system-prompt.md");
 			if (systemPromptPath !== undefined && systemPrompt !== undefined) await atomicWriteFile(systemPromptPath, systemPrompt);
@@ -327,7 +340,7 @@ export async function executeWorkflow(
 				extensionPath: manifest.extensionPath,
 				model: spec.model,
 				omitModel: spec.omitModel,
-				tools: spec.tools,
+				tools: allowStatusTool(spec.tools),
 				systemPromptPath,
 			});
 			const invocation: ChildInvocation = {
@@ -340,10 +353,13 @@ export async function executeWorkflow(
 			env[SCHEDULER_ROOT_ENV] = manifest.schedulerRoot;
 			env[DSTACK_CHILD_INDEX_ENV] = String(index);
 			env[DSTACK_ARTIFACT_DIR_ENV] = manifest.artifactDir;
+			env[STATUS_FILE_ENV] = statusPath;
 			const activityPath = join(childDirectory, "activity.json");
 			const throttledActivity = createThrottledWriter<ChildActivityV1>(activityPath, 1000);
+			let journalUpdates = Promise.resolve();
+			let child: ChildResult;
 			try {
-				const child = await spawnChild({
+				child = await spawnChild({
 					args,
 					cwd,
 					env,
@@ -360,24 +376,44 @@ export async function executeWorkflow(
 							turns: partial.usage.turns,
 							contextTokens: partial.usage.contextTokens,
 						});
+						journalUpdates = journalUpdates.then(async () => {
+							recorder.recordMessages(partial.messages);
+							if (partial.usage.turns > 0) {
+								recorder.recordTurn({ turn: partial.usage.turns, text: partial.text, usage: partial.usage });
+							}
+							await recorder.checkStatusFile();
+							await recorder.persist();
+						}).catch(() => undefined);
 					},
 				});
-				const endedAt = new Date().toISOString();
-				const state: ChildState = signal.aborted ? "cancelled" : child.exitCode === 0 ? "succeeded" : "failed";
-				const completed = taskResult(child, spec, cwd, task, manifest.mode === "chain" ? index + 1 : undefined);
-				results[index] = completed;
-				entries[index] = await sealChild({ manifest, index, state, result: completed, fullOutput: child.text, startedAt, endedAt });
-				childMeta[index] = {
-					...childMeta[index],
-					state,
-					startedAt,
-					endedAt,
-				};
-				await writeProgress(manifest, childMeta);
-				return { state, output: child.text };
+				await journalUpdates;
+			} catch (error) {
+				await journalUpdates.catch(() => undefined);
+				recorder.recordFailure({ error: error instanceof Error ? error.message : String(error) });
+				await recorder.persist();
+				throw error;
 			} finally {
 				await throttledActivity.dispose();
 			}
+			await recorder.checkStatusFile();
+			const endedAt = new Date().toISOString();
+			const state: ChildState = signal.aborted ? "cancelled" : child.exitCode === 0 ? "succeeded" : "failed";
+			if (signal.aborted) recorder.recordFailure({ error: "Workflow cancelled" });
+			else recorder.recordExit({ exitCode: child.exitCode, text: child.text });
+			await recorder.persist();
+			const completed = taskResult(child, spec, cwd, task, manifest.mode === "chain" ? index + 1 : undefined);
+			completed.journal = recorder.getEntries();
+			completed.status = recorder.getLatestStatus();
+			results[index] = completed;
+			entries[index] = await sealChild({ manifest, index, state, result: completed, fullOutput: child.text, startedAt, endedAt });
+			childMeta[index] = {
+				...childMeta[index],
+				state,
+				startedAt,
+				endedAt,
+			};
+			await writeProgress(manifest, childMeta);
+			return { state, output: child.text };
 		} finally {
 			await lease.release();
 		}

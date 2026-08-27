@@ -102,6 +102,9 @@ test("parallel results retain manifest order when children finish in reverse ord
 	const cwd = await temporaryDirectory(t);
 	const specs: [ResolvedChildSpec, ...ResolvedChildSpec[]] = [spec(cwd, "0"), spec(cwd, "1"), spec(cwd, "2")];
 	const calls: number[] = [];
+	let started = 0;
+	let releaseStarts: (() => void) | undefined;
+	const allStarted = new Promise<void>((resolve) => { releaseStarts = resolve; });
 	const index = await executeWorkflow(
 		manifest({ artifactDir: join(cwd, "artifacts"), cwd, mode: "parallel", specs }),
 		"a".repeat(64),
@@ -110,7 +113,10 @@ test("parallel results retain manifest order when children finish in reverse ord
 			slots: createLocalSlotAcquirer(4),
 			spawnChild: async ({ args }) => {
 				const id = Number(args.at(-1)?.replace("Task: ", ""));
-				await new Promise((resolve) => setTimeout(resolve, (2 - id) * 40));
+				started += 1;
+				if (started === specs.length) releaseStarts?.();
+				await allStarted;
+				await new Promise((resolve) => setTimeout(resolve, (2 - id) * 15));
 				calls.push(id);
 				return child(`output-${id}`);
 			},

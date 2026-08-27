@@ -120,6 +120,7 @@ export const MAX_CONCURRENCY = 4;
 export const PER_TASK_OUTPUT_CAP = 50 * 1024;
 export const NESTING_ENV = "DSTACK_NESTING";
 export const ASSIGNMENT_ENV = "DSTACK_ASSIGNMENT";
+export const STATUS_FILE_ENV = "DSTACK_STATUS_FILE";
 export const MODE_ENTRY = "dstack-mode";
 export const TODO_ENTRY = "dstack-todos";
 export const ACTIVE_WORKFLOW_ENTRY = "dstack-active-workflow";
