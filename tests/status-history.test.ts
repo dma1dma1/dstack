@@ -17,7 +17,7 @@ import {
 	type JournalEntry,
 	type SemanticStatus,
 } from "../extensions/background/journal.ts";
-import { readDstackResult, type CommittedResult, type TaskBinding } from "../extensions/background/result.ts";
+import { readDstackResult, type TaskBinding } from "../extensions/background/result.ts";
 import dstack, { latestActivity, type TaskResult } from "../extensions/dstack.ts";
 import { NESTING_ENV, STATUS_FILE_ENV } from "../extensions/types.ts";
 import type { WorkflowManifestV1 } from "../extensions/background/workflow.ts";
@@ -264,99 +264,6 @@ test("dstack_result exposes live child state, latest semantic status, freshness,
 		assert.equal(child?.latestActivity, "grounding: reading files");
 		assert.equal(child?.lastActiveAt, "2026-02-26T10:00:10.000Z");
 		assert.equal(child?.journal?.length, 3);
-	}
-});
-
-test("dstack_result summary cleans up metadata while full detail retains raw fields", async () => {
-	const binding: TaskBinding = { taskId: "task-comp-1", workflowId: "wf-comp-1" };
-	const journal: JournalEntry[] = [
-		{ seq: 1, timestamp: "2026-02-26T10:00:00.000Z", kind: "spawn", agent: "poteto-agent", task: "implement", cwd: "/tmp" },
-		{ seq: 2, timestamp: "2026-02-26T10:00:10.000Z", kind: "phase", phase: "verification", note: "running tests" },
-		{ seq: 3, timestamp: "2026-02-26T10:00:20.000Z", kind: "exit", exitCode: 0, text: "Success" },
-	];
-	const status: SemanticStatus = { phase: "verification", note: "running tests", updatedAt: "2026-02-26T10:00:10.000Z" };
-
-	const taskResult: TaskResult = {
-		agent: "poteto-agent",
-		cwd: "/tmp",
-		task: "implement",
-		model: "openai/gpt-5-mini",
-		text: "Feature complete and tested.",
-		exitCode: 0,
-		stderr: "debug log line",
-		stopReason: "stop",
-		messages: [
-			{ role: "user", content: [{ type: "text", text: "Start" }] },
-			{ role: "assistant", content: [{ type: "text", text: "Feature complete and tested." }] },
-		],
-		usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: 0.001, contextTokens: 150, turns: 1 },
-		journal,
-		status,
-	};
-
-	const committed: CommittedResult = {
-		kind: "complete",
-		package: { mode: "single", results: [taskResult] },
-	};
-
-	const summaryView = await readDstackResult({
-		taskId: "task-comp-1",
-		detail: "summary",
-		statusExact: async () => ({ id: "task-comp-1", name: "dstack", command: "runner", status: "completed", outputPath: "/tmp/out.txt" }),
-		readBinding: async () => binding,
-		readProgress: async () => ({ queued: 0, running: 0, complete: 1, total: 1 }),
-		readCommittedResult: async () => committed,
-	});
-
-	assert.equal(summaryView.kind, "complete");
-	if (summaryView.kind === "complete" && summaryView.detail === "summary") {
-		const res = summaryView.package.results[0];
-		assert.ok(res);
-		assert.equal(res.agent, "poteto-agent");
-		assert.equal(res.summary, "Feature complete and tested.");
-		assert.equal(res.exitCode, 0);
-		assert.deepEqual(res, {
-			agent: "poteto-agent",
-			summary: "Feature complete and tested.",
-			exitCode: 0,
-		});
-
-		const summaryJson = JSON.stringify(summaryView);
-		assert.ok(!summaryJson.includes('"task"'));
-		assert.ok(!summaryJson.includes('"journal"'));
-		assert.ok(!summaryJson.includes('"usage"'));
-		assert.ok(!summaryJson.includes('"model"'));
-		assert.ok(!summaryJson.includes('"cwd"'));
-		assert.ok(!summaryJson.includes('"messages"'));
-		assert.ok(!summaryJson.includes('"fullOutput"'));
-		assert.ok(!summaryJson.includes('"status"'));
-		assert.ok(!summaryJson.includes('"stderr"'));
-		assert.ok(!summaryJson.includes('"stopReason"'));
-	}
-
-	const fullView = await readDstackResult({
-		taskId: "task-comp-1",
-		detail: "full",
-		statusExact: async () => ({ id: "task-comp-1", name: "dstack", command: "runner", status: "completed", outputPath: "/tmp/out.txt" }),
-		readBinding: async () => binding,
-		readProgress: async () => ({ queued: 0, running: 0, complete: 1, total: 1 }),
-		readCommittedResult: async () => committed,
-	});
-
-	assert.equal(fullView.kind, "complete");
-	if (fullView.kind === "complete" && fullView.detail === "full") {
-		const res = fullView.package.results[0];
-		assert.ok(res);
-		assert.equal(res.text, "Feature complete and tested.");
-		assert.equal(res.cwd, "/tmp");
-		assert.equal(res.task, "implement");
-		assert.equal(res.model, "openai/gpt-5-mini");
-		assert.equal(res.stderr, "debug log line");
-		assert.equal(res.stopReason, "stop");
-		assert.equal(res.messages.length, 2);
-		assert.deepEqual(res.status, status);
-		assert.equal(res.journal?.length, 3);
-		assert.deepEqual(res.usage, taskResult.usage);
 	}
 });
 

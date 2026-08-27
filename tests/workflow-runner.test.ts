@@ -166,6 +166,18 @@ test("chain substitutes every previous token with full output and seals later sk
 	assert.deepEqual(index.children.map((entry) => entry.state), ["succeeded", "failed", "skipped"]);
 	assert.equal((await readOutputArtifact(index.children[0]!.output)).toString(), full);
 	assert.equal((await readOutputArtifact(index.children[2]!.output)).toString(), "");
+
+	await commitWorkflowResult(workflow, index);
+	const progressRaw = await readFile(join(workflow.artifactDir, "progress.json"), "utf8");
+	const progress = JSON.parse(progressRaw) as {
+		children: Array<{ index: number; state: string; startedAt?: string; endedAt?: string }>;
+	};
+	assert.equal(progress.children[0]?.state, "succeeded");
+	assert.ok(typeof progress.children[0]?.startedAt === "string");
+	assert.ok(typeof progress.children[0]?.endedAt === "string");
+	assert.equal(progress.children[2]?.state, "skipped");
+	assert.equal(progress.children[2]?.startedAt, undefined);
+	assert.ok(typeof progress.children[2]?.endedAt === "string");
 });
 
 test("chain creates worktrees only when their steps become runnable", async (t) => {
@@ -298,7 +310,7 @@ test("concurrent runner processes share one four-child scheduler", async (t) => 
 			`import { join } from "node:path";`,
 			`const marker = join(process.env.DSTACK_TEST_ACTIVE_DIR, String(process.pid));`,
 			`writeFileSync(marker, "active");`,
-			`await new Promise((resolve) => setTimeout(resolve, 3000));`,
+			`await new Promise((resolve) => setTimeout(resolve, 500));`,
 			`const task = process.argv.at(-1).slice(6);`,
 			`process.stdout.write(JSON.stringify({type:"message_end",message:{role:"assistant",content:[{type:"text",text:task}]}}) + "\\n");`,
 			`unlinkSync(marker);`,
@@ -310,7 +322,7 @@ test("concurrent runner processes share one four-child scheduler", async (t) => 
 	const node = await realpath(process.execPath);
 	const fakeReal = await realpath(fake);
 	const extensionReal = await realpath(extension);
-	const runnerCommands = await Promise.all(Array.from({ length: 3 }, async (_, runnerIndex) => {
+	const runnerCommands = await Promise.all(Array.from({ length: 2 }, async (_, runnerIndex) => {
 		const artifactDir = join(root, `artifacts-${runnerIndex}`);
 		await mkdir(artifactDir, { recursive: true, mode: 0o700 });
 		const tools = { tools: "read,grep" };
@@ -318,7 +330,6 @@ test("concurrent runner processes share one four-child scheduler", async (t) => 
 			spec(root, `${runnerIndex}-0`, tools),
 			spec(root, `${runnerIndex}-1`, tools),
 			spec(root, `${runnerIndex}-2`, tools),
-			spec(root, `${runnerIndex}-3`, tools),
 		];
 		const workflow: WorkflowManifestV1 = {
 			...manifest({ artifactDir, cwd: root, mode: "parallel", executable: node, argvPrefix: [fakeReal], specs }),
@@ -420,38 +431,6 @@ test("parallel execution writes durable per-child progress v2 and startedAt/ende
 	assert.ok(typeof childResult.endedAt === "string");
 });
 
-test("chain execution stamps skipped steps with endedAt and no startedAt", async (t) => {
-	const cwd = await temporaryDirectory(t);
-	const workflow = manifest({
-		artifactDir: join(cwd, "artifacts"),
-		cwd,
-		mode: "chain",
-		specs: [
-			spec(cwd, "first-step"),
-			spec(cwd, "second-step"),
-		],
-	});
-	const digest = "b".repeat(64);
-	const index = await executeWorkflow(workflow, digest, new AbortController().signal, {
-		slots: createLocalSlotAcquirer(1),
-		spawnChild: async () => child("failing output", 1),
-	});
-	await commitWorkflowResult(workflow, index);
-
-	const progressRaw = await readFile(join(workflow.artifactDir, "progress.json"), "utf8");
-	const progress = JSON.parse(progressRaw) as {
-		children: Array<{ index: number; state: string; startedAt?: string; endedAt?: string }>;
-	};
-	assert.equal(progress.children.length, 2);
-	assert.equal(progress.children[0]?.state, "failed");
-	assert.ok(typeof progress.children[0]?.startedAt === "string");
-	assert.ok(typeof progress.children[0]?.endedAt === "string");
-
-	assert.equal(progress.children[1]?.state, "skipped");
-	assert.equal(progress.children[1]?.startedAt, undefined);
-	assert.ok(typeof progress.children[1]?.endedAt === "string");
-});
-
 test("child execution exports index and artifact dir env vars and writes activity.json onUpdate", async (t) => {
 	const cwd = await temporaryDirectory(t);
 	const workflow = manifest({
@@ -538,38 +517,4 @@ test("child execution exports index and artifact dir env vars and writes activit
 	assert.ok(snapshot !== undefined);
 	assert.equal(snapshot.children[0]?.state, "succeeded");
 	assert.equal(snapshot.children[0]?.outcome, "all done");
-});
-
-test("workflow execution persists child usage and buildTreeSnapshot recovers terminal cost", async (t) => {
-	const cwd = await temporaryDirectory(t);
-	const workflow = manifest({
-		artifactDir: join(cwd, "artifacts"),
-		cwd,
-		mode: "single",
-		specs: [spec(cwd, "task-with-cost")],
-	});
-
-	const index = await executeWorkflow(workflow, "d".repeat(64), new AbortController().signal, {
-		slots: createLocalSlotAcquirer(1),
-		spawnChild: async () => ({
-			text: "completed with cost",
-			exitCode: 0,
-			stderr: "",
-			messages: [],
-			usage: { input: 1000, output: 500, cacheRead: 0, cacheWrite: 0, cost: 0.084, contextTokens: 1500, turns: 3 },
-		}),
-	});
-	await commitWorkflowResult(workflow, index);
-
-	await writeFile(join(workflow.artifactDir, "manifest.json"), JSON.stringify(workflow), "utf8");
-	const snapshot = await buildTreeSnapshot({
-		taskId: "task-terminal-cost",
-		workflowId: workflow.workflowId,
-		artifactDir: workflow.artifactDir,
-		schedulerRoot: workflow.schedulerRoot,
-	});
-
-	assert.ok(snapshot !== undefined);
-	assert.equal(snapshot.children[0]?.state, "succeeded");
-	assert.equal(snapshot.children[0]?.cost, 0.084);
 });

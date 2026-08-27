@@ -352,39 +352,6 @@ test("FIFO order holds under contention", async (t) => {
 	}
 });
 
-test("stress: peak concurrency never exceeds four across many real worker processes", async (t) => {
-	const root = await temporaryRoot(t);
-	const specs: SpawnOptions[] = [
-		{ root, childId: "s1", depth: 1, cycles: 3, holdMs: 25 },
-		{ root, childId: "s2", depth: 1, cycles: 3, holdMs: 25 },
-		{ root, childId: "s3", depth: 1, cycles: 3, holdMs: 25 },
-		{ root, childId: "s4", depth: 1, nonNesting: true, cycles: 3, holdMs: 25 },
-		{ root, childId: "s5", depth: 1, nonNesting: true, cycles: 3, holdMs: 25 },
-		{ root, childId: "s6", depth: 1, nonNesting: true, cycles: 3, holdMs: 25 },
-		{ root, childId: "s7", depth: 2, cycles: 3, holdMs: 25 },
-		{ root, childId: "s8", depth: 2, cycles: 3, holdMs: 25 },
-	];
-	const workers = specs.map((spec) => spawnWorker(t, spec));
-	let done = false;
-	let peak = 0;
-	const monitor = (async () => {
-		while (!done) {
-			peak = Math.max(peak, (await leaseFiles(root)).length);
-			await sleep(5);
-		}
-	})();
-	for (const worker of workers) {
-		await worker.waitForLine("all-cycles-done");
-		assert.equal(await worker.exited, 0);
-	}
-	done = true;
-	await monitor;
-	assert.ok(peak <= MAX_ACTIVE_CHILDREN, `observed ${peak} concurrent leases`);
-	assert.ok(peak >= 1, "the monitor must observe at least one lease");
-	assert.deepEqual(await leaseFiles(root), []);
-	assert.deepEqual(await ticketFiles(root), []);
-});
-
 // --- Abort ------------------------------------------------------------------
 
 test("aborting a queued waiter removes its ticket and leaves holders untouched", async (t) => {

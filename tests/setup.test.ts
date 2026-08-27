@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { emptyConfig, validateRoles } from "../extensions/models.ts";
 import {
-	classifySlug,
 	companionStatus,
 	dedupeSlugs,
 	ensurePermissionConfig,
@@ -23,13 +22,6 @@ test("dedupe keeps the undated slug over a dated twin", () => {
 		dedupeSlugs(["anthropic/claude-haiku-4-5-20251001", "anthropic/claude-haiku-4-5"]),
 		["anthropic/claude-haiku-4-5"],
 	);
-});
-
-test("classify maps haiku, opus, and sol", () => {
-	assert.equal(classifySlug("anthropic/claude-haiku-4-5"), "fast");
-	assert.equal(classifySlug("anthropic/claude-opus-4-5"), "judgment");
-	assert.equal(classifySlug("anthropic/claude-fable-5"), "judgment");
-	assert.equal(classifySlug("openai/gpt-5.6-sol"), "instruction");
 });
 
 test("suggestConfig uses fast for explorers and judgment for prose", () => {
