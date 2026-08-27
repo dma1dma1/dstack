@@ -3,7 +3,16 @@ import { constants } from "node:fs";
 import { lstat, mkdir, open, realpath } from "node:fs/promises";
 import { isAbsolute, join, normalize } from "node:path";
 import { atomicWriteFile, readOutputArtifact, sealBytes, toSha256, type OutputArtifactSeal } from "./artifacts.ts";
-import { executeWorkflow, verifyChildOutputs, type WorkflowManifestV1, type WorkflowResultIndexV1 } from "./workflow.ts";
+import {
+	compactResultIndex,
+	executeWorkflow,
+	verifyChildOutputs,
+	type ChildIndexEntry,
+	type WorkflowExecutionResult,
+	type WorkflowManifestV1,
+	type WorkflowResultIndexV2,
+} from "./workflow.ts";
+import { parseChildSessionRef } from "./session.ts";
 import { parseWorkflowContext } from "../workflow-context.ts";
 
 export const RUNNER_PREFLIGHT_PROTOCOL = "dstack.runner-preflight.v1";
@@ -167,18 +176,19 @@ function digest(bytes: Buffer): string {
 	return createHash("sha256").update(bytes).digest("hex");
 }
 
-export async function commitWorkflowResult(manifest: WorkflowManifestV1, index: WorkflowResultIndexV1): Promise<void> {
+export async function commitWorkflowResult(manifest: WorkflowManifestV1, execution: WorkflowExecutionResult): Promise<void> {
+	const index = compactResultIndex(execution);
 	const indexPath = join(manifest.artifactDir, "result-index.json");
 	const indexBytes = Buffer.from(`${JSON.stringify(index)}\n`);
 	await atomicWriteFile(indexPath, indexBytes);
 	const marker: CommitMarker = {
 		schemaVersion: COMMIT_SCHEMA,
 		workflowId: manifest.workflowId,
-		manifestSha256: index.manifestSha256,
+		manifestSha256: execution.manifestSha256,
 		resultIndex: sealBytes(indexPath, indexBytes),
 	};
 	await atomicWriteFile(join(manifest.artifactDir, "COMMITTED"), `${JSON.stringify(marker)}\n`);
-	await readCommittedWorkflowResult(manifest.artifactDir, index.manifestSha256, manifest.workflowId);
+	await readCommittedWorkflowResult(manifest.artifactDir, execution.manifestSha256, manifest.workflowId);
 }
 
 function parseSeal(value: unknown, expectedPath: string): OutputArtifactSeal {
@@ -209,14 +219,43 @@ function validateTaskResult(value: unknown, index: number): void {
 	}
 }
 
-function parseResultIndex(value: unknown, artifactDir: string, workflowId: string, manifestSha256: string): WorkflowResultIndexV1 {
+function verifySummaryAndOutcome(input: Readonly<{
+	summaryValue: JsonRecord;
+	outcome: unknown;
+	states: readonly ("succeeded" | "failed" | "cancelled" | "skipped")[];
+}>): Readonly<{ total: number; succeeded: number; failed: number; cancelled: number; outcome: "succeeded" | "failed" | "cancelled" }> {
+	const { summaryValue, outcome, states } = input;
+	if (outcome !== "succeeded" && outcome !== "failed" && outcome !== "cancelled") throw new Error("result index outcome is invalid");
+	const summaryKeys = ["total", "succeeded", "failed", "cancelled"] as const;
+	for (const key of summaryKeys) if (!Number.isSafeInteger(summaryValue[key]) || Number(summaryValue[key]) < 0) throw new Error("result index summary is invalid");
+	if (summaryValue["total"] !== states.length) throw new Error("result index summary total is invalid");
+	const succeededCount = states.filter((state) => state === "succeeded").length;
+	const cancelledCount = states.filter((state) => state === "cancelled").length;
+	const failedCount = states.length - succeededCount - cancelledCount;
+	if (summaryValue["succeeded"] !== succeededCount || summaryValue["failed"] !== failedCount || summaryValue["cancelled"] !== cancelledCount) {
+		throw new Error("result index summary does not match child states");
+	}
+	const expectedOutcome = cancelledCount > 0 ? "cancelled" : failedCount > 0 ? "failed" : "succeeded";
+	if (outcome !== expectedOutcome) throw new Error("result index outcome does not match child states");
+	return {
+		total: Number(summaryValue["total"]),
+		succeeded: succeededCount,
+		failed: failedCount,
+		cancelled: cancelledCount,
+		outcome,
+	};
+}
+
+function parseResultIndexMode(value: unknown): "single" | "parallel" | "chain" {
+	if (value !== "single" && value !== "parallel" && value !== "chain") throw new Error("result index mode is invalid");
+	return value;
+}
+
+function parseResultIndexV1(value: unknown, artifactDir: string, workflowId: string, manifestSha256: string): WorkflowExecutionResult {
 	const raw = record(value, "result index");
 	if (raw["schemaVersion"] !== "dstack.result-index.v1") throw new Error("result index schema is invalid");
 	if (raw["workflowId"] !== workflowId || raw["manifestSha256"] !== manifestSha256) throw new Error("result index identity mismatch");
-	const mode = raw["mode"];
-	if (mode !== "single" && mode !== "parallel" && mode !== "chain") throw new Error("result index mode is invalid");
-	const outcome = raw["outcome"];
-	if (outcome !== "succeeded" && outcome !== "failed" && outcome !== "cancelled") throw new Error("result index outcome is invalid");
+	const mode = parseResultIndexMode(raw["mode"]);
 	const rawChildren = raw["children"];
 	if (!Array.isArray(rawChildren)) throw new Error("result index children must be an array");
 	const children = rawChildren.map((value, index) => {
@@ -237,36 +276,80 @@ function parseResultIndex(value: unknown, artifactDir: string, workflowId: strin
 	}
 	packageValue["results"].forEach(validateTaskResult);
 	if (children.length === 0 || (mode === "single" && children.length !== 1)) throw new Error("result index child count is invalid");
-	const summaryValue = record(raw["summary"], "result index summary");
-	const summaryKeys = ["total", "succeeded", "failed", "cancelled"] as const;
-	for (const key of summaryKeys) if (!Number.isSafeInteger(summaryValue[key]) || Number(summaryValue[key]) < 0) throw new Error("result index summary is invalid");
-	if (summaryValue["total"] !== children.length) throw new Error("result index summary total is invalid");
-	const succeededCount = children.filter((child) => child.state === "succeeded").length;
-	const cancelledCount = children.filter((child) => child.state === "cancelled").length;
-	const failedCount = children.length - succeededCount - cancelledCount;
-	if (summaryValue["succeeded"] !== succeededCount || summaryValue["failed"] !== failedCount || summaryValue["cancelled"] !== cancelledCount) {
-		throw new Error("result index summary does not match child states");
-	}
-	const expectedOutcome = cancelledCount > 0 ? "cancelled" : failedCount > 0 ? "failed" : "succeeded";
-	if (outcome !== expectedOutcome) throw new Error("result index outcome does not match child states");
+	const verified = verifySummaryAndOutcome({
+		summaryValue: record(raw["summary"], "result index summary"),
+		outcome: raw["outcome"],
+		states: children.map((child) => child.state),
+	});
 	return {
-		schemaVersion: "dstack.result-index.v1",
 		workflowId,
 		manifestSha256,
 		mode,
-		outcome,
-		summary: {
-			total: Number(summaryValue["total"]),
-			succeeded: Number(summaryValue["succeeded"]),
-			failed: Number(summaryValue["failed"]),
-			cancelled: Number(summaryValue["cancelled"]),
-		},
+		outcome: verified.outcome,
+		summary: { total: verified.total, succeeded: verified.succeeded, failed: verified.failed, cancelled: verified.cancelled },
 		package: { mode, results: packageValue["results"] },
 		children,
 	};
 }
 
-export async function readCommittedWorkflowResult(artifactDir: string, manifestSha256: string, workflowId: string): Promise<WorkflowResultIndexV1> {
+type ParsedResultIndexV2 = Readonly<{
+	index: WorkflowResultIndexV2;
+	childResultSeals: readonly OutputArtifactSeal[];
+}>;
+
+function parseResultIndexV2(value: unknown, artifactDir: string, workflowId: string, manifestSha256: string): ParsedResultIndexV2 {
+	const raw = record(value, "result index");
+	if (raw["schemaVersion"] !== "dstack.result-index.v2") throw new Error("result index schema is invalid");
+	if (raw["workflowId"] !== workflowId || raw["manifestSha256"] !== manifestSha256) throw new Error("result index identity mismatch");
+	const mode = parseResultIndexMode(raw["mode"]);
+	const rawChildren = raw["children"];
+	if (!Array.isArray(rawChildren)) throw new Error("result index children must be an array");
+	const children = rawChildren.map((value, index) => {
+		const child = record(value, `result index child ${index}`);
+		if (child["index"] !== index) throw new Error("result index child order is invalid");
+		const state = childState(child["state"]);
+		const summary = record(child["summary"], `result index child ${index} summary`);
+		const agent = string(summary["agent"], `result index child ${index} summary.agent`);
+		if (typeof summary["task"] !== "string" || typeof summary["text"] !== "string") throw new Error("result index child summary is invalid");
+		if (!Number.isSafeInteger(summary["exitCode"])) throw new Error("result index child summary exitCode is invalid");
+		const directory = join(artifactDir, "children", String(index));
+		return {
+			index,
+			state,
+			summary: { agent, task: summary["task"], exitCode: Number(summary["exitCode"]), text: summary["text"] },
+			result: parseSeal(child["result"], join(directory, "result.json")),
+		};
+	});
+	if (children.length === 0 || (mode === "single" && children.length !== 1)) throw new Error("result index child count is invalid");
+	const verified = verifySummaryAndOutcome({
+		summaryValue: record(raw["summary"], "result index summary"),
+		outcome: raw["outcome"],
+		states: children.map((child) => child.state),
+	});
+	return {
+		index: {
+			schemaVersion: "dstack.result-index.v2",
+			workflowId,
+			manifestSha256,
+			mode,
+			outcome: verified.outcome,
+			summary: { total: verified.total, succeeded: verified.succeeded, failed: verified.failed, cancelled: verified.cancelled },
+			children,
+		},
+		childResultSeals: children.map((child) => child.result),
+	};
+}
+
+async function verifyChildMetadata(child: Readonly<{ index: number; state: string; result: OutputArtifactSeal }>, workflowId: string): Promise<JsonRecord> {
+	const metadataBytes = await readOutputArtifact(child.result);
+	const metadata = record(JSON.parse(metadataBytes.toString("utf8")) as unknown, "child result metadata");
+	if (metadata["schemaVersion"] !== "dstack.child-result.v1" || metadata["workflowId"] !== workflowId || metadata["index"] !== child.index || metadata["state"] !== child.state) {
+		throw new Error("child result metadata identity mismatch");
+	}
+	return metadata;
+}
+
+export async function readCommittedWorkflowResult(artifactDir: string, manifestSha256: string, workflowId: string): Promise<WorkflowExecutionResult> {
 	const markerBytes = await readFileNoFollow(join(artifactDir, "COMMITTED"));
 	const marker = record(JSON.parse(markerBytes.toString("utf8")) as unknown, "commit marker");
 	if (marker["schemaVersion"] !== COMMIT_SCHEMA || marker["workflowId"] !== workflowId || marker["manifestSha256"] !== manifestSha256) {
@@ -274,18 +357,51 @@ export async function readCommittedWorkflowResult(artifactDir: string, manifestS
 	}
 	const indexSeal = parseSeal(marker["resultIndex"], join(artifactDir, "result-index.json"));
 	const indexBytes = await readOutputArtifact(indexSeal);
-	const index = parseResultIndex(JSON.parse(indexBytes.toString("utf8")) as unknown, artifactDir, workflowId, manifestSha256);
-	await verifyChildOutputs(index);
-	for (const child of index.children) {
-		const metadataBytes = await readOutputArtifact(child.result);
-		const metadata = record(JSON.parse(metadataBytes.toString("utf8")) as unknown, "child result metadata");
-		if (metadata["schemaVersion"] !== "dstack.child-result.v1" || metadata["workflowId"] !== workflowId || metadata["index"] !== child.index || metadata["state"] !== child.state) {
-			throw new Error("child result metadata identity mismatch");
+	const rawIndex = JSON.parse(indexBytes.toString("utf8")) as unknown;
+	const schemaVersion = record(rawIndex, "result index")["schemaVersion"];
+	if (schemaVersion === "dstack.result-index.v1") {
+		const index = parseResultIndexV1(rawIndex, artifactDir, workflowId, manifestSha256);
+		await verifyChildOutputs(index);
+		for (const child of index.children) {
+			const metadata = await verifyChildMetadata(child, workflowId);
+			if (JSON.stringify(metadata["output"]) !== JSON.stringify(child.output)) throw new Error("child result output seal mismatch");
+			if (JSON.stringify(metadata["result"]) !== JSON.stringify(index.package.results[child.index])) throw new Error("child result package mismatch");
 		}
-		if (JSON.stringify(metadata["output"]) !== JSON.stringify(child.output)) throw new Error("child result output seal mismatch");
-		if (JSON.stringify(metadata["result"]) !== JSON.stringify(index.package.results[child.index])) throw new Error("child result package mismatch");
+		return index;
 	}
-	return index;
+	if (schemaVersion !== "dstack.result-index.v2") throw new Error("result index schema is invalid");
+	const { index } = parseResultIndexV2(rawIndex, artifactDir, workflowId, manifestSha256);
+	const results: unknown[] = [];
+	const children: ChildIndexEntry[] = [];
+	for (const child of index.children) {
+		const directory = join(artifactDir, "children", String(child.index));
+		const metadata = await verifyChildMetadata(child, workflowId);
+		const output = parseSeal(metadata["output"], join(directory, "output.txt"));
+		await readOutputArtifact(output);
+		validateTaskResult(metadata["result"], child.index);
+		const result = record(metadata["result"], `result index package result ${child.index}`);
+		if (result["agent"] !== child.summary.agent || result["exitCode"] !== child.summary.exitCode) {
+			throw new Error("child result summary mismatch");
+		}
+		results.push(metadata["result"]);
+		const session = parseChildSessionRef(metadata["session"]);
+		children.push({
+			index: child.index,
+			state: child.state,
+			output,
+			result: child.result,
+			...(session !== undefined ? { session } : {}),
+		});
+	}
+	return {
+		workflowId,
+		manifestSha256,
+		mode: index.mode,
+		outcome: index.outcome,
+		summary: index.summary,
+		package: { mode: index.mode, results: results as WorkflowExecutionResult["package"]["results"] },
+		children,
+	};
 }
 
 export function runRuntimePreflight(argv: readonly string[]): number {

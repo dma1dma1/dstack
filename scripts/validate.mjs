@@ -466,7 +466,7 @@ async function main() {
 	assert("child-no-extensions", lastKid.noExtensions === true);
 	assert("child-explicit-dstack", lastKid.explicitExtension === join(root, "extensions/dstack.ts"), String(lastKid.explicitExtension));
 	assert("child-nesting-env", lastKid.nesting === "2");
-	assert("child-tools-allowlist", lastKid.tools === "read,grep,find,ls", String(lastKid.tools));
+	assert("child-tools-allowlist", lastKid.tools === "read,grep,find,ls,dstack_status", String(lastKid.tools));
 
 	const parallel = await pi.tools.get("dstack_task").execute(
 		"12",

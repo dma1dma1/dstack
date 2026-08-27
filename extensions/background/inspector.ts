@@ -1,3 +1,4 @@
+import type { Stats } from "node:fs";
 import { open, readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { matchesKey, truncateToWidth, visibleWidth, type Component, type TUI } from "@earendil-works/pi-tui";
@@ -16,6 +17,7 @@ import {
 	type BuildTreeSnapshotInput,
 	type NestedChild,
 	type NestedGroup,
+	type SessionRefCache,
 	type SpawnNestedChild,
 	type TreeChild,
 	type TreeChildState,
@@ -24,6 +26,14 @@ import {
 } from "./tree.ts";
 import { formatRecentActivity, type SemanticStatus } from "./journal.ts";
 import type { OutputArtifactSeal } from "./artifacts.ts";
+import {
+	createSessionTailState,
+	tailSessionFile,
+	type ChildSessionRefV1,
+	type SessionTailRecord,
+	type SessionTailState,
+} from "./session.ts";
+import { snapshotActiveLeases, type LeaseSnapshot } from "./scheduler.ts";
 import { sessionRoot } from "./launch.ts";
 import { todoFilePath } from "../todo.ts";
 import type { TodoItem, WorkflowContext } from "../types.ts";
@@ -202,47 +212,172 @@ function parseBindingFile(raw: unknown): BindingFile | undefined {
 	return { taskId: raw.taskId, workflowId: raw.workflowId };
 }
 
-export async function listSessionWorkflows(sessionId: string): Promise<WorkflowSummary[]> {
+export type DirectoryToken = Readonly<{
+	dev: number;
+	ino: number;
+	mtimeMs: number;
+	ctimeMs: number;
+	size: number;
+}>;
+
+function directoryTokenOf(stats: { dev: number; ino: number; mtimeMs: number; ctimeMs: number; size: number }): DirectoryToken {
+	return {
+		dev: stats.dev,
+		ino: stats.ino,
+		mtimeMs: stats.mtimeMs,
+		ctimeMs: stats.ctimeMs,
+		size: stats.size,
+	};
+}
+
+function directoryTokenMatches(a?: DirectoryToken, b?: DirectoryToken): boolean {
+	if (a === undefined || b === undefined) return false;
+	return a.dev === b.dev && a.ino === b.ino && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs && a.size === b.size;
+}
+
+export type WorkflowListCache = {
+	readonly bindings: Map<string, string>;
+	readonly summaries: Map<string, WorkflowSummary>;
+	bindingsDirToken?: DirectoryToken;
+	workflowsDirToken?: DirectoryToken;
+	workflowIds?: readonly string[];
+};
+
+export function createWorkflowListCache(): WorkflowListCache {
+	return {
+		bindings: new Map(),
+		summaries: new Map(),
+	};
+}
+
+const defaultSessionWorkflowCaches = new Map<string, WorkflowListCache>();
+
+export function getSessionWorkflowCache(sessionId: string): WorkflowListCache {
+	let cache = defaultSessionWorkflowCaches.get(sessionId);
+	if (cache === undefined) {
+		if (defaultSessionWorkflowCaches.size >= 32) {
+			const oldest = defaultSessionWorkflowCaches.keys().next().value;
+			if (oldest !== undefined) defaultSessionWorkflowCaches.delete(oldest);
+		}
+		cache = createWorkflowListCache();
+		defaultSessionWorkflowCaches.set(sessionId, cache);
+	}
+	return cache;
+}
+
+export function resetWorkflowListCache(sessionId?: string): void {
+	if (sessionId !== undefined) {
+		defaultSessionWorkflowCaches.delete(sessionId);
+	} else {
+		defaultSessionWorkflowCaches.clear();
+	}
+}
+
+export type ListSessionWorkflowsIO = Readonly<{
+	stat?: (path: string) => Promise<Stats>;
+	readdir?: (path: string) => Promise<string[]>;
+	readFile?: (path: string, encoding: "utf8") => Promise<string>;
+}>;
+
+export async function listSessionWorkflows(
+	sessionId: string,
+	cache?: WorkflowListCache,
+	io: ListSessionWorkflowsIO = {},
+): Promise<WorkflowSummary[]> {
+	const effectiveStat = io.stat ?? ((path: string) => stat(path));
+	const effectiveReaddir = io.readdir ?? ((path: string) => readdir(path));
+	const effectiveReadFile = io.readFile ?? ((path: string, encoding: "utf8") => readFile(path, encoding));
+
+	const effectiveCache = cache ?? getSessionWorkflowCache(sessionId);
 	const root = sessionRoot(sessionId);
 	const workflowsDir = join(root, "workflows");
 	const bindingsDir = join(root, "bindings");
 	const schedulerRoot = join(root, "scheduler");
 
-	const workflowToTaskId = new Map<string, string>();
 	try {
-		const bindingEntries = await readdir(bindingsDir);
-		for (const entry of bindingEntries) {
-			if (!entry.endsWith(".json")) continue;
-			try {
-				const content = await readFile(join(bindingsDir, entry), "utf8");
-				const binding = parseBindingFile(JSON.parse(content));
-				if (binding !== undefined) {
-					workflowToTaskId.set(binding.workflowId, binding.taskId);
-				}
-			} catch {}
+		const bindingsStats = await effectiveStat(bindingsDir);
+		const currentToken = directoryTokenOf(bindingsStats);
+		if (!directoryTokenMatches(effectiveCache.bindingsDirToken, currentToken)) {
+			const bindingEntries = await effectiveReaddir(bindingsDir);
+			for (const entry of bindingEntries) {
+				if (!entry.endsWith(".json")) continue;
+				if (effectiveCache.bindings.has(entry)) continue;
+				try {
+					const content = await effectiveReadFile(join(bindingsDir, entry), "utf8");
+					const binding = parseBindingFile(JSON.parse(content));
+					if (binding !== undefined) {
+						effectiveCache.bindings.set(entry, binding.taskId);
+						effectiveCache.bindings.set(`wf:${binding.workflowId}`, binding.taskId);
+					}
+				} catch {}
+			}
+			effectiveCache.bindingsDirToken = currentToken;
 		}
 	} catch (error) {
-		if (!hasErrorCode(error, "ENOENT")) throw error;
+		if (hasErrorCode(error, "ENOENT")) {
+			effectiveCache.bindingsDirToken = undefined;
+		} else {
+			throw error;
+		}
+	}
+
+	let workflowEntries: readonly string[];
+	try {
+		const workflowsStats = await effectiveStat(workflowsDir);
+		const currentWorkflowsToken = directoryTokenOf(workflowsStats);
+		if (!directoryTokenMatches(effectiveCache.workflowsDirToken, currentWorkflowsToken) || effectiveCache.workflowIds === undefined) {
+			const rawEntries = await effectiveReaddir(workflowsDir);
+			workflowEntries = rawEntries;
+			effectiveCache.workflowIds = rawEntries;
+			effectiveCache.workflowsDirToken = currentWorkflowsToken;
+
+			const activeWorkflowIds = new Set(workflowEntries);
+			for (const cachedId of Array.from(effectiveCache.summaries.keys())) {
+				if (!activeWorkflowIds.has(cachedId)) {
+					effectiveCache.summaries.delete(cachedId);
+				}
+			}
+		} else {
+			workflowEntries = effectiveCache.workflowIds;
+		}
+	} catch (error) {
+		if (hasErrorCode(error, "ENOENT")) {
+			effectiveCache.workflowsDirToken = undefined;
+			effectiveCache.workflowIds = undefined;
+			effectiveCache.summaries.clear();
+			return [];
+		}
+		throw error;
 	}
 
 	const summaries: WorkflowSummary[] = [];
-	try {
-		const workflowEntries = await readdir(workflowsDir);
-		for (const wfId of workflowEntries) {
-			const artifactDir = join(workflowsDir, wfId);
-			let committed = false;
-			try {
-				await stat(join(artifactDir, "COMMITTED"));
-				committed = true;
-			} catch {
-				committed = false;
-			}
+	for (const wfId of workflowEntries) {
+		const artifactDir = join(workflowsDir, wfId);
+		const cached = effectiveCache.summaries.get(wfId);
 
-			let createdAt = "";
-			let playbook: string | undefined;
-			let manifest: WorkflowManifestState;
+		if (cached !== undefined && cached.committed) {
+			const taskId = effectiveCache.bindings.get(`wf:${wfId}`) ?? wfId;
+			const current = cached.taskId === taskId ? cached : { ...cached, taskId };
+			if (current !== cached) effectiveCache.summaries.set(wfId, current);
+			summaries.push(current);
+			continue;
+		}
+
+		let committed = false;
+		try {
+			await effectiveStat(join(artifactDir, "COMMITTED"));
+			committed = true;
+		} catch {
+			committed = false;
+		}
+
+		let createdAt = cached?.createdAt ?? "";
+		let playbook: string | undefined = cached?.playbook;
+		let manifest: WorkflowManifestState = cached?.manifest ?? { kind: "pending" };
+
+		if (cached === undefined || cached.manifest.kind !== "ok") {
 			try {
-				const manifestBytes = await readFile(join(artifactDir, "manifest.json"), "utf8");
+				const manifestBytes = await effectiveReadFile(join(artifactDir, "manifest.json"), "utf8");
 				try {
 					const parsed = parseManifestForTree(JSON.parse(manifestBytes));
 					if (parsed !== undefined) {
@@ -265,28 +400,28 @@ export async function listSessionWorkflows(sessionId: string): Promise<WorkflowS
 
 			if (createdAt === "") {
 				try {
-					const dirStat = await stat(artifactDir);
+					const dirStat = await effectiveStat(artifactDir);
 					createdAt = dirStat.mtime.toISOString();
 				} catch {
 					createdAt = new Date().toISOString();
 				}
 			}
-
-			const taskId = workflowToTaskId.get(wfId) ?? wfId;
-			summaries.push({
-				workflowId: wfId,
-				taskId,
-				artifactDir,
-				schedulerRoot,
-				committed,
-				createdAt,
-				playbook,
-				manifest,
-			});
 		}
-	} catch (error) {
-		if (hasErrorCode(error, "ENOENT")) return [];
-		throw error;
+
+		const taskId = effectiveCache.bindings.get(`wf:${wfId}`) ?? wfId;
+		const summary: WorkflowSummary = {
+			workflowId: wfId,
+			taskId,
+			artifactDir,
+			schedulerRoot,
+			committed,
+			createdAt,
+			playbook,
+			manifest,
+		};
+
+		effectiveCache.summaries.set(wfId, summary);
+		summaries.push(summary);
 	}
 
 	return summaries.sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
@@ -579,9 +714,10 @@ export type AgentInspection = Readonly<{
 	input: AgentInput;
 	output?: AgentOutput;
 	raw: RawAvailability;
+	session?: ChildSessionRefV1;
 }>;
 
-export type DetailViewMode = "summary" | "task" | "final" | "raw";
+export type DetailViewMode = "conversation" | "summary" | "task" | "final" | "raw";
 
 export function buildAgentInspection(
 	snapshot: TreeSnapshot,
@@ -706,6 +842,7 @@ export function buildAgentInspection(
 			},
 			output,
 			raw,
+			session: !isLeaseSnapshot(nested) ? nested.session : undefined,
 		};
 	}
 
@@ -804,6 +941,7 @@ export function buildAgentInspection(
 		},
 		output,
 		raw,
+		session: child.session,
 	};
 }
 
@@ -834,7 +972,11 @@ export type NavigableItem =
 			nestedIndex: number;
 	  }>;
 
-export type AgentInspectorResult = "closed";
+export type AgentInspectorAction =
+	| Readonly<{ action: "resume"; sessionFile: string }>
+	| Readonly<{ action: "fork"; sessionFile: string; cwd?: string }>;
+
+export type AgentInspectorResult = AgentInspectorAction | "closed";
 
 export interface InspectorTheme {
 	fg(color: string, text: string): string;
@@ -852,12 +994,14 @@ export type AgentInspectorOptions = Readonly<{
 	initialView?: DetailViewMode;
 	todoPath?: string;
 	refreshIntervalMs?: number;
+	pollIntervalMs?: number;
 	terminalRows?: number | (() => number);
 	listWorkflows?: (sessionId: string) => Promise<readonly WorkflowSummary[]>;
 	getSnapshot?: (input: BuildTreeSnapshotInput) => Promise<TreeSnapshot | undefined>;
 	readOutputTail?: (filePath: string, maxBytes?: number) => Promise<BoundedReadResult>;
 	readChildResult?: (artifactDir: string, childIndex: number) => Promise<ChildResultDetails | undefined>;
 	readChildActivity?: (artifactDir: string, childIndex: number, workflowId: string) => Promise<ChildResultDetails | undefined>;
+	tailSession?: typeof tailSessionFile;
 	now?: () => Date;
 }>;
 
@@ -884,6 +1028,154 @@ function toOutputLines(content: string): string[] {
 		.filter((line, index, array) => line.length > 0 || index < array.length - 1);
 }
 
+export function formatConversationRecords(
+	records: readonly SessionTailRecord[],
+	theme: InspectorTheme,
+	width: number,
+): string[] {
+	const lines: string[] = [];
+	const contentWidth = Math.max(10, width - 4);
+
+	for (const record of records) {
+		if (!isRecord(record)) continue;
+		if (record.type === "session") {
+			continue;
+		}
+
+		if (record.type === "message" && isRecord(record.message)) {
+			const msg = record.message;
+			const role = typeof msg.role === "string" ? msg.role : "";
+
+			if (role === "user") {
+				if (lines.length > 0) lines.push("");
+				const userHeading = theme.bold ? theme.bold(theme.fg("accent", "👤 User")) : theme.fg("accent", "👤 User");
+				lines.push(` ${userHeading}`);
+				let text = "";
+				if (typeof msg.content === "string") {
+					text = msg.content;
+				} else if (Array.isArray(msg.content)) {
+					text = msg.content
+						.filter((p) => isRecord(p) && p.type === "text" && typeof p.text === "string")
+						.map((p) => p.text)
+						.join("\n");
+				}
+				if (text) {
+					for (const line of wrapText(text, contentWidth)) {
+						lines.push(`   ${line}`);
+					}
+				}
+			} else if (role === "assistant") {
+				if (lines.length > 0) lines.push("");
+				const modelLabel = typeof msg.model === "string" && msg.model ? ` ${theme.fg("dim", `(${msg.model})`)}` : "";
+				const asstHeading = theme.bold ? theme.bold(theme.fg("success", "🤖 Assistant")) : theme.fg("success", "🤖 Assistant");
+				lines.push(` ${asstHeading}${modelLabel}`);
+
+				if (Array.isArray(msg.content)) {
+					for (const part of msg.content) {
+						if (!isRecord(part)) continue;
+						if (part.type === "thinking" && typeof part.thinking === "string") {
+							const thinkingLines = wrapText(part.thinking.trim(), contentWidth - 2);
+							if (thinkingLines.length > 0) {
+								lines.push(`   ${theme.fg("dim", `💭 ${thinkingLines[0]}`)}`);
+								for (let i = 1; i < thinkingLines.length; i++) {
+									lines.push(`      ${theme.fg("dim", thinkingLines[i])}`);
+								}
+							}
+						} else if (part.type === "text" && typeof part.text === "string") {
+							for (const line of wrapText(part.text, contentWidth)) {
+								lines.push(`   ${line}`);
+							}
+						} else if (part.type === "toolCall" && typeof part.name === "string") {
+							const argsStr = formatToolArgsPreview(part.arguments);
+							lines.push(`   ${theme.fg("warning", `🔧 ${part.name}(${argsStr})`)}`);
+						}
+					}
+				} else if (typeof msg.content === "string") {
+					for (const line of wrapText(msg.content, contentWidth)) {
+						lines.push(`   ${line}`);
+					}
+				}
+
+				if (typeof msg.errorMessage === "string" && msg.errorMessage) {
+					lines.push(`   ${theme.fg("error", `Error: ${msg.errorMessage}`)}`);
+				}
+			} else if (role === "toolResult") {
+				const toolName = typeof msg.toolName === "string" ? msg.toolName : "tool";
+				const isError = Boolean(msg.isError);
+				const statusBadge = isError ? ` ${theme.fg("error", "[error]")}` : "";
+				lines.push(`   ${theme.fg("dim", `⎿ ${toolName}${statusBadge}`)}`);
+
+				let text = "";
+				if (typeof msg.content === "string") {
+					text = msg.content;
+				} else if (Array.isArray(msg.content)) {
+					text = msg.content
+						.filter((p) => isRecord(p) && p.type === "text" && typeof p.text === "string")
+						.map((p) => p.text)
+						.join("\n");
+				}
+				if (text) {
+					const wrapped = wrapText(text, contentWidth - 4);
+					const maxPreviewLines = 15;
+					const preview = wrapped.slice(0, maxPreviewLines);
+					for (const line of preview) {
+						lines.push(`     ${theme.fg("dim", line)}`);
+					}
+					if (wrapped.length > maxPreviewLines) {
+						lines.push(`     ${theme.fg("dim", `... (${wrapped.length - maxPreviewLines} more lines)`)}`);
+					}
+				}
+			} else if (role === "bashExecution") {
+				const cmd = typeof msg.command === "string" ? msg.command : "";
+				const exitCode = typeof msg.exitCode === "number" ? msg.exitCode : 0;
+				const statusBadge = exitCode !== 0 ? ` ${theme.fg("error", `(exit ${exitCode})`)}` : "";
+				lines.push(`   ${theme.fg("dim", `⚡ bash: ${cmd}${statusBadge}`)}`);
+				if (typeof msg.output === "string" && msg.output) {
+					const wrapped = wrapText(msg.output, contentWidth - 4);
+					const maxPreviewLines = 15;
+					const preview = wrapped.slice(0, maxPreviewLines);
+					for (const line of preview) {
+						lines.push(`     ${theme.fg("dim", line)}`);
+					}
+					if (wrapped.length > maxPreviewLines) {
+						lines.push(`     ${theme.fg("dim", `... (${wrapped.length - maxPreviewLines} more lines)`)}`);
+					}
+				}
+			}
+		} else if (record.type === "compaction" && typeof record.summary === "string") {
+			if (lines.length > 0) lines.push("");
+			lines.push(` ${theme.fg("dim", "─── Context Compacted ───")}`);
+			for (const line of wrapText(record.summary, contentWidth)) {
+				lines.push(`   ${theme.fg("dim", line)}`);
+			}
+		} else if (record.type === "model_change" && typeof record.modelId === "string") {
+			const provider = typeof record.provider === "string" ? `${record.provider}/` : "";
+			lines.push(` ${theme.fg("dim", `─── Model changed to ${provider}${record.modelId} ───`)}`);
+		}
+	}
+
+	return lines;
+}
+
+function formatToolArgsPreview(args: unknown): string {
+	if (!isRecord(args)) return "";
+	if (typeof args.path === "string") return `path: "${args.path}"`;
+	if (typeof args.command === "string") {
+		const cmd = args.command.length > 35 ? `${args.command.slice(0, 32)}...` : args.command;
+		return `"${cmd}"`;
+	}
+	if (typeof args.task === "string") {
+		const task = args.task.length > 35 ? `${args.task.slice(0, 32)}...` : args.task;
+		return `task: "${task}"`;
+	}
+	try {
+		const raw = JSON.stringify(args);
+		return raw.length > 40 ? `${raw.slice(0, 37)}...` : raw;
+	} catch {
+		return "";
+	}
+}
+
 export class AgentInspector implements Component {
 	private stack: Frame[] = [{ kind: "list" }];
 	private workflows: WorkflowSummary[] = [];
@@ -894,7 +1186,7 @@ export class AgentInspector implements Component {
 	private listScroll = 0;
 	private visibleItems: NavigableItem[] = [];
 
-	private detailView: DetailViewMode = "summary";
+	private detailView: DetailViewMode = "conversation";
 	private summaryScrollTop = 0;
 	private lastSummaryLineCount = 0;
 	private taskScrollTop = 0;
@@ -902,6 +1194,13 @@ export class AgentInspector implements Component {
 	private finalScrollTop = 0;
 	private lastFinalLineCount = 0;
 	private lastFinalVisibleRows = deriveInspectorLayoutMetrics().finalVisibleRows;
+
+	private conversationLines: string[] = [];
+	private conversationScrollTop = 0;
+	private conversationFollow = true;
+	private readonly tailStates = new Map<string, SessionTailState>();
+	private readonly sessionRefCache: SessionRefCache = new Map();
+	private readonly tailSessionFn: typeof tailSessionFile;
 
 	private loadError?: string;
 	private disposed = false;
@@ -946,6 +1245,7 @@ export class AgentInspector implements Component {
 		this.readOutputTailFn = options.readOutputTail ?? boundedTailRead;
 		this.readChildResultFn = options.readChildResult ?? readChildResultDetails;
 		this.readChildActivityFn = options.readChildActivity ?? readChildActivityDetails;
+		this.tailSessionFn = options.tailSession ?? tailSessionFile;
 		this.nowFn = options.now ?? (() => new Date());
 
 		if (options.initialView !== undefined) {
@@ -967,7 +1267,7 @@ export class AgentInspector implements Component {
 
 		void this.initialLoad();
 
-		const intervalMs = options.refreshIntervalMs ?? STATUS_INTERVAL_MS;
+		const intervalMs = options.refreshIntervalMs ?? options.pollIntervalMs ?? STATUS_INTERVAL_MS;
 		if (intervalMs > 0) {
 			this.refreshTimer = setInterval(() => {
 				void this.poll();
@@ -982,6 +1282,8 @@ export class AgentInspector implements Component {
 			clearInterval(this.refreshTimer);
 			this.refreshTimer = undefined;
 		}
+		this.tailStates.clear();
+		this.sessionRefCache.clear();
 	}
 
 	invalidate(): void {
@@ -1038,9 +1340,21 @@ export class AgentInspector implements Component {
 
 	private async refreshSnapshots(): Promise<void> {
 		const todoPath = this.options.todoPath ?? todoFilePath(this.options.sessionId);
+		let activeLeases: readonly LeaseSnapshot[] = [];
+		try {
+			const root = sessionRoot(this.options.sessionId);
+			activeLeases = await snapshotActiveLeases(join(root, "scheduler"));
+		} catch {
+			activeLeases = [];
+		}
+
 		for (const wf of this.workflows) {
 			if (this.disposed) return;
 			if (wf.manifest.kind === "corrupt") continue;
+			const existing = this.snapshots.get(wf.workflowId);
+			if (existing !== undefined && existing.committed) {
+				continue;
+			}
 			try {
 				const snapshot = await this.getSnapshotFn({
 					taskId: wf.taskId,
@@ -1049,6 +1363,8 @@ export class AgentInspector implements Component {
 					schedulerRoot: wf.schedulerRoot,
 					todoPath,
 					playbook: wf.playbook,
+					activeLeases,
+					sessionRefCache: this.sessionRefCache,
 					now: this.nowFn(),
 				});
 				if (this.disposed) return;
@@ -1091,10 +1407,14 @@ export class AgentInspector implements Component {
 		return this.stack[this.stack.length - 1] ?? { kind: "list" };
 	}
 
-	private close(): void {
+	private closeWithResult(result: AgentInspectorResult): void {
 		if (this.doneCalled) return;
 		this.doneCalled = true;
-		this.done("closed");
+		this.done(result);
+	}
+
+	private close(): void {
+		this.closeWithResult("closed");
 	}
 
 	handleInput(data: string): void {
@@ -1194,7 +1514,9 @@ export class AgentInspector implements Component {
 					workflowId: item.workflowId,
 					childIndex: item.childIndex,
 				});
-				this.detailView = "summary";
+				this.detailView = "conversation";
+				this.conversationScrollTop = 0;
+				this.conversationFollow = true;
 				this.summaryScrollTop = 0;
 				this.taskScrollTop = 0;
 				this.finalScrollTop = 0;
@@ -1237,7 +1559,9 @@ export class AgentInspector implements Component {
 					nestedGroupId: item.nestedGroupId,
 					nestedIndex: item.nestedIndex,
 				});
-				this.detailView = "summary";
+				this.detailView = "conversation";
+				this.conversationScrollTop = 0;
+				this.conversationFollow = true;
 				this.summaryScrollTop = 0;
 				this.taskScrollTop = 0;
 				this.finalScrollTop = 0;
@@ -1265,8 +1589,41 @@ export class AgentInspector implements Component {
 	}
 
 	private handleDetailInput(data: string, frame: Extract<Frame, { kind: "agent-detail" }>): void {
+		const snapshot = this.snapshots.get(frame.workflowId);
+		const child = snapshot?.children[frame.childIndex];
+		let nestedMatch: SpawnNestedChild | undefined;
+		if (child && frame.nestedGroupId !== undefined && frame.nestedIndex !== undefined) {
+			const candidate = child.nested.find((n) => !isLeaseSnapshot(n) && n.groupId === frame.nestedGroupId && n.nestedIndex === frame.nestedIndex);
+			if (candidate && !isLeaseSnapshot(candidate)) {
+				nestedMatch = candidate;
+			}
+		}
+
+		const isCompleted = nestedMatch
+			? (nestedMatch.state !== "running" && nestedMatch.state !== "queued")
+			: (child !== undefined && child.state !== "running" && child.state !== "queued");
+		const targetSession = nestedMatch ? nestedMatch.session : child?.session;
+		const targetCwd = nestedMatch?.cwd ?? child?.cwd;
+
+		if (isCompleted && targetSession !== undefined) {
+			if (data === "u" || data === "U" || (data === "r" && this.detailView !== "raw") || (data === "R" && this.detailView !== "raw")) {
+				this.closeWithResult({ action: "resume", sessionFile: targetSession.sessionFile });
+				return;
+			}
+			if (data === "k" || data === "K" || data === "F") {
+				this.closeWithResult({ action: "fork", sessionFile: targetSession.sessionFile, cwd: targetCwd });
+				return;
+			}
+		}
+
+		if (data === "c" || data === "C") {
+			this.detailView = "conversation";
+			this.tui.requestRender();
+			return;
+		}
 		if (data === "s" || data === "S") {
 			this.detailView = "summary";
+			this.summaryScrollTop = 0;
 			this.tui.requestRender();
 			return;
 		}
@@ -1276,7 +1633,7 @@ export class AgentInspector implements Component {
 			this.tui.requestRender();
 			return;
 		}
-		if (data === "f" || data === "F") {
+		if (data === "f") {
 			this.detailView = "final";
 			this.finalScrollTop = 0;
 			this.tui.requestRender();
@@ -1290,10 +1647,11 @@ export class AgentInspector implements Component {
 
 		if (matchesKey(data, "left")) {
 			this.stack.pop();
-			this.detailView = "summary";
+			this.detailView = "conversation";
 			this.summaryScrollTop = 0;
 			this.taskScrollTop = 0;
 			this.finalScrollTop = 0;
+			this.conversationScrollTop = 0;
 			this.tui.requestRender();
 			return;
 		}
@@ -1342,7 +1700,9 @@ export class AgentInspector implements Component {
 						nestedGroupId: firstNested.groupId,
 						nestedIndex: firstNested.nestedIndex,
 					});
-					this.detailView = "summary";
+					this.detailView = "conversation";
+					this.conversationScrollTop = 0;
+					this.conversationFollow = true;
 					this.summaryScrollTop = 0;
 					this.taskScrollTop = 0;
 					this.finalScrollTop = 0;
@@ -1376,7 +1736,17 @@ export class AgentInspector implements Component {
 	}
 
 	private scrollActiveDetailView(delta: number): void {
-		if (this.detailView === "task") {
+		if (this.detailView === "conversation") {
+			const visibleRows = Math.max(1, this.layoutMetrics.bodyRows);
+			const maxTop = Math.max(0, this.conversationLines.length - visibleRows);
+			if (delta < 0) {
+				this.conversationFollow = false;
+			}
+			this.conversationScrollTop = Math.min(maxTop, Math.max(0, this.conversationScrollTop + delta));
+			if (this.conversationScrollTop >= maxTop) {
+				this.conversationFollow = true;
+			}
+		} else if (this.detailView === "task") {
 			const maxTop = Math.max(0, this.lastTaskLineCount - this.layoutMetrics.taskVisibleRows);
 			this.taskScrollTop = Math.min(maxTop, Math.max(0, this.taskScrollTop + delta));
 		} else if (this.detailView === "final") {
@@ -1393,7 +1763,12 @@ export class AgentInspector implements Component {
 	}
 
 	private scrollActiveDetailViewTo(target: number): void {
-		if (this.detailView === "task") {
+		if (this.detailView === "conversation") {
+			const visibleRows = Math.max(1, this.layoutMetrics.bodyRows);
+			const maxTop = Math.max(0, this.conversationLines.length - visibleRows);
+			this.conversationFollow = target >= maxTop;
+			this.conversationScrollTop = Math.min(maxTop, Math.max(0, target));
+		} else if (this.detailView === "task") {
 			const maxTop = Math.max(0, this.lastTaskLineCount - this.layoutMetrics.taskVisibleRows);
 			this.taskScrollTop = Math.min(maxTop, Math.max(0, target));
 		} else if (this.detailView === "final") {
@@ -1444,6 +1819,41 @@ export class AgentInspector implements Component {
 			if (this.disposed) return;
 			this.childResultDetails = undefined;
 			this.childActivityDetails = undefined;
+		}
+
+		const snapshot = this.snapshots.get(frame.workflowId);
+		const child = snapshot?.children[frame.childIndex];
+		let targetSession: ChildSessionRefV1 | undefined = child?.session;
+
+		if (frame.nestedGroupId !== undefined && frame.nestedIndex !== undefined && child !== undefined) {
+			const nested = child.nested.find(
+				(n) => !isLeaseSnapshot(n) && n.groupId === frame.nestedGroupId && n.nestedIndex === frame.nestedIndex,
+			);
+			if (nested && !isLeaseSnapshot(nested)) {
+				targetSession = nested.session;
+			}
+		}
+
+		if (targetSession !== undefined && targetSession.sessionFile) {
+			let tailState = this.tailStates.get(targetSession.sessionFile);
+			if (tailState === undefined) {
+				if (this.tailStates.size >= 50) {
+					const oldest = this.tailStates.keys().next().value;
+					if (oldest !== undefined) this.tailStates.delete(oldest);
+				}
+				tailState = createSessionTailState();
+				this.tailStates.set(targetSession.sessionFile, tailState);
+			}
+			const tailRes = await this.tailSessionFn(tailState, targetSession.sessionFile);
+			if (this.disposed) return;
+			if (tailRes.changed || this.conversationLines.length === 0) {
+				this.conversationLines = formatConversationRecords(tailRes.records, this.theme, Math.max(30, this.layoutMetrics.summaryVisibleRows * 4));
+				if (this.conversationFollow) {
+					this.conversationScrollTop = Math.max(0, this.conversationLines.length - this.layoutMetrics.bodyRows);
+				}
+			}
+		} else {
+			this.conversationLines = [];
 		}
 
 		if (frame.nestedGroupId !== undefined) {
@@ -1807,23 +2217,31 @@ export class AgentInspector implements Component {
 		let body: string[] = [];
 		let footer = "";
 
+		const isCompleted = inspection.status.state !== "running" && inspection.status.state !== "queued";
+		const hasSession = inspection.session !== undefined;
+		const actionHint = isCompleted && hasSession ? " · u resume · k fork" : "";
+
 		switch (this.detailView) {
+			case "conversation":
+				body = this.renderConversationView(width, inspection);
+				footer = ` ${this.theme.fg("dim", `↑/↓ PgUp/PgDn scroll · Home/End · s Summary · t Task · f Final · o Raw${actionHint} · Esc/← back · q close`)}`;
+				break;
 			case "task":
 				body = this.renderTaskView(width, inspection);
-				footer = ` ${this.theme.fg("dim", "↑/↓ PgUp/PgDn scroll · Home/End · s Summary · f Final · o Raw · Esc/← back · q close")}`;
+				footer = ` ${this.theme.fg("dim", `↑/↓ PgUp/PgDn scroll · Home/End · c Conversation · s Summary · f Final · o Raw${actionHint} · Esc/← back · q close`)}`;
 				break;
 			case "final":
 				body = this.renderFinalView(width, inspection);
-				footer = ` ${this.theme.fg("dim", "↑/↓ PgUp/PgDn scroll · Home/End · s Summary · t Task · o Raw · Esc/← back · q close")}`;
+				footer = ` ${this.theme.fg("dim", `↑/↓ PgUp/PgDn scroll · Home/End · c Conversation · s Summary · t Task · o Raw${actionHint} · Esc/← back · q close`)}`;
 				break;
 			case "raw":
 				body = this.renderRawView(width, inspection);
-				footer = ` ${this.theme.fg("dim", "↑/↓ scroll · r refresh · s Summary · t Task · f Final · Esc/← back · q close")}`;
+				footer = ` ${this.theme.fg("dim", `↑/↓ scroll · r refresh · c Conversation · s Summary · t Task · f Final${actionHint} · Esc/← back · q close`)}`;
 				break;
 			case "summary":
 			default:
 				body = this.renderSummaryView(width, inspection, snapshot, child, nowMs);
-				footer = ` ${this.theme.fg("dim", "↑/↓ PgUp/PgDn scroll · Home/End · t Task · f Final · o Raw · Enter nested · Esc/← back · q close")}`;
+				footer = ` ${this.theme.fg("dim", `↑/↓ PgUp/PgDn scroll · Home/End · c Conversation · t Task · f Final · o Raw${actionHint} · Enter nested · Esc/← back · q close`)}`;
 				break;
 		}
 
@@ -1832,22 +2250,67 @@ export class AgentInspector implements Component {
 
 	private renderDetailSubtitle(inspection: AgentInspection): string {
 		const tabs: Array<{ key: string; label: string; mode: DetailViewMode }> = [
+			{ key: "c", label: "Conversation", mode: "conversation" },
 			{ key: "s", label: "Summary", mode: "summary" },
 			{ key: "t", label: "Task", mode: "task" },
 			{ key: "f", label: "Final response", mode: "final" },
-			{ key: "o", label: "Raw output", mode: "raw" },
+			{ key: "o", label: "Raw diagnostics", mode: "raw" },
 		];
 
 		const formattedTabs = tabs
 			.map((t) => {
 				if (t.mode === this.detailView) {
-					return `[${t.key} ${t.label}]`;
+					return `[${t.mode === "conversation" ? "Conversation" : `${t.key} ${t.label}`}]`;
 				}
-				return `${t.key} ${t.label}`;
+				return t.mode === "conversation" ? "c Conversation" : `${t.key} ${t.label}`;
 			})
 			.join("   ");
 
 		return `${inspection.identity.agent} · ${formattedTabs}`;
+	}
+
+	private renderConversationView(width: number, inspection: AgentInspection): string[] {
+		const bodyRows = this.layoutMetrics.bodyRows;
+		if (this.conversationLines.length === 0) {
+			const emptyBody: string[] = [];
+			if (inspection.status.state === "running" || inspection.status.state === "queued") {
+				emptyBody.push("");
+				emptyBody.push(`  ${this.theme.fg("dim", "Session starting / awaiting conversation records...")}`);
+				if (inspection.status.recentActivity && inspection.status.recentActivity.length > 0) {
+					for (const act of inspection.status.recentActivity) {
+						emptyBody.push(`  ${this.theme.fg("dim", `• ${act}`)}`);
+					}
+				}
+			} else if (inspection.session === undefined) {
+				emptyBody.push("");
+				emptyBody.push(`  ${this.theme.fg("dim", "No native Pi conversation recorded for this agent.")}`);
+				emptyBody.push(`  ${this.theme.fg("dim", "Press 's' for Summary, 't' for Task, or 'o' for Raw diagnostics.")}`);
+			} else {
+				emptyBody.push("");
+				emptyBody.push(`  ${this.theme.fg("dim", "(empty conversation)")}`);
+			}
+			while (emptyBody.length < bodyRows) {
+				emptyBody.push("");
+			}
+			return emptyBody;
+		}
+
+		if (this.conversationFollow) {
+			this.conversationScrollTop = Math.max(0, this.conversationLines.length - bodyRows);
+		}
+
+		const maxTop = Math.max(0, this.conversationLines.length - bodyRows);
+		const start = Math.min(this.conversationScrollTop, maxTop);
+		const windowLines = this.conversationLines.slice(start, start + bodyRows);
+		const body: string[] = [...windowLines];
+
+		while (body.length < bodyRows) {
+			body.push("");
+		}
+		if (body.length > bodyRows) {
+			body.length = bodyRows;
+		}
+		return body;
 	}
 
 	private renderSummaryView(

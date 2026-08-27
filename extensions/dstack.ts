@@ -58,7 +58,7 @@ import {
 	saveTodos,
 	todoFilePath,
 } from "./todo.ts";
-import { ACTIVE_WORKFLOW_ENTRY, MODE_ENTRY, NESTING_ENV, STATUS_FILE_ENV, type ActiveWorkflow, type ChildDepth, type ModeState, type TodoState } from "./types.ts";
+import { ACTIVE_WORKFLOW_ENTRY, MODE_ENTRY, NESTING_ENV, SESSION_REF_ENV, STATUS_FILE_ENV, type ActiveWorkflow, type ChildDepth, type ModeState, type TodoState } from "./types.ts";
 import { createEventBusV1Port, type BackgroundTaskPort, type CompanionTaskState } from "./background/eventbus-v1.ts";
 import { createTaskResultFiles, launchTaskGroup, sessionRoot } from "./background/launch.ts";
 import { atomicWriteFile } from "./background/artifacts.ts";
@@ -69,6 +69,8 @@ import {
 	type SemanticStatus,
 } from "./background/journal.ts";
 import { readDstackResult, type CommittedResult, type DstackResultView } from "./background/result.ts";
+import { buildChildSessionRef } from "./background/session.ts";
+import { snapshotActiveLeases, type LeaseSnapshot } from "./background/scheduler.ts";
 import {
 	formatStaleWakePrompt,
 	launchNestedTask,
@@ -80,7 +82,7 @@ import {
 	type TaskDetails,
 	type TaskResult,
 } from "./task-registry.ts";
-import { activityLines, buildTreeSnapshot, latestActivity, parseTreeSnapshot, renderTreeLines } from "./background/tree.ts";
+import { activityLines, buildTreeSnapshot, latestActivity, parseTreeSnapshot, renderTreeLines, type SessionRefCache } from "./background/tree.ts";
 import {
 	parseTranscriptProgressEvent,
 	PROGRESS_ENTRY,
@@ -181,6 +183,19 @@ const StatusParams = Type.Object({
 
 function skillPath(): string {
 	return join(packageRoot(), "skills/dmode/SKILL.md");
+}
+
+type SwitchableSessionContext = Readonly<{
+	switchSession: (path: string) => Promise<unknown>;
+}>;
+
+function isSwitchableSessionContext(candidate: unknown): candidate is SwitchableSessionContext {
+	return (
+		typeof candidate === "object" &&
+		candidate !== null &&
+		"switchSession" in candidate &&
+		typeof candidate.switchSession === "function"
+	);
 }
 
 function extensionPath(): string {
@@ -349,7 +364,7 @@ export default function dstack(pi: ExtensionAPI) {
 		inspectorOpen = true;
 		updateTreeWidget(ctx);
 		try {
-			await ctx.ui.custom<AgentInspectorResult>(
+			const result = await ctx.ui.custom<AgentInspectorResult>(
 				(tui, theme, _keybindings, done) => {
 					return new AgentInspector(tui, theme, done, {
 						sessionId,
@@ -369,15 +384,44 @@ export default function dstack(pi: ExtensionAPI) {
 					},
 				},
 			);
+			if (result && typeof result === "object" && "action" in result) {
+				const switchable = isSwitchableSessionContext(ctx) ? ctx : undefined;
+				if (result.action === "resume") {
+					try {
+						if (switchable !== undefined) {
+							await switchable.switchSession(result.sessionFile);
+						}
+					} catch (error) {
+						ctx.ui.notify(`Failed to resume session: ${error instanceof Error ? error.message : String(error)}`, "error");
+					}
+				} else if (result.action === "fork") {
+					try {
+						const targetCwd = result.cwd ?? ctx.cwd ?? process.cwd();
+						const forkedManager = SessionManager.forkFrom(result.sessionFile, targetCwd);
+						const forkedFile = forkedManager.getSessionFile();
+						if (forkedFile && switchable !== undefined) {
+							await switchable.switchSession(forkedFile);
+						}
+					} catch (error) {
+						ctx.ui.notify(`Failed to fork session: ${error instanceof Error ? error.message : String(error)}`, "error");
+					}
+				}
+			}
 		} finally {
 			inspectorOpen = false;
 			updateTreeWidget(ctx);
 		}
 	}
 
+	const treeSessionRefCache: SessionRefCache = new Map();
+
 	async function pollTreeTick(generation = treePollGeneration) {
 		if (!treeArtifactDir || !treeSchedulerRoot || !treeLastTaskId || !treeLastWorkflowId) return;
 		try {
+			let activeLeases: readonly LeaseSnapshot[] = [];
+			try {
+				activeLeases = await snapshotActiveLeases(treeSchedulerRoot);
+			} catch {}
 			const snapshot = await buildTreeSnapshot({
 				taskId: treeLastTaskId,
 				workflowId: treeLastWorkflowId,
@@ -385,6 +429,8 @@ export default function dstack(pi: ExtensionAPI) {
 				schedulerRoot: treeSchedulerRoot,
 				todoPath: todoFilePath(sessionId),
 				playbook: activeWorkflow?.playbook,
+				activeLeases,
+				sessionRefCache: treeSessionRefCache,
 			});
 			if (!snapshot || generation !== treePollGeneration) return;
 			for (const progressEvent of transcriptProgress.ingest(snapshot)) {
@@ -468,6 +514,19 @@ export default function dstack(pi: ExtensionAPI) {
 
 	let fallbacks = false;
 
+	let sessionRefWritten = false;
+	async function maybeWriteChildSessionRef(ctx: ExtensionContext): Promise<void> {
+		if (sessionRefWritten) return;
+		const refFile = process.env[SESSION_REF_ENV];
+		if (refFile === undefined || refFile === "") return;
+		try {
+			const ref = buildChildSessionRef(ctx.sessionManager);
+			if (ref === undefined) return;
+			await atomicWriteFile(refFile, `${JSON.stringify(ref)}\n`);
+			sessionRefWritten = true;
+		} catch {}
+	}
+
 	let nestingDepth = 0;
 	try {
 		nestingDepth = parseNestingDepth(process.env[NESTING_ENV]);
@@ -522,6 +581,7 @@ export default function dstack(pi: ExtensionAPI) {
 		mode = restoreMode(branchEntries(ctx));
 		activeWorkflow = restoreActiveWorkflow(branchEntries(ctx));
 		sessionId = ctx.sessionManager.getSessionId();
+		await maybeWriteChildSessionRef(ctx);
 		await refreshTodos();
 		applyStatus(ctx);
 		if (activeWorkflow) {
@@ -564,7 +624,8 @@ export default function dstack(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("before_agent_start", async () => {
+	pi.on("before_agent_start", async (_event, ctx) => {
+		await maybeWriteChildSessionRef(ctx);
 		if (!mode.on) return;
 		return {
 			message: {

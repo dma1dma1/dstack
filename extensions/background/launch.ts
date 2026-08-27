@@ -13,6 +13,7 @@ import { workflowSystemPrompt } from "../workflow-context.ts";
 import { atomicWriteFile, writeSealedArtifact } from "./artifacts.ts";
 import type { BackgroundTaskPort } from "./eventbus-v1.ts";
 import { readCommittedWorkflowResult } from "./runner.ts";
+import { cleanupStaleChildSessions } from "./session.ts";
 import { readJournalFile, readSemanticStatusFile, recentJournal } from "./journal.ts";
 import type { ChildStateView, CommittedResult, TaskBinding, WorkflowProgress } from "./result.ts";
 import type { ResolvedChildSpec, WorkflowManifestV1 } from "./workflow.ts";
@@ -86,6 +87,8 @@ export async function launchTaskGroup(input: Readonly<{
 }>): Promise<BackgroundReceipt> {
 	const workflowId = randomUUID();
 	const root = sessionRoot(input.sessionId);
+	// Best-effort retention sweep. Failures must never affect the launch.
+	void cleanupStaleChildSessions({ root }).catch(() => undefined);
 	const artifactDir = join(root, "workflows", workflowId);
 	const specs = requestSpecs(input.request);
 	const resolvedSpecs = specs.map((spec, index): ResolvedChildSpec => {

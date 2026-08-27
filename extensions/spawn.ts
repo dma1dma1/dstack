@@ -62,8 +62,12 @@ export function buildChildArgv(input: {
 	omitModel?: boolean;
 	tools?: string;
 	systemPromptPath?: string;
+	sessionDir?: string;
 }): string[] {
-	const args = ["--mode", "json", "-p", "--no-session", "--no-extensions", "-e", input.extensionPath];
+	const args = ["--mode", "json", "-p"];
+	if (input.sessionDir !== undefined) args.push("--session-dir", input.sessionDir);
+	else args.push("--no-session");
+	args.push("--no-extensions", "-e", input.extensionPath);
 	if (input.model && !input.omitModel) args.push("--model", input.model);
 	if (input.tools) args.push("--tools", input.tools);
 	if (input.systemPromptPath) args.push("--append-system-prompt", input.systemPromptPath);
