@@ -390,37 +390,91 @@ test("dstack_result preserves true unknown behavior when no live status and no b
 	});
 });
 
-test("dstack_result defaults to a bounded summary with a sealed full-output pointer", async () => {
+test("dstack_result defaults to a bounded summary and detail full retains raw fields", async () => {
 	const binding: TaskBinding = { taskId, workflowId: "wf-0123456789abcdef" };
 	const fullOutput = { path: toAbsolutePath("/tmp/child-output.txt"), sha256: toSha256("b".repeat(64)), bytes: 12_000 };
+	const errorMessage = `child failed: ${"e".repeat(4_000)}`;
+	const committedComplete: CommittedResult = {
+		kind: "complete",
+		outputs: [fullOutput],
+		package: {
+			mode: "single",
+			results: [{
+				agent: "poteto-agent",
+				cwd: "/workspace",
+				task: "own it",
+				model: "openai/gpt-5-mini",
+				text: "x".repeat(12_000),
+				exitCode: 7,
+				stderr: "some stderr",
+				errorMessage,
+				messages: [{ role: "assistant", content: [{ type: "text", text: "large transcript" }] }],
+				usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 3, turns: 1 },
+			}],
+		},
+	};
+
 	const result = await readDstackResult({
 		taskId,
 		statusExact: async () => ({ ...runningTask, status: "completed" }),
 		readBinding: async () => binding,
 		readProgress: async () => ({ queued: 0, running: 0, complete: 1, total: 1 }),
-		readCommittedResult: async () => ({
-			kind: "complete",
-			outputs: [fullOutput],
-			package: {
-				mode: "single",
-				results: [{
-					agent: "poteto-agent",
-					cwd: "/workspace",
-					task: "own it",
-					text: "x".repeat(12_000),
-					exitCode: 0,
-					stderr: "",
-					messages: [{ role: "assistant", content: [{ type: "text", text: "large transcript" }] }],
-					usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 3, turns: 1 },
-				}],
-			},
-		}),
+		readCommittedResult: async () => committedComplete,
 	});
 	assert.equal(result.kind, "complete");
 	if (result.kind !== "complete" || result.detail !== "summary") return;
-	assert.equal(result.package.results[0]?.fullOutput, fullOutput);
-	assert.match(result.package.results[0]?.summary ?? "", /truncated/);
-	assert.equal("messages" in (result.package.results[0] ?? {}), false);
+	const first = result.package.results[0];
+	assert.equal(first?.agent, "poteto-agent");
+	assert.equal(first?.exitCode, 7);
+	const summaryError = first?.errorMessage ?? "";
+	assert.match(summaryError, /^child failed:/);
+	assert.match(summaryError, /truncated.*detail:\s*"full"/s);
+	assert.ok(summaryError.length < errorMessage.length);
+	assert.match(first?.summary ?? "", /truncated/);
+	assert.match(first?.summary ?? "", /detail:\s*"full"/);
+	assert.ok(!first?.summary.includes("artifact"));
+	assert.equal("task" in (first ?? {}), false);
+	assert.equal("journal" in (first ?? {}), false);
+	assert.equal("usage" in (first ?? {}), false);
+	assert.equal("model" in (first ?? {}), false);
+	assert.equal("cwd" in (first ?? {}), false);
+	assert.equal("messages" in (first ?? {}), false);
+	assert.equal("fullOutput" in (first ?? {}), false);
+	assert.equal("stderr" in (first ?? {}), false);
+	assert.equal("stopReason" in (first ?? {}), false);
+	assert.equal("status" in (first ?? {}), false);
+
+	const defaultJson = JSON.stringify(result);
+	assert.ok(!defaultJson.includes('"task"'));
+	assert.ok(!defaultJson.includes('"journal"'));
+	assert.ok(!defaultJson.includes('"usage"'));
+	assert.ok(!defaultJson.includes('"model"'));
+	assert.ok(!defaultJson.includes('"cwd"'));
+	assert.ok(!defaultJson.includes('"messages"'));
+	assert.ok(!defaultJson.includes('"fullOutput"'));
+
+	const fullResult = await readDstackResult({
+		taskId,
+		detail: "full",
+		statusExact: async () => ({ ...runningTask, status: "completed" }),
+		readBinding: async () => binding,
+		readProgress: async () => ({ queued: 0, running: 0, complete: 1, total: 1 }),
+		readCommittedResult: async () => committedComplete,
+	});
+	assert.equal(fullResult.kind, "complete");
+	if (fullResult.kind === "complete" && fullResult.detail === "full") {
+		const fullFirst = fullResult.package.results[0];
+		assert.equal(fullFirst?.agent, "poteto-agent");
+		assert.equal(fullFirst?.cwd, "/workspace");
+		assert.equal(fullFirst?.task, "own it");
+		assert.equal(fullFirst?.model, "openai/gpt-5-mini");
+		assert.equal(fullFirst?.text, "x".repeat(12_000));
+		assert.equal(fullFirst?.exitCode, 7);
+		assert.equal(fullFirst?.stderr, "some stderr");
+		assert.equal(fullFirst?.errorMessage, errorMessage);
+		assert.equal(fullFirst?.messages.length, 1);
+		assert.deepEqual(fullFirst?.usage, { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 3, turns: 1 });
+	}
 });
 
 test("output artifact hash and byte-length corruption fail closed", async (t) => {

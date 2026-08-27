@@ -226,9 +226,60 @@ test("root task returns a receipt before the runner completes and dstack_result 
 	const completed = await resultTool.execute("result-complete", { taskId: receipt.taskId }, undefined, undefined, runtime.ctx);
 	assert.equal((completed.details as { kind: string }).kind, "complete");
 	assert.deepEqual(
-		(completed.details as { package: { results: Array<{ task: string }> } }).package.results.map((item) => item.task),
+		(completed.details as { package: { results: Array<{ summary: string }> } }).package.results.map((item) => item.summary),
+		["done:first", "done:second"],
+	);
+	const completedJson = completed.content[0]?.type === "text" ? completed.content[0].text : "";
+	assert.ok(!completedJson.includes('"task"'));
+	assert.ok(!completedJson.includes('"journal"'));
+	assert.ok(!completedJson.includes('"usage"'));
+	assert.ok(!completedJson.includes('"model"'));
+	assert.ok(!completedJson.includes('"cwd"'));
+	assert.ok(!completedJson.includes('"messages"'));
+	assert.ok(!completedJson.includes('"fullOutput"'));
+	assert.ok(!completedJson.includes('"stderr"'));
+	assert.ok(!completedJson.includes('"stopReason"'));
+	assert.ok(!completedJson.includes('"status"'));
+	assert.deepEqual(JSON.parse(completedJson), {
+		kind: "complete",
+		taskId: receipt.taskId,
+		detail: "summary",
+		package: {
+			mode: "parallel",
+			results: [
+				{ agent: "general-purpose", summary: "done:first", exitCode: 0 },
+				{ agent: "comment-sicko", summary: "done:second", exitCode: 0 },
+			],
+		},
+	});
+
+	const fullCompleted = await resultTool.execute(
+		"result-complete-full",
+		{ taskId: receipt.taskId, detail: "full" },
+		undefined,
+		undefined,
+		runtime.ctx,
+	);
+	assert.equal((fullCompleted.details as { kind: string }).kind, "complete");
+	assert.deepEqual(
+		(fullCompleted.details as { package: { results: Array<{ task: string }> } }).package.results.map((item) => item.task),
 		["first", "second"],
 	);
+	const fullCompletedJson = fullCompleted.content[0]?.type === "text" ? fullCompleted.content[0].text : "";
+	const parsedFull = JSON.parse(fullCompletedJson);
+	assert.equal(parsedFull.kind, "complete");
+	assert.equal(parsedFull.detail, "full");
+	assert.equal(parsedFull.package.results[0].task, "first");
+	assert.equal(parsedFull.package.results[0].cwd, process.cwd());
+	assert.deepEqual(parsedFull.package.results[0].usage, {
+		input: 10,
+		output: 5,
+		cacheRead: 2,
+		cacheWrite: 1,
+		cost: 0.025,
+		contextTokens: 18,
+		turns: 1,
+	});
 	assert.deepEqual(completed.usage, {
 		input: 20,
 		output: 10,

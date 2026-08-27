@@ -267,7 +267,7 @@ test("dstack_result exposes live child state, latest semantic status, freshness,
 	}
 });
 
-test("dstack_result summary retains compact history while full detail retains raw messages", async () => {
+test("dstack_result summary cleans up metadata while full detail retains raw fields", async () => {
 	const binding: TaskBinding = { taskId: "task-comp-1", workflowId: "wf-comp-1" };
 	const journal: JournalEntry[] = [
 		{ seq: 1, timestamp: "2026-02-26T10:00:00.000Z", kind: "spawn", agent: "poteto-agent", task: "implement", cwd: "/tmp" },
@@ -280,9 +280,11 @@ test("dstack_result summary retains compact history while full detail retains ra
 		agent: "poteto-agent",
 		cwd: "/tmp",
 		task: "implement",
+		model: "openai/gpt-5-mini",
 		text: "Feature complete and tested.",
 		exitCode: 0,
-		stderr: "",
+		stderr: "debug log line",
+		stopReason: "stop",
 		messages: [
 			{ role: "user", content: [{ type: "text", text: "Start" }] },
 			{ role: "assistant", content: [{ type: "text", text: "Feature complete and tested." }] },
@@ -310,9 +312,26 @@ test("dstack_result summary retains compact history while full detail retains ra
 	if (summaryView.kind === "complete" && summaryView.detail === "summary") {
 		const res = summaryView.package.results[0];
 		assert.ok(res);
+		assert.equal(res.agent, "poteto-agent");
 		assert.equal(res.summary, "Feature complete and tested.");
-		assert.deepEqual(res.status, status);
-		assert.equal(res.journal?.length, 3);
+		assert.equal(res.exitCode, 0);
+		assert.deepEqual(res, {
+			agent: "poteto-agent",
+			summary: "Feature complete and tested.",
+			exitCode: 0,
+		});
+
+		const summaryJson = JSON.stringify(summaryView);
+		assert.ok(!summaryJson.includes('"task"'));
+		assert.ok(!summaryJson.includes('"journal"'));
+		assert.ok(!summaryJson.includes('"usage"'));
+		assert.ok(!summaryJson.includes('"model"'));
+		assert.ok(!summaryJson.includes('"cwd"'));
+		assert.ok(!summaryJson.includes('"messages"'));
+		assert.ok(!summaryJson.includes('"fullOutput"'));
+		assert.ok(!summaryJson.includes('"status"'));
+		assert.ok(!summaryJson.includes('"stderr"'));
+		assert.ok(!summaryJson.includes('"stopReason"'));
 	}
 
 	const fullView = await readDstackResult({
@@ -329,9 +348,15 @@ test("dstack_result summary retains compact history while full detail retains ra
 		const res = fullView.package.results[0];
 		assert.ok(res);
 		assert.equal(res.text, "Feature complete and tested.");
+		assert.equal(res.cwd, "/tmp");
+		assert.equal(res.task, "implement");
+		assert.equal(res.model, "openai/gpt-5-mini");
+		assert.equal(res.stderr, "debug log line");
+		assert.equal(res.stopReason, "stop");
 		assert.equal(res.messages.length, 2);
 		assert.deepEqual(res.status, status);
 		assert.equal(res.journal?.length, 3);
+		assert.deepEqual(res.usage, taskResult.usage);
 	}
 });
 

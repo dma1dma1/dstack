@@ -2,7 +2,7 @@ import type { Usage } from "@earendil-works/pi-ai";
 import type { TaskDetails, TaskResult } from "../dstack.ts";
 import type { AbsolutePath, OutputArtifactSeal, Sha256 } from "./artifacts.ts";
 import type { CompanionTaskState } from "./eventbus-v1.ts";
-import { recentJournal, type JournalEntry, type SemanticStatus } from "./journal.ts";
+import type { JournalEntry, SemanticStatus } from "./journal.ts";
 
 export type ChildStateView = Readonly<{
 	index: number;
@@ -189,19 +189,10 @@ async function readCommitted(input: ResultReader, binding: TaskBinding, task?: C
 
 export type TaskSummaryResult = Readonly<{
 	agent: string;
-	cwd: string;
-	task: string;
 	summary: string;
 	exitCode: number;
-	stderr: string;
-	stopReason?: string;
-	errorMessage?: string;
-	model?: string;
-	usage: TaskResult["usage"];
 	step?: number;
-	fullOutput?: OutputArtifactSeal;
-	status?: SemanticStatus;
-	journal?: readonly JournalEntry[];
+	errorMessage?: string;
 }>;
 
 export type TaskSummaryDetails = Readonly<{
@@ -210,34 +201,24 @@ export type TaskSummaryDetails = Readonly<{
 }>;
 
 const SUMMARY_CAP = 8 * 1024;
-const TASK_CAP = 2 * 1024;
-const STDERR_CAP = 2 * 1024;
+const ERROR_CAP = 2 * 1024;
 
 function bounded(value: string, cap: number): string {
 	if (Buffer.byteLength(value, "utf8") <= cap) return value;
 	let text = value.slice(0, cap);
 	while (Buffer.byteLength(text, "utf8") > cap) text = text.slice(0, -1);
-	return `${text}\n\n[truncated; read the full output artifact for the remainder]`;
+	return `${text}\n\n[truncated; call dstack_result with detail: "full" for the remainder]`;
 }
 
 function summaryPackage(committed: Extract<CommittedResult, { kind: "complete" }>): TaskSummaryDetails {
 	return {
 		mode: committed.package.mode,
-		results: committed.package.results.map((result, index) => ({
+		results: committed.package.results.map((result) => ({
 			agent: result.agent,
-			cwd: result.cwd,
-			task: bounded(result.task, TASK_CAP),
 			summary: bounded(result.text, SUMMARY_CAP),
 			exitCode: result.exitCode,
-			stderr: bounded(result.stderr, STDERR_CAP),
-			stopReason: result.stopReason,
-			errorMessage: result.errorMessage,
-			model: result.model,
-			usage: { ...result.usage },
-			step: result.step,
-			fullOutput: committed.outputs?.[index],
-			status: result.status,
-			journal: result.journal ? recentJournal(result.journal) : undefined,
+			...(result.step !== undefined ? { step: result.step } : {}),
+			...(result.errorMessage ? { errorMessage: bounded(result.errorMessage, ERROR_CAP) } : {}),
 		})),
 	};
 }
