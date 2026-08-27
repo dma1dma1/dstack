@@ -82,6 +82,12 @@ import {
 } from "./task-registry.ts";
 import { activityLines, buildTreeSnapshot, latestActivity, parseTreeSnapshot, renderTreeLines } from "./background/tree.ts";
 import {
+	parseTranscriptProgressEvent,
+	PROGRESS_ENTRY,
+	renderTranscriptProgress,
+	TranscriptProgressTracker,
+} from "./background/progress.ts";
+import {
 	AgentInspector,
 	listSessionWorkflows,
 	renderAmbientWidgetLine,
@@ -301,8 +307,12 @@ export default function dstack(pi: ExtensionAPI) {
 	let lastContext: ExtensionContext | undefined;
 	const nestedTaskRegistry = new NestedTaskRegistry();
 	const firedStaleWakes = new Set<string>();
+	let treePollGeneration = 0;
+	const transcriptProgress = new TranscriptProgressTracker();
 
 	function stopTreeTimer() {
+		treePollGeneration += 1;
+		transcriptProgress.reset();
 		if (treeTimer !== undefined) {
 			clearInterval(treeTimer);
 			treeTimer = undefined;
@@ -365,7 +375,7 @@ export default function dstack(pi: ExtensionAPI) {
 		}
 	}
 
-	async function pollTreeTick() {
+	async function pollTreeTick(generation = treePollGeneration) {
 		if (!treeArtifactDir || !treeSchedulerRoot || !treeLastTaskId || !treeLastWorkflowId) return;
 		try {
 			const snapshot = await buildTreeSnapshot({
@@ -376,7 +386,10 @@ export default function dstack(pi: ExtensionAPI) {
 				todoPath: todoFilePath(sessionId),
 				playbook: activeWorkflow?.playbook,
 			});
-			if (!snapshot) return;
+			if (!snapshot || generation !== treePollGeneration) return;
+			for (const progressEvent of transcriptProgress.ingest(snapshot)) {
+				pi.appendEntry(PROGRESS_ENTRY, progressEvent);
+			}
 			let activeWorkflowCount = snapshot.committed ? 0 : 1;
 			try {
 				const workflows = await listSessionWorkflows(sessionId);
@@ -418,9 +431,10 @@ export default function dstack(pi: ExtensionAPI) {
 		treeSchedulerRoot = join(root, "scheduler");
 		lastContext = ctx;
 		stopTreeTimer();
-		void pollTreeTick();
+		const generation = treePollGeneration;
+		void pollTreeTick(generation);
 		treeTimer = setInterval(() => {
-			void pollTreeTick();
+			void pollTreeTick(generation);
 		}, 1000);
 		treeTimer.unref();
 	}
@@ -682,6 +696,14 @@ export default function dstack(pi: ExtensionAPI) {
 
 			pi.appendEntry("dstack-tree-snapshot", snapshot);
 		},
+	});
+
+	pi.registerEntryRenderer?.(PROGRESS_ENTRY, (entry, { expanded }, theme) => {
+		const progressEvent = parseTranscriptProgressEvent(entry.data);
+		if (!progressEvent) {
+			return new Text(theme.fg("dim", "(corrupt dstack progress entry)"), 0, 0);
+		}
+		return new Text(renderTranscriptProgress(progressEvent, expanded, theme), 0, 0);
 	});
 
 	pi.registerEntryRenderer?.("dstack-tree-snapshot", (entry, { expanded }, theme) => {
