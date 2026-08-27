@@ -745,6 +745,12 @@ test("AgentInspector task view displays full multiline task with vertical scroll
 	const scrolledTask = inspector.render(80);
 	assert.ok(scrolledTask.some((l) => l.includes("Full Task Content:")));
 
+	inspector.handleInput("t");
+	const beforeWheel = inspector.render(38);
+	inspector.handleInput("\x1b[<65;10;10M");
+	const afterWheel = inspector.render(38);
+	assert.notDeepEqual(afterWheel, beforeWheel);
+
 	inspector.handleInput("s");
 	const backSummary = inspector.render(80);
 	assert.ok(backSummary.some((l) => l.includes("Input Envelope:")));
