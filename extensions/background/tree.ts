@@ -1555,14 +1555,17 @@ export function renderTreeLines(snapshot: TreeSnapshot, opts: RenderTreeOptions)
 	if (snapshot.todos.length > 0) {
 		header += ` · todos ${snapshot.todoCounts.completed}/${snapshot.todoCounts.total}`;
 	}
-	header += " · oldest at top · newest at bottom";
+	header += ` · ${theme.fg("dim", "↓ new")}`;
 
 	const lines: string[] = [truncateToWidth(header, width)];
 
 	const rows: PreparedTreeRow[] = [];
 	let orderIndex = 0;
 
-	for (const child of snapshot.children) {
+	for (let childIndex = 0; childIndex < snapshot.children.length; childIndex++) {
+		const child = snapshot.children[childIndex];
+		if (child === undefined) continue;
+		const childOrdinal = childIndex + 1;
 		const childOrder = orderIndex++;
 		let priority = 4;
 		if (child.state === "failed") priority = 1;
@@ -1576,6 +1579,7 @@ export function renderTreeLines(snapshot: TreeSnapshot, opts: RenderTreeOptions)
 			order: childOrder,
 			render: (isLast, rowTheme, renderWidth) => {
 				const guide = rowTheme.fg("dim", isLast ? "└─ " : "├─ ");
+				const dimOrdinal = rowTheme.fg("dim", `${childOrdinal}`);
 				const glyph = glyphForState(currentChild.state, rowTheme);
 				const role = roleLabel(currentChild);
 				const duration = childDurationText(currentChild, snapshot.createdAt, nowMs);
@@ -1612,7 +1616,7 @@ export function renderTreeLines(snapshot: TreeSnapshot, opts: RenderTreeOptions)
 					}
 				}
 
-				const rawLine = `${guide}${glyph} ${role} ${duration}${costSuffix}${detail}`;
+				const rawLine = `${guide}${dimOrdinal} ${glyph} ${role} ${duration}${costSuffix}${detail}`;
 				return truncateToWidth(rawLine, renderWidth);
 			},
 		});
@@ -1654,6 +1658,7 @@ export function renderTreeLines(snapshot: TreeSnapshot, opts: RenderTreeOptions)
 			for (let cIdx = 0; cIdx < group.children.length; cIdx++) {
 				const nestedChild = group.children[cIdx];
 				if (nestedChild === undefined) continue;
+				const nestedOrdinal = cIdx + 1;
 				const isLastChildInGroup = cIdx === group.children.length - 1;
 				const nestedOrder = orderIndex++;
 
@@ -1673,12 +1678,13 @@ export function renderTreeLines(snapshot: TreeSnapshot, opts: RenderTreeOptions)
 					render: (_isLast, rowTheme, renderWidth) => {
 						const prefix = isLastGroup ? "      " : "   │  ";
 						const guide = rowTheme.fg("dim", `${prefix}${isLastChildInGroup ? "└─ " : "├─ "}`);
+						const dimOrdinal = rowTheme.fg("dim", `${nestedOrdinal}`);
 
 						if (isLeaseSnapshot(nestedChild)) {
 							const leaseAcquiredMs = Date.parse(nestedChild.acquiredAt);
 							const leaseElapsed = Number.isNaN(leaseAcquiredMs) ? 0 : Math.max(0, nowMs - leaseAcquiredMs);
 							const glyph = rowTheme.fg("accent", "◐");
-							const rawLine = `${guide}${glyph} agent details pending (${formatElapsed(leaseElapsed)})`;
+							const rawLine = `${guide}${dimOrdinal} ${glyph} agent details pending (${formatElapsed(leaseElapsed)})`;
 							return truncateToWidth(rawLine, renderWidth);
 						}
 
@@ -1734,7 +1740,7 @@ export function renderTreeLines(snapshot: TreeSnapshot, opts: RenderTreeOptions)
 							detail = detailText.length > 0 ? ` — ${detailText}` : "";
 						}
 
-						const rawLine = `${guide}${glyph} ${role} ${durationStr}${costSuffix}${detail}`;
+						const rawLine = `${guide}${dimOrdinal} ${glyph} ${role} ${durationStr}${costSuffix}${detail}`;
 						return truncateToWidth(rawLine, renderWidth);
 					},
 				});

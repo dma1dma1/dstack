@@ -1570,6 +1570,8 @@ export class AgentInspector implements Component {
 				for (let i = 0; i < snapshot.children.length; i++) {
 					const child = snapshot.children[i];
 					if (child === undefined) continue;
+					const childOrdinal = i + 1;
+					const dimOrdinal = this.theme.fg("dim", `${childOrdinal}`);
 					const childGroups = child.nestedGroups ?? (child.nested ? groupNestedChildren(child.nested) : []);
 					const isLastChild = i === snapshot.children.length - 1 && childGroups.length === 0;
 					const guide = this.theme.fg("dim", isLastChild ? "    └─ " : "    ├─ ");
@@ -1591,7 +1593,7 @@ export class AgentInspector implements Component {
 								? ` ${child.taskPreview}`
 								: "";
 
-					const childRow = `${guide}${glyph} ${role}${phase}${durationFormatted}${staleTag}${detail}`;
+					const childRow = `${guide}${dimOrdinal} ${glyph} ${role}${phase}${durationFormatted}${staleTag}${detail}`;
 					rows.push({
 						item: { type: "child", workflowId: wf.workflowId, childIndex: i },
 						text: childRow,
@@ -1617,13 +1619,15 @@ export class AgentInspector implements Component {
 						for (let j = 0; j < group.children.length; j++) {
 							const nested = group.children[j];
 							if (nested === undefined) continue;
+							const nestedOrdinal = j + 1;
+							const dimNestedOrdinal = this.theme.fg("dim", `${nestedOrdinal}`);
 							const isLastNested = j === group.children.length - 1;
 							const nestedPrefix = isLastGroup ? "          " : "       │  ";
 							const nestedGuide = this.theme.fg("dim", `${nestedPrefix}${isLastNested ? "└─ " : "├─ "}`);
 
 							if (isLeaseSnapshot(nested)) {
 								const leaseElapsed = formatElapsed(Math.max(0, nowMs - Date.parse(nested.acquiredAt)));
-								const nestedRow = `${nestedGuide}${this.theme.fg("accent", "◐")} agent details pending (${leaseElapsed})`;
+								const nestedRow = `${nestedGuide}${dimNestedOrdinal} ${this.theme.fg("accent", "◐")} agent details pending (${leaseElapsed})`;
 								rows.push({
 									item: { type: "child", workflowId: wf.workflowId, childIndex: i },
 									text: nestedRow,
@@ -1637,7 +1641,7 @@ export class AgentInspector implements Component {
 								const nDetailText = nestedChildDetail(nested);
 								const nDetail = nDetailText ? (nested.state === "queued" || nested.state === "skipped" ? ` ${nDetailText}` : ` — ${nDetailText}`) : "";
 								const nStale = nested.stale ? ` ${this.theme.fg("warning", "⚠ stale")}` : "";
-								const nestedRow = `${nestedGuide}${nGlyph} ${nRole}${nDuration}${nStale}${nDetail}`;
+								const nestedRow = `${nestedGuide}${dimNestedOrdinal} ${nGlyph} ${nRole}${nDuration}${nStale}${nDetail}`;
 								rows.push({
 									item: {
 										type: "nested",
@@ -1667,7 +1671,7 @@ export class AgentInspector implements Component {
 		} else {
 			subtitleParts.push(activeWorkflowCount > 0 ? `${activeWorkflowCount} active workflow${activeWorkflowCount === 1 ? "" : "s"}` : "No active workflows");
 		}
-		subtitleParts.push(`slots ${activeSlots}`, "oldest at top · newest at bottom");
+		subtitleParts.push(`slots ${activeSlots}`, this.theme.fg("dim", "↓ new"));
 		const subtitle = subtitleParts.join(" · ");
 
 		const listVisibleRows = this.layoutMetrics.listVisibleRows;

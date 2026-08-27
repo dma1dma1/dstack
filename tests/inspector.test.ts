@@ -2118,9 +2118,17 @@ test("AgentInspector calculates Final view row budget with fully populated envel
 	inspector.dispose();
 });
 
-test("AgentInspector renders visual group rows, plain chronological direction copy, and failure diagnostics", async () => {
+test("AgentInspector renders numbered task groups, compact ordering cue, and failure diagnostics", async () => {
 	const tui = { requestRender: () => {} };
 	const done = () => {};
+	const dimmedText: string[] = [];
+	const theme: InspectorTheme = {
+		...plainTheme(),
+		fg(color, text) {
+			if (color === "dim") dimmedText.push(text);
+			return text;
+		},
+	};
 
 	const snapshot: TreeSnapshot = {
 		taskId: "task-inspector-groups",
@@ -2226,7 +2234,7 @@ test("AgentInspector renders visual group rows, plain chronological direction co
 		},
 	];
 
-	const inspector = new AgentInspector(tui, plainTheme(), done, {
+	const inspector = new AgentInspector(tui, theme, done, {
 		sessionId: "test-sess",
 		listWorkflows: async () => workflows,
 		getSnapshot: async () => snapshot,
@@ -2238,15 +2246,17 @@ test("AgentInspector renders visual group rows, plain chronological direction co
 
 	const listLines = inspector.render(120);
 
-	assert.ok(listLines.some((l) => l.includes("oldest at top · newest at bottom")), "subtitle states chronological direction");
+	assert.ok(listLines.some((l) => l.includes("↓ new")), "subtitle states chronological direction");
+	assert.ok(dimmedText.includes("↓ new"), "subtitle direction cue is dim");
+	assert.ok(listLines.some((l) => l.includes("├─ 1 ◐ owner poteto-agent")), "top-level task has a creation ordinal");
 
-	assert.ok(listLines.some((l) => l.includes("├─ parallel · 2 agents · phase grounding")), "parallel group row rendered");
-	assert.ok(listLines.some((l) => l.includes("│  ├─ ✓ worker general-purpose")), "parallel child 1 indented under group");
-	assert.ok(listLines.some((l) => l.includes("│  └─ ✗ missing-worker")), "parallel child 2 indented under group");
+	assert.ok(listLines.some((l) => l.includes("├─ parallel · 2 agents · phase grounding")), "parallel group row rendered without an ordinal");
+	assert.ok(listLines.some((l) => l.includes("│  ├─ 1 ✓ worker general-purpose")), "parallel child 1 indented under group");
+	assert.ok(listLines.some((l) => l.includes("│  └─ 2 ✗ missing-worker")), "parallel child 2 indented under group");
 
 	assert.ok(listLines.some((l) => l.includes("└─ sequence · 2 steps · phase implementation")), "sequence group row rendered");
-	assert.ok(listLines.some((l) => l.includes("   ├─ ✓ worker general-purpose")), "sequence step 1 indented under group");
-	assert.ok(listLines.some((l) => l.includes("   └─ ◐ worker general-purpose")), "sequence step 2 indented under group");
+	assert.ok(listLines.some((l) => l.includes("   ├─ 1 ✓ worker general-purpose")), "sequence step 1 indented under group");
+	assert.ok(listLines.some((l) => l.includes("   └─ 2 ◐ worker general-purpose")), "sequence step 2 indented under group");
 
 	assert.ok(
 		listLines.some((l) => l.includes("Unknown agent \"missing-worker\"")),

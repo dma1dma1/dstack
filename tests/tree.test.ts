@@ -246,13 +246,13 @@ test("renderTreeLines generates compact live widget lines with glyphs, elapsed t
 		now: new Date("2025-01-01T00:12:41.000Z"),
 	});
 
-	assert.equal(lines[0], truncateToWidth("dstack · feature · slots 3/4 · 2/4 done · 12m41s · todos 1/3 · oldest at top · newest at bottom", 78));
-	assert.ok(lines.some((l) => l.includes("├─ ◐ owner poteto-agent 12m39s orchestrate feature development")));
+	assert.equal(lines[0], truncateToWidth("dstack · feature · slots 3/4 · 2/4 done · 12m41s · todos 1/3 · ↓ new", 78));
+	assert.ok(lines.some((l) => l.includes("├─ 1 ◐ owner poteto-agent 12m39s orchestrate feature development")));
 	assert.ok(lines.some((l) => l.includes("run · 1 agent · mode unavailable")));
-	assert.ok(lines.some((l) => l.includes("◐ agent details pending (1m02s)")));
-	assert.ok(lines.some((l) => l.includes("├─ ✓ worker general-purpose (4m02s) ground and design the MVP")));
-	assert.ok(lines.some((l) => l.includes("├─ ✗ worker general-purpose (2m11s) failed implement todo timestamps")));
-	assert.ok(lines.some((l) => l.includes("└─ ○ worker general-purpose queued 12m41s write tree renderer tests")));
+	assert.ok(lines.some((l) => l.includes("1 ◐ agent details pending (1m02s)")));
+	assert.ok(lines.some((l) => l.includes("├─ 2 ✓ worker general-purpose (4m02s) ground and design the MVP")));
+	assert.ok(lines.some((l) => l.includes("├─ 3 ✗ worker general-purpose (2m11s) failed implement todo timestamps")));
+	assert.ok(lines.some((l) => l.includes("└─ 4 ○ worker general-purpose queued 12m41s write tree renderer tests")));
 
 	for (const line of lines) {
 		assert.ok(visibleWidth(line) <= 78, `line exceeds width 78: "${line}"`);
@@ -304,8 +304,8 @@ test("renderTreeLines applies theme colors and renders frozen frame without slot
 		now: new Date("2025-01-01T00:04:02.000Z"),
 	});
 
-	assert.equal(lines[0], truncateToWidth("dstack · feature · 1/1 done · 4m02s · todos 1/1 · oldest at top · newest at bottom", 80));
-	assert.ok(lines.some((l) => l.includes("[success]✓[/success]")));
+	assert.equal(lines[0], truncateToWidth("dstack · feature · 1/1 done · 4m02s · todos 1/1 · [dim]↓ new[/dim]", 80));
+	assert.ok(lines.some((l) => l.includes("[dim]1[/dim] [success]✓[/success]")));
 	assert.ok(lines.some((l) => l.includes("todos (1/1 done, owner: session root):")));
 	assert.ok(lines.some((l) => l.includes("[success]☑[/success]")));
 });
@@ -348,8 +348,8 @@ test("renderTreeLines prioritizes failed and live rows during maxLines truncatio
 	});
 
 	assert.equal(lines.length, 6);
-	assert.ok(lines.some((l) => l.includes("✗ worker general-purpose") && l.includes("task number 1")));
-	assert.ok(lines.some((l) => l.includes("◐ worker general-purpose") && l.includes("task number 3")));
+	assert.ok(lines.some((l) => l.includes("2 ✗ worker general-purpose") && l.includes("task number 1")));
+	assert.ok(lines.some((l) => l.includes("4 ◐ worker general-purpose") && l.includes("task number 3")));
 	assert.ok(lines[lines.length - 1]?.includes("more (use /dtree)"));
 });
 
@@ -1796,24 +1796,24 @@ test("buildTreeSnapshot preserves invocation group identity and orders groups ch
 		now: new Date("2025-01-01T00:06:00.000Z"),
 	});
 
-	assert.ok(lines[0]?.includes("oldest at top · newest at bottom"));
+	assert.ok(lines[0]?.includes("↓ new"));
 
 	const g1Idx = lines.findIndex((l) => l.includes("parallel · 2 agents · phase grounding"));
 	assert.ok(g1Idx >= 0, "parallel group header rendered");
 	assert.ok(lines[g1Idx]?.includes("├─ parallel · 2 agents"));
-	assert.ok(lines[g1Idx + 1]?.includes("│  ├─ ✓ worker general-purpose"));
-	assert.ok(lines[g1Idx + 2]?.includes("│  └─ ✓ worker general-purpose"));
+	assert.ok(lines[g1Idx + 1]?.includes("│  ├─ 1 ✓ worker general-purpose"));
+	assert.ok(lines[g1Idx + 2]?.includes("│  └─ 2 ✓ worker general-purpose"));
 
 	const g2Idx = lines.findIndex((l) => l.includes("sequence · 2 steps · phase implementation"));
 	assert.ok(g2Idx > g1Idx, "sequence group appears after parallel group chronologically");
 	assert.ok(lines[g2Idx]?.includes("├─ sequence · 2 steps"));
-	assert.ok(lines[g2Idx + 1]?.includes("│  ├─ ✓ worker general-purpose"));
-	assert.ok(lines[g2Idx + 2]?.includes("│  └─ ◐ worker general-purpose"));
+	assert.ok(lines[g2Idx + 1]?.includes("│  ├─ 1 ✓ worker general-purpose"));
+	assert.ok(lines[g2Idx + 2]?.includes("│  └─ 2 ◐ worker general-purpose"));
 
 	const g3Idx = lines.findIndex((l) => l.includes("single · phase review"));
 	assert.ok(g3Idx > g2Idx, "single group appears last chronologically");
 	assert.ok(lines[g3Idx]?.includes("└─ single · phase review"));
-	assert.ok(lines[g3Idx + 1]?.includes("      └─ ○ reviewer general-purpose"));
+	assert.ok(lines[g3Idx + 1]?.includes("      └─ 1 ○ reviewer general-purpose"));
 });
 
 test("renderTreeLines prefers errorMessage then stderr over activity/taskPreview on failed nested rows", () => {
@@ -2507,7 +2507,7 @@ test("terminal child rendering remains unchanged with outcome and duration", () 
 		now: new Date("2025-01-01T00:04:00.000Z"),
 	});
 
-	assert.equal(lines[0], "dstack · feature · 2/2 done · 4m00s · oldest at top · newest at bottom");
+	assert.equal(lines[0], "dstack · feature · 2/2 done · 4m00s · ↓ new");
 	assert.ok(lines.some((l) => l.includes("✓ owner poteto-agent (3m00s) — All changes integrated and verified")));
 	assert.ok(lines.some((l) => l.includes("✗ worker general-purpose (1m30s) failed — AssertionError: 3 !== 4")));
 });
