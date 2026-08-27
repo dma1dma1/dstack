@@ -22,6 +22,7 @@ import {
 	type TreeSnapshot,
 	type TreeTheme,
 } from "./tree.ts";
+import { formatRecentActivity, type SemanticStatus } from "./journal.ts";
 import type { OutputArtifactSeal } from "./artifacts.ts";
 import { sessionRoot } from "./launch.ts";
 import { todoFilePath } from "../todo.ts";
@@ -495,6 +496,8 @@ export type AgentStatus = Readonly<{
 	state: TreeChildState;
 	phase?: string;
 	activity?: string;
+	semanticStatus?: SemanticStatus;
+	recentActivity?: readonly string[];
 	stale?: boolean;
 	todos?: readonly TodoItem[];
 	outcome?: string;
@@ -641,6 +644,10 @@ export function buildAgentInspection(
 			raw = { kind: "none", reason: "Raw output tail is unavailable for depth-2 child agents" };
 		}
 
+		const recentActivity = !isLeaseSnapshot(nested) && nested.state === "running" && nested.journal && nested.journal.length > 0
+			? formatRecentActivity(nested.journal)
+			: undefined;
+
 		return {
 			identity: {
 				depth: 2,
@@ -658,6 +665,8 @@ export function buildAgentInspection(
 				state: nested.state,
 				phase: nested.workflow?.phase ?? child.phase,
 				activity: nested.activity,
+				semanticStatus: nested.status,
+				recentActivity,
 				stale: nested.stale,
 				outcome: nested.state === "failed" ? (nested.errorMessage ?? nested.stderr ?? "failed") : undefined,
 			},
@@ -735,6 +744,10 @@ export function buildAgentInspection(
 		raw = { kind: "none", reason: "No output recorded" };
 	}
 
+	const recentActivity = child.state === "running" && child.journal && child.journal.length > 0
+		? formatRecentActivity(child.journal)
+		: undefined;
+
 	return {
 		identity: {
 			depth: 1,
@@ -749,6 +762,8 @@ export function buildAgentInspection(
 			state: child.state,
 			phase: child.phase,
 			activity: child.activity?.text,
+			semanticStatus: child.status,
+			recentActivity,
 			stale: child.stale,
 			todos,
 			outcome: child.outcome,
@@ -1811,13 +1826,19 @@ export class AgentInspector implements Component {
 		const lines: string[] = [];
 		const { identity, status, timing, input, output } = inspection;
 
-		const roleLabel = identity.assignment ? `${identity.assignment} (${identity.agent})` : identity.role ? `${identity.role} (${identity.agent})` : identity.agent;
 		const stateGlyph = glyphForState(status.state, this.theme);
 		const durationText = timing.elapsedMs !== undefined ? formatElapsed(timing.elapsedMs) : "queued";
 
 		lines.push(
-			` ${this.theme.fg("toolTitle", "Agent:")} ${this.theme.fg("accent", identity.agent)} ${this.theme.fg("dim", `· depth ${identity.depth} · ${roleLabel}`)}`,
+			` ${this.theme.fg("toolTitle", "Agent:")} ${this.theme.fg("accent", identity.agent)} ${this.theme.fg("dim", `· depth ${identity.depth}`)}`,
 		);
+		if (identity.assignment) {
+			lines.push(` ${this.theme.fg("toolTitle", "Assignment:")} ${this.theme.fg("accent", identity.assignment)}`);
+		}
+		if (identity.role) {
+			const resolvedModel = identity.model ? ` → ${identity.model}` : "";
+			lines.push(` ${this.theme.fg("toolTitle", "Role:")} ${this.theme.fg("accent", identity.role)}${this.theme.fg("dim", resolvedModel)}`);
+		}
 
 		if (identity.parentIdentity !== undefined) {
 			lines.push(
@@ -1873,6 +1894,14 @@ export class AgentInspector implements Component {
 			if (inTok !== undefined && outTok !== undefined) parts.push(`${inTok.toLocaleString()}/${outTok.toLocaleString()} in/out`);
 			if (cost !== undefined) parts.push(`$${cost.toFixed(4)}`);
 			lines.push(` ${this.theme.fg("toolTitle", "Telemetry:")} ${this.theme.fg("dim", parts.join(" · "))}`);
+		}
+
+		if (status.recentActivity !== undefined && status.recentActivity.length > 0) {
+			lines.push("");
+			lines.push(` ${this.theme.fg("toolTitle", "Recent Activity:")}`);
+			for (const act of status.recentActivity) {
+				lines.push(`   ${this.theme.fg("dim", "•")} ${truncateToWidth(act, width - 8)}`);
+			}
 		}
 
 		lines.push("");

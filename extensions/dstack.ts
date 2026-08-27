@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, writeFile, unlink, rmdir, mkdir } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, unlink, rmdir, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -50,6 +50,7 @@ import {
 	childEnv,
 	formatUsageStats,
 	mapWithConcurrency,
+	parseNestingDepth,
 	parseTaskRequest,
 	resolveAgent,
 	spawnableDepth,
@@ -67,10 +68,20 @@ import {
 	saveTodos,
 	todoFilePath,
 } from "./todo.ts";
-import { ACTIVE_WORKFLOW_ENTRY, MODE_ENTRY, type ActiveWorkflow, type ChildDepth, type ModeState, type TaskSpec, type TodoState } from "./types.ts";
+import { ACTIVE_WORKFLOW_ENTRY, MODE_ENTRY, NESTING_ENV, STATUS_FILE_ENV, type ActiveWorkflow, type ChildDepth, type ModeState, type TaskSpec, type TodoState } from "./types.ts";
 import { createEventBusV1Port, type BackgroundTaskPort } from "./background/eventbus-v1.ts";
 import { createTaskResultFiles, launchTaskGroup, sessionRoot } from "./background/launch.ts";
 import { atomicWriteFile, toAbsolutePath } from "./background/artifacts.ts";
+import {
+	allowStatusTool,
+	ChildJournalRecorder,
+	MAX_STATUS_NOTE_CHARS,
+	MAX_STATUS_PHASE_CHARS,
+	recentJournal,
+	sanitizeString,
+	type JournalEntry,
+	type SemanticStatus,
+} from "./background/journal.ts";
 import { readDstackResult } from "./background/result.ts";
 import { acquireChildSlot } from "./background/scheduler.ts";
 import { DSTACK_ARTIFACT_DIR_ENV, DSTACK_CHILD_INDEX_ENV, ROOT_WORKFLOW_ENV, SCHEDULER_ROOT_ENV } from "./background/workflow.ts";
@@ -159,6 +170,12 @@ const ConfigParams = Type.Object({
 	value: Type.Optional(Type.String({ description: "Slug, inherit-parent, auto, comma-separated list, or full models.json for write" })),
 });
 
+const StatusParams = Type.Object({
+	phase: Type.Optional(Type.String({ description: "Current phase slug or name" })),
+	note: Type.Optional(Type.String({ description: "Brief status note or current focus" })),
+	blocking: Type.Optional(Type.Boolean({ description: "Whether work is currently blocked" })),
+});
+
 function skillPath(): string {
 	return join(packageRoot(), "skills/dmode/SKILL.md");
 }
@@ -207,6 +224,8 @@ export type TaskResult = ChildResult & {
 	cwd: string;
 	task: string;
 	step?: number;
+	status?: SemanticStatus;
+	journal?: readonly JournalEntry[];
 };
 
 export type TaskDetails = {
@@ -264,6 +283,8 @@ function cloneDetails(details: TaskDetails): TaskDetails {
 			task: ownerResultText(result.task),
 			messages: result.messages.map((message) => ({ ...message, content: [...message.content] })),
 			usage: { ...result.usage },
+			journal: result.journal ? [...result.journal] : undefined,
+			status: result.status ? { ...result.status } : undefined,
 		})),
 	};
 }
@@ -286,6 +307,8 @@ function ownerResultDetails(details: TaskDetails): TaskDetails {
 			stderr: ownerResultText(result.stderr),
 			messages: [],
 			usage: { ...result.usage },
+			journal: result.journal ? recentJournal(result.journal) : undefined,
+			status: result.status ? { ...result.status } : undefined,
 		})),
 	};
 }
@@ -500,6 +523,43 @@ export default function dstack(pi: ExtensionAPI) {
 	}
 
 	let fallbacks = false;
+
+	let nestingDepth = 0;
+	try {
+		nestingDepth = parseNestingDepth(process.env[NESTING_ENV]);
+	} catch {
+		nestingDepth = 0;
+	}
+	const isChild = nestingDepth > 0 || process.env[STATUS_FILE_ENV] !== undefined;
+	if (isChild) {
+		pi.registerTool({
+			name: "dstack_status",
+			label: "dstack status",
+			description: "Publish a semantic progress update for the current phase or task. Child agents only.",
+			parameters: StatusParams,
+			async execute(_id, params) {
+				const phase = params.phase ? sanitizeString(params.phase, MAX_STATUS_PHASE_CHARS) : undefined;
+				const note = params.note ? sanitizeString(params.note, MAX_STATUS_NOTE_CHARS) : undefined;
+				const blocking = typeof params.blocking === "boolean" ? params.blocking : undefined;
+				const status: SemanticStatus = {
+					...(phase !== undefined ? { phase } : {}),
+					...(note !== undefined ? { note } : {}),
+					...(blocking !== undefined ? { blocking } : {}),
+					updatedAt: new Date().toISOString(),
+				};
+				const statusFile = process.env[STATUS_FILE_ENV];
+				if (statusFile) {
+					await atomicWriteFile(statusFile, `${JSON.stringify(status, null, 2)}\n`);
+				}
+				const parts: string[] = [];
+				if (phase) parts.push(`phase: ${phase}`);
+				if (note) parts.push(`note: ${note}`);
+				if (blocking !== undefined) parts.push(`blocking: ${blocking}`);
+				const text = parts.length > 0 ? parts.join(", ") : "status cleared";
+				return textResult(`Status updated (${text})`, status);
+			},
+		});
+	}
 
 	pi.on("session_start", async (_event, ctx) => {
 		pendingContinuation = undefined;
@@ -1006,6 +1066,8 @@ export default function dstack(pi: ExtensionAPI) {
 			};
 			publish();
 			const runOne = async (spec: TaskSpec, index: number): Promise<TaskResult> => {
+				let childTmpDir: string | undefined;
+				let recorder: ChildJournalRecorder | undefined;
 				try {
 					const resolved = resolveAgent(spec);
 					const agent = agents.find((candidate) => candidate.name === resolved.agent);
@@ -1047,6 +1109,19 @@ export default function dstack(pi: ExtensionAPI) {
 					const system = promptParts.filter(Boolean).join("\n\n");
 					if (system) tmp = await writeTempPrompt(system);
 					try {
+						childTmpDir = await mkdtemp(join(tmpdir(), "dstack-child-"));
+						const statusPath = join(childTmpDir, "status.json");
+						const journalPath = join(childTmpDir, "journal.json");
+						recorder = new ChildJournalRecorder({ statusPath, journalPath });
+						recorder.recordSpawn({
+							agent: resolved.agent,
+							task: spec.task,
+							cwd,
+							model: model.value.model,
+							role: spec.role,
+							step: details.results[index]?.step,
+						});
+						await recorder.persist();
 						if (rootWorkflowId && schedulerRoot) {
 							lease = await acquireChildSlot({
 								schedulerRoot: toAbsolutePath(schedulerRoot),
@@ -1075,35 +1150,65 @@ export default function dstack(pi: ExtensionAPI) {
 							await spawnRecordWriter?.flush();
 						}
 
+						const childTools = allowStatusTool(resolved.tools ?? agent.tools?.join(","));
 						const args = buildChildArgv({
 							task: spec.task,
 							extensionPath: extensionPath(),
 							model: model.value.model,
 							omitModel: model.value.omitModel,
-							tools: resolved.tools ?? agent.tools?.join(","),
+							tools: childTools,
 							systemPromptPath: tmp?.filePath,
 						});
+						const env = childEnv(childDepth, process.env, spec.workflow?.assignment);
+						env[STATUS_FILE_ENV] = statusPath;
+						let journalUpdates = Promise.resolve();
 						const child = await runChildProcess({
 							args,
 							cwd,
-							env: childEnv(childDepth, process.env, spec.workflow?.assignment),
+							env,
 							signal,
 							onSpawn: (pid) => lease?.bindChild(pid),
 							onUpdate: (partial) => {
-								details.results[index] = { ...partial, agent: resolved.agent, cwd, task: spec.task, step: details.results[index]?.step };
-								publish();
-								const now = new Date().toISOString();
-								const existing = spawnChildren[index];
-								if (existing !== undefined) {
-									spawnChildren[index] = {
-										...existing,
-										activity: latestActivity(partial),
-										updatedAt: now,
+								journalUpdates = journalUpdates.then(async () => {
+									recorder?.recordMessages(partial.messages);
+									if (partial.usage.turns > 0) {
+										recorder?.recordTurn({ turn: partial.usage.turns, text: partial.text, usage: partial.usage });
+									}
+									await recorder?.checkStatusFile();
+									await recorder?.persist();
+									const updatedStatus = recorder?.getLatestStatus();
+									const updatedJournal = recorder?.getEntries();
+									const partialWithStatus: TaskResult = {
+										...partial,
+										agent: resolved.agent,
+										cwd,
+										task: spec.task,
+										step: details.results[index]?.step,
+										journal: updatedJournal,
+										status: updatedStatus,
 									};
-									spawnRecordWriter?.writeThrottled();
-								}
+									details.results[index] = partialWithStatus;
+									publish();
+									const now = new Date().toISOString();
+									const existing = spawnChildren[index];
+									if (existing !== undefined) {
+										spawnChildren[index] = {
+											...existing,
+											activity: latestActivity(partialWithStatus),
+											status: updatedStatus,
+											journal: updatedJournal,
+											updatedAt: now,
+										};
+										spawnRecordWriter?.writeThrottled();
+									}
+								}).catch(() => undefined);
 							},
 						});
+						await journalUpdates;
+						await recorder.checkStatusFile();
+						if (signal?.aborted) recorder.recordFailure({ error: "Child agent was aborted" });
+						else recorder.recordExit({ exitCode: child.exitCode, text: child.text });
+						await recorder.persist();
 						const completed: TaskResult = {
 							...child,
 							agent: resolved.agent,
@@ -1111,6 +1216,8 @@ export default function dstack(pi: ExtensionAPI) {
 							task: spec.task,
 							text: capOutput(child.text),
 							step: details.results[index]?.step,
+							journal: recorder.getEntries(),
+							status: recorder.getLatestStatus(),
 						};
 						details.results[index] = completed;
 						publish();
@@ -1128,6 +1235,8 @@ export default function dstack(pi: ExtensionAPI) {
 								usage: completed.usage,
 								model: completed.model ?? existing.model ?? launchModel,
 								activity: latestActivity(completed),
+								status: completed.status,
+								journal: completed.journal,
 								updatedAt: now,
 								endedAt: now,
 							};
@@ -1137,6 +1246,7 @@ export default function dstack(pi: ExtensionAPI) {
 					} finally {
 						await lease?.release();
 						if (tmp) await removeTemp(tmp.dir, tmp.filePath);
+						if (childTmpDir) await rm(childTmpDir, { recursive: true, force: true }).catch(() => undefined);
 					}
 				} catch (err) {
 					const now = new Date().toISOString();

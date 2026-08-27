@@ -8,9 +8,12 @@ import {
 	formatElapsed,
 	isLeaseSnapshot,
 	parseActivityV1,
+	parseJournalEntries,
+	parseJournalSnapshot,
 	parseLeaseChildId,
 	parseManifestForTree,
 	parseProgressV2,
+	parseSemanticStatus,
 	parseSpawnRecordV1,
 	parseTreeSnapshot,
 	recoverNestedModelFromParentResult,
@@ -1715,4 +1718,563 @@ test("buildTreeSnapshot groups unmatched depth-2 leases by parsed groupId into m
 	assert.equal(modeUnavailLines.length, 2);
 	const agentPendingLines = lines.filter((l) => l.includes("◐ agent details pending"));
 	assert.equal(agentPendingLines.length, 2);
+});
+
+test("buildTreeSnapshot prefers fresh semantic status over low-level activity and renders it cleanly", async (t) => {
+	const cwd = await temporaryDirectory(t);
+	const artifactDir = join(cwd, "workflows", "wf-status-pref");
+	const schedulerRoot = join(cwd, "scheduler");
+	await mkdir(join(artifactDir, "children", "0"), { recursive: true });
+	await mkdir(join(schedulerRoot, "leases"), { recursive: true });
+
+	const manifest = {
+		schemaVersion: "dstack.workflow.v1",
+		workflowId: "wf-status-pref",
+		sessionId: "sess-pref",
+		mode: "single",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		specs: [{ agent: "poteto-agent", task: "implement feature", requestedRole: "feature", workflow: { assignment: "owner" } }],
+	};
+	await writeFile(join(artifactDir, "manifest.json"), JSON.stringify(manifest), "utf8");
+	await writeFile(join(artifactDir, "progress.json"), JSON.stringify({
+		queued: 0,
+		running: 1,
+		complete: 0,
+		total: 1,
+		children: [{ index: 0, agent: "poteto-agent", state: "running", startedAt: "2025-01-01T00:00:05.000Z" }],
+	}), "utf8");
+
+	const statusData = {
+		phase: "integrate",
+		note: "resolving merge conflicts",
+		blocking: true,
+		updatedAt: "2025-01-01T00:02:00.000Z",
+	};
+	await writeFile(join(artifactDir, "children", "0", "status.json"), JSON.stringify(statusData), "utf8");
+
+	const activityData = {
+		schemaVersion: "dstack.child-activity.v1",
+		workflowId: "wf-status-pref",
+		index: 0,
+		activity: "→ read file.ts",
+		updatedAt: "2025-01-01T00:01:30.000Z",
+		turns: 3,
+		contextTokens: 1500,
+	};
+	await writeFile(join(artifactDir, "children", "0", "activity.json"), JSON.stringify(activityData), "utf8");
+
+	const snapshot = await buildTreeSnapshot({
+		taskId: "task-status-pref",
+		workflowId: "wf-status-pref",
+		artifactDir,
+		schedulerRoot,
+		now: new Date("2025-01-01T00:02:10.000Z"),
+	});
+
+	assert.ok(snapshot !== undefined);
+	const child = snapshot.children[0];
+	assert.ok(child !== undefined);
+	assert.equal(child.phase, "integrate");
+	assert.equal(child.status?.phase, "integrate");
+	assert.equal(child.status?.note, "resolving merge conflicts");
+	assert.equal(child.status?.blocking, true);
+	assert.equal(child.activity?.text, "integrate: resolving merge conflicts: [blocking]");
+	assert.equal(child.stale, undefined);
+
+	const lines = renderTreeLines(snapshot, {
+		width: 100,
+		maxLines: Infinity,
+		now: new Date("2025-01-01T00:02:10.000Z"),
+	});
+	assert.ok(lines.some((l) => l.includes("owner poteto-agent · phase integrate") && l.includes("integrate: resolving merge conflicts: [blocking]")));
+});
+
+test("buildTreeSnapshot derives stale indicator when status and journal are older than threshold", async (t) => {
+	const cwd = await temporaryDirectory(t);
+	const artifactDir = join(cwd, "workflows", "wf-stale-status");
+	const schedulerRoot = join(cwd, "scheduler");
+	await mkdir(join(artifactDir, "children", "0"), { recursive: true });
+	await mkdir(join(schedulerRoot, "leases"), { recursive: true });
+
+	const manifest = {
+		schemaVersion: "dstack.workflow.v1",
+		workflowId: "wf-stale-status",
+		sessionId: "sess-stale",
+		mode: "single",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		specs: [{ agent: "general-purpose", task: "run long job", workflow: { assignment: "worker" } }],
+	};
+	await writeFile(join(artifactDir, "manifest.json"), JSON.stringify(manifest), "utf8");
+	await writeFile(join(artifactDir, "progress.json"), JSON.stringify({
+		queued: 0,
+		running: 1,
+		complete: 0,
+		total: 1,
+		children: [{ index: 0, agent: "general-purpose", state: "running", startedAt: "2025-01-01T00:00:00.000Z" }],
+	}), "utf8");
+
+	const statusData = {
+		phase: "building",
+		note: "compiling heavy binary",
+		updatedAt: "2025-01-01T00:01:00.000Z",
+	};
+	await writeFile(join(artifactDir, "children", "0", "status.json"), JSON.stringify(statusData), "utf8");
+
+	const snapshot = await buildTreeSnapshot({
+		taskId: "task-stale-status",
+		workflowId: "wf-stale-status",
+		artifactDir,
+		schedulerRoot,
+		now: new Date("2025-01-01T00:05:00.000Z"),
+	});
+
+	assert.ok(snapshot !== undefined);
+	const child = snapshot.children[0];
+	assert.ok(child !== undefined);
+	assert.equal(child.stale, true);
+
+	const lines = renderTreeLines(snapshot, {
+		width: 100,
+		maxLines: Infinity,
+		now: new Date("2025-01-01T00:05:00.000Z"),
+	});
+	assert.ok(lines.some((l) => l.includes("stale 4m00s") && l.includes("building: compiling heavy binary")));
+
+	await writeFile(join(artifactDir, "children", "0", "journal.json"), JSON.stringify({
+		schemaVersion: "dstack.journal.v1",
+		seq: 1,
+		entries: [{
+			seq: 1,
+			timestamp: "2025-01-01T00:04:50.000Z",
+			kind: "tool",
+			name: "bash",
+			gist: "npm test",
+		}],
+		updatedAt: "2025-01-01T00:04:50.000Z",
+	}), "utf8");
+
+	const refreshed = await buildTreeSnapshot({
+		taskId: "task-stale-status",
+		workflowId: "wf-stale-status",
+		artifactDir,
+		schedulerRoot,
+		now: new Date("2025-01-01T00:05:00.000Z"),
+	});
+	assert.ok(refreshed !== undefined);
+	assert.equal(refreshed.children[0]?.phase, undefined);
+	assert.equal(refreshed.children[0]?.activity?.text, "→ bash npm test");
+	assert.equal(refreshed.children[0]?.stale, undefined);
+});
+
+test("buildTreeSnapshot bounds journal history count and parses recent entries", async (t) => {
+	const cwd = await temporaryDirectory(t);
+	const artifactDir = join(cwd, "workflows", "wf-history-bound");
+	const schedulerRoot = join(cwd, "scheduler");
+	await mkdir(join(artifactDir, "children", "0"), { recursive: true });
+	await mkdir(join(schedulerRoot, "leases"), { recursive: true });
+
+	const manifest = {
+		schemaVersion: "dstack.workflow.v1",
+		workflowId: "wf-history-bound",
+		sessionId: "sess-hist",
+		mode: "single",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		specs: [{ agent: "poteto-agent", task: "long task", workflow: { assignment: "owner" } }],
+	};
+	await writeFile(join(artifactDir, "manifest.json"), JSON.stringify(manifest), "utf8");
+	await writeFile(join(artifactDir, "progress.json"), JSON.stringify({
+		queued: 0,
+		running: 1,
+		complete: 0,
+		total: 1,
+		children: [{ index: 0, agent: "poteto-agent", state: "running", startedAt: "2025-01-01T00:00:00.000Z" }],
+	}), "utf8");
+
+	const entries: Array<Record<string, unknown>> = [
+		{ seq: 1, timestamp: "2025-01-01T00:00:01.000Z", kind: "spawn", agent: "poteto-agent", task: "long task", cwd },
+	];
+	for (let i = 2; i <= 50; i++) {
+		entries.push({
+			seq: i,
+			timestamp: new Date(Date.parse("2025-01-01T00:00:00.000Z") + i * 1000).toISOString(),
+			kind: "tool",
+			name: "read",
+			gist: `file-${i}.ts`,
+		});
+	}
+	const journalSnapshot = {
+		schemaVersion: "dstack.journal.v1",
+		seq: 50,
+		entries,
+		updatedAt: "2025-01-01T00:00:50.000Z",
+	};
+	await writeFile(join(artifactDir, "children", "0", "journal.json"), JSON.stringify(journalSnapshot), "utf8");
+
+	const snapshot = await buildTreeSnapshot({
+		taskId: "task-hist-bound",
+		workflowId: "wf-history-bound",
+		artifactDir,
+		schedulerRoot,
+		now: new Date("2025-01-01T00:01:00.000Z"),
+	});
+
+	assert.ok(snapshot !== undefined);
+	const child = snapshot.children[0];
+	assert.ok(child !== undefined);
+	assert.ok(child.journal !== undefined);
+	assert.ok(child.journal.length <= 20);
+	assert.equal(child.journal[0]?.kind, "spawn");
+	assert.equal(child.journal.at(-1)?.kind, "tool");
+});
+
+test("buildTreeSnapshot propagates nested semantic status and recent history for depth-2 workers", async (t) => {
+	const cwd = await temporaryDirectory(t);
+	const artifactDir = join(cwd, "workflows", "wf-nested-status");
+	const schedulerRoot = join(cwd, "scheduler");
+	await mkdir(join(artifactDir, "children", "0", "spawns"), { recursive: true });
+	await mkdir(join(schedulerRoot, "leases"), { recursive: true });
+
+	const manifest = {
+		schemaVersion: "dstack.workflow.v1",
+		workflowId: "wf-nested-status",
+		sessionId: "sess-nest",
+		mode: "single",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		specs: [{ agent: "poteto-agent", task: "orchestrator", workflow: { assignment: "owner", playbook: "feature", phase: "implement" } }],
+	};
+	await writeFile(join(artifactDir, "manifest.json"), JSON.stringify(manifest), "utf8");
+	await writeFile(join(artifactDir, "progress.json"), JSON.stringify({
+		queued: 0,
+		running: 1,
+		complete: 0,
+		total: 1,
+		children: [{ index: 0, agent: "poteto-agent", state: "running", startedAt: "2025-01-01T00:00:00.000Z" }],
+	}), "utf8");
+
+	const spawnRecord = {
+		schemaVersion: "dstack.spawn-record.v1",
+		workflowId: "wf-nested-status",
+		parentIndex: 0,
+		groupId: "grp-nest-1",
+		mode: "parallel",
+		phase: "implement",
+		createdAt: "2025-01-01T00:00:30.000Z",
+		children: [
+			{
+				nestedIndex: 0,
+				agent: "general-purpose",
+				role: "implementation-worker",
+				assignment: "worker",
+				taskPreview: "worker unit tests",
+				state: "running",
+				status: {
+					phase: "unit-tests",
+					note: "running suite 2 of 4",
+					blocking: false,
+					updatedAt: "2025-01-01T00:01:00.000Z",
+				},
+				journal: [
+					{ seq: 1, timestamp: "2025-01-01T00:00:30.000Z", kind: "spawn", agent: "general-purpose", task: "worker unit tests", cwd },
+					{ seq: 2, timestamp: "2025-01-01T00:01:00.000Z", kind: "tool", name: "bash", gist: "npm test" },
+				],
+				updatedAt: "2025-01-01T00:01:00.000Z",
+				startedAt: "2025-01-01T00:00:30.000Z",
+			},
+		],
+	};
+	await writeFile(join(artifactDir, "children", "0", "spawns", "grp-nest-1.json"), JSON.stringify(spawnRecord), "utf8");
+
+	const snapshot = await buildTreeSnapshot({
+		taskId: "task-nested-status",
+		workflowId: "wf-nested-status",
+		artifactDir,
+		schedulerRoot,
+		now: new Date("2025-01-01T00:01:10.000Z"),
+	});
+
+	assert.ok(snapshot !== undefined);
+	const child = snapshot.children[0];
+	assert.ok(child !== undefined);
+	assert.equal(child.nested.length, 1);
+	const nested = child.nested[0];
+	assert.ok(nested !== undefined && !isLeaseSnapshot(nested));
+	assert.equal(nested.status?.phase, "unit-tests");
+	assert.equal(nested.status?.note, "running suite 2 of 4");
+	assert.equal(nested.activity, "unit-tests: running suite 2 of 4");
+	assert.equal(nested.journal?.length, 2);
+
+	const lines = renderTreeLines(snapshot, {
+		width: 100,
+		maxLines: Infinity,
+		now: new Date("2025-01-01T00:01:10.000Z"),
+	});
+	assert.ok(lines.some((l) => l.includes("worker general-purpose") && l.includes("unit-tests: running suite 2 of 4")));
+});
+
+test("buildTreeSnapshot and boundary parsers handle malformed status and journal safely", async (t) => {
+	const cwd = await temporaryDirectory(t);
+	const artifactDir = join(cwd, "workflows", "wf-malformed");
+	const schedulerRoot = join(cwd, "scheduler");
+	await mkdir(join(artifactDir, "children", "0"), { recursive: true });
+	await mkdir(join(schedulerRoot, "leases"), { recursive: true });
+
+	const manifest = {
+		schemaVersion: "dstack.workflow.v1",
+		workflowId: "wf-malformed",
+		sessionId: "sess-mal",
+		mode: "single",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		specs: [{ agent: "poteto-agent", task: "task with corrupt files" }],
+	};
+	await writeFile(join(artifactDir, "manifest.json"), JSON.stringify(manifest), "utf8");
+	await writeFile(join(artifactDir, "progress.json"), JSON.stringify({
+		queued: 0,
+		running: 1,
+		complete: 0,
+		total: 1,
+		children: [{ index: 0, agent: "poteto-agent", state: "running" }],
+	}), "utf8");
+
+	await writeFile(join(artifactDir, "children", "0", "status.json"), "invalid json data {", "utf8");
+	await writeFile(join(artifactDir, "children", "0", "journal.json"), "{ invalid journal", "utf8");
+
+	const snapshot = await buildTreeSnapshot({
+		taskId: "task-malformed",
+		workflowId: "wf-malformed",
+		artifactDir,
+		schedulerRoot,
+		now: new Date("2025-01-01T00:01:00.000Z"),
+	});
+
+	assert.ok(snapshot !== undefined);
+	const child = snapshot.children[0];
+	assert.ok(child !== undefined);
+	assert.equal(child.status, undefined);
+	assert.equal(child.journal, undefined);
+	assert.equal(child.state, "running");
+
+	const parsed = parseTreeSnapshot({
+		taskId: "task-bad",
+		workflowId: "wf-bad",
+		mode: "single",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		committed: false,
+		counts: { queued: 0, running: 1, complete: 0, total: 1 },
+		slots: { active: 1, capacity: 4 },
+		capturedAt: "2025-01-01T00:01:00.000Z",
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		children: [
+			{
+				index: 0,
+				agent: "general-purpose",
+				state: "running",
+				status: "not an object",
+				journal: "not an array",
+				nestedGroups: [],
+				nested: [],
+			},
+		],
+	});
+	assert.ok(parsed !== undefined);
+	assert.equal(parsed.children[0]?.status, undefined);
+	assert.equal(parsed.children[0]?.journal, undefined);
+
+	assert.equal(parseSemanticStatus({ phase: "integrate" }), undefined);
+	assert.equal(parseSemanticStatus({ phase: "integrate", updatedAt: "invalid-date" }), undefined);
+	assert.equal(parseSemanticStatus({ phase: "integrate", updatedAt: 12345 }), undefined);
+	assert.deepEqual(parseSemanticStatus({ phase: "integrate", updatedAt: "2025-01-01T00:00:00.000Z" }), {
+		phase: "integrate",
+		updatedAt: "2025-01-01T00:00:00.000Z",
+	});
+
+	const validJournalItem = { seq: 1, timestamp: "2025-01-01T00:00:01.000Z", kind: "spawn", agent: "poteto-agent", task: "task", cwd: "/tmp" };
+	const invalidItems = [
+		{ seq: "1", timestamp: "2025-01-01T00:00:01.000Z", kind: "spawn" },
+		{ seq: -1, timestamp: "2025-01-01T00:00:01.000Z", kind: "spawn" },
+		{ seq: 2, timestamp: "not-a-date", kind: "tool", name: "read", gist: "a.ts" },
+		{ seq: 3, timestamp: "2025-01-01T00:00:03.000Z", kind: "turn", turn: -1 },
+		{ seq: 4, timestamp: "2025-01-01T00:00:04.000Z", kind: "exit", exitCode: "0" },
+		{ seq: 5, timestamp: "2025-01-01T00:00:05.000Z", kind: "failure", error: 123 },
+		null,
+		"string-entry",
+	];
+	const filteredJournal = parseJournalEntries([...invalidItems, validJournalItem]);
+	assert.deepEqual(filteredJournal, [validJournalItem]);
+	assert.equal(parseJournalEntries("not-an-array"), undefined);
+	assert.deepEqual(parseJournalEntries([]), []);
+
+	assert.equal(parseJournalSnapshot({ schemaVersion: "dstack.journal.v2", seq: 1, entries: [], updatedAt: "2025-01-01T00:00:00.000Z" }), undefined);
+	assert.equal(parseJournalSnapshot({ schemaVersion: "dstack.journal.v1", seq: 1, entries: [], updatedAt: "bad-date" }), undefined);
+	assert.deepEqual(
+		parseJournalSnapshot({ schemaVersion: "dstack.journal.v1", seq: 1, entries: [validJournalItem], updatedAt: "2025-01-01T00:00:00.000Z" }),
+		{ schemaVersion: "dstack.journal.v1", seq: 1, entries: [validJournalItem], updatedAt: "2025-01-01T00:00:00.000Z" },
+	);
+});
+
+test("terminal child rendering remains unchanged with outcome and duration", () => {
+	const snapshot: TreeSnapshot = {
+		taskId: "task-terminal-render",
+		workflowId: "wf-term-render",
+		mode: "parallel",
+		playbook: "feature",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		committed: true,
+		counts: { queued: 0, running: 0, complete: 2, total: 2 },
+		slots: { active: 0, capacity: 4 },
+		capturedAt: "2025-01-01T00:04:00.000Z",
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		children: [
+			{
+				index: 0,
+				agent: "poteto-agent",
+				state: "succeeded",
+				assignment: "owner",
+				startedAt: "2025-01-01T00:00:00.000Z",
+				endedAt: "2025-01-01T00:03:00.000Z",
+				taskPreview: "orchestrate feature",
+				outcome: "All changes integrated and verified",
+				nestedGroups: [],
+				nested: [],
+			},
+			{
+				index: 1,
+				agent: "general-purpose",
+				state: "failed",
+				assignment: "worker",
+				startedAt: "2025-01-01T00:00:00.000Z",
+				endedAt: "2025-01-01T00:01:30.000Z",
+				taskPreview: "run tests",
+				outcome: "AssertionError: 3 !== 4",
+				nestedGroups: [],
+				nested: [],
+			},
+		],
+	};
+
+	const lines = renderTreeLines(snapshot, {
+		width: 100,
+		maxLines: Infinity,
+		now: new Date("2025-01-01T00:04:00.000Z"),
+	});
+
+	assert.equal(lines[0], "dstack · feature · 2/2 done · 4m00s · oldest at top · newest at bottom");
+	assert.ok(lines.some((l) => l.includes("✓ owner poteto-agent (3m00s) — All changes integrated and verified")));
+	assert.ok(lines.some((l) => l.includes("✗ worker general-purpose (1m30s) failed — AssertionError: 3 !== 4")));
+});
+
+test("renderTreeLines expanded view exposes compact recent activity history for running top-level and nested agents", () => {
+	const snapshot: TreeSnapshot = {
+		taskId: "task-exp-journal",
+		workflowId: "wf-exp-journal",
+		mode: "single",
+		playbook: "feature",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		committed: false,
+		counts: { queued: 0, running: 1, complete: 1, total: 2 },
+		slots: { active: 2, capacity: 4 },
+		capturedAt: "2025-01-01T00:03:00.000Z",
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		children: [
+			{
+				index: 0,
+				agent: "poteto-agent",
+				state: "running",
+				assignment: "owner",
+				phase: "implement",
+				startedAt: "2025-01-01T00:00:00.000Z",
+				taskPreview: "orchestrate feature implementation",
+				taskFull: "orchestrate feature implementation in full details",
+				activity: {
+					text: "implement: editing tree renderer",
+					updatedAt: "2025-01-01T00:02:30.000Z",
+				},
+				journal: [
+					{ seq: 1, timestamp: "2025-01-01T00:00:00.000Z", kind: "spawn", agent: "poteto-agent", task: "orchestrate feature", cwd: "/tmp" },
+					{ seq: 2, timestamp: "2025-01-01T00:01:00.000Z", kind: "tool", name: "read", gist: "src/tree.ts" },
+					{ seq: 3, timestamp: "2025-01-01T00:01:45.000Z", kind: "tool", name: "edit", gist: "src/tree.ts" },
+					{ seq: 4, timestamp: "2025-01-01T00:02:30.000Z", kind: "phase", phase: "implement", note: "editing tree renderer" },
+				],
+				nestedGroups: [
+					{
+						groupId: "grp-1",
+						mode: "single",
+						createdAt: "2025-01-01T00:01:00.000Z",
+						children: [
+							{
+								groupId: "grp-1",
+								nestedIndex: 0,
+								agent: "general-purpose",
+								role: "implementation-worker",
+								assignment: "worker",
+								taskPreview: "run test suite",
+								state: "running",
+								startedAt: "2025-01-01T00:01:00.000Z",
+								updatedAt: "2025-01-01T00:02:30.000Z",
+								live: true,
+								journal: [
+									{ seq: 1, timestamp: "2025-01-01T00:01:00.000Z", kind: "spawn", agent: "general-purpose", task: "run tests", cwd: "/tmp" },
+									{ seq: 2, timestamp: "2025-01-01T00:01:30.000Z", kind: "tool", name: "bash", gist: "npm test" },
+									{ seq: 3, timestamp: "2025-01-01T00:02:30.000Z", kind: "turn", turn: 1, summary: "tests running suite 1" },
+								],
+							},
+						],
+					},
+				],
+				nested: [],
+			},
+			{
+				index: 1,
+				agent: "general-purpose",
+				state: "succeeded",
+				assignment: "worker",
+				startedAt: "2025-01-01T00:00:00.000Z",
+				endedAt: "2025-01-01T00:01:00.000Z",
+				taskPreview: "ground codebase",
+				taskFull: "ground codebase full task description",
+				outcome: "Codebase mapped cleanly",
+				journal: [
+					{ seq: 1, timestamp: "2025-01-01T00:00:00.000Z", kind: "spawn", agent: "general-purpose", task: "ground", cwd: "/tmp" },
+					{ seq: 2, timestamp: "2025-01-01T00:00:30.000Z", kind: "tool", name: "read", gist: "README.md" },
+					{ seq: 3, timestamp: "2025-01-01T00:01:00.000Z", kind: "exit", exitCode: 0 },
+				],
+				nestedGroups: [],
+				nested: [],
+			},
+		],
+	};
+
+	const lines = renderTreeLines(snapshot, {
+		width: 100,
+		expanded: true,
+		now: new Date("2025-01-01T00:03:00.000Z"),
+	});
+
+	assert.ok(lines.some((l) => l.includes("◐ owner poteto-agent") && l.includes("implement: editing tree renderer")));
+	assert.ok(lines.some((l) => l.includes("◐ worker general-purpose")));
+
+	assert.ok(lines.some((l) => l.includes("task [poteto-agent]: orchestrate feature implementation in full details")));
+	assert.ok(lines.some((l) => l.includes("task [general-purpose]: ground codebase full task description")));
+
+	assert.ok(!lines.some((l) => l.includes("• → read src/tree.ts")));
+	assert.ok(!lines.some((l) => l.includes("• → edit src/tree.ts")));
+	assert.ok(lines.some((l) => l.includes("• implement: editing tree renderer")));
+
+	assert.ok(!lines.some((l) => l.includes("• → bash npm test")));
+	assert.ok(!lines.some((l) => l.includes("• turn 1: tests running suite 1")));
+	assert.ok(lines.some((l) => l.includes("• tests running suite 1")));
+
+	assert.ok(lines.some((l) => l.includes("✓ worker general-purpose (1m00s) — Codebase mapped cleanly")));
+	assert.ok(!lines.some((l) => l.includes("• → read README.md")));
+
+	const narrowLines = renderTreeLines(snapshot, {
+		width: 40,
+		expanded: true,
+		now: new Date("2025-01-01T00:03:00.000Z"),
+	});
+	for (const line of narrowLines) {
+		assert.ok(visibleWidth(line) <= 40, `line exceeds width 40: "${line}"`);
+	}
 });

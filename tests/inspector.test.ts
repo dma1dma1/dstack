@@ -20,6 +20,12 @@ import {
 	type WorkflowSummary,
 } from "../extensions/background/inspector.ts";
 import {
+	formatJournalEntry,
+	formatRecentActivity,
+	type JournalEntry,
+	type SemanticStatus,
+} from "../extensions/background/journal.ts";
+import {
 	parseChildUsage,
 	parseSpawnRecordV1,
 	type SpawnNestedChild,
@@ -442,6 +448,7 @@ test("AgentInspector component navigation: list -> drill-down -> nested drill-do
 				state: "running",
 				role: "feature",
 				assignment: "owner",
+				model: "openai-codex/gpt-5.6-sol",
 				phase: "implementation",
 				taskPreview: "build inspector",
 				taskFull: "build inspector with clean frames",
@@ -523,6 +530,9 @@ test("AgentInspector component navigation: list -> drill-down -> nested drill-do
 
 	const detailLines = inspector.render(100);
 	assert.ok(detailLines.some((l) => l.includes("Agent: poteto-agent")));
+	assert.ok(detailLines.some((l) => l.includes("Assignment: owner")));
+	assert.ok(detailLines.some((l) => l.includes("Role: feature → openai-codex/gpt-5.6-sol")));
+	assert.ok(detailLines.some((l) => l.includes("Model: openai-codex/gpt-5.6-sol")));
 	assert.ok(detailLines.some((l) => l.includes("Workflow: feature")));
 	assert.ok(detailLines.some((l) => l.includes("Phase: implementation")));
 	assert.ok(detailLines.some((l) => l.includes("Input Envelope:")));
@@ -530,8 +540,11 @@ test("AgentInspector component navigation: list -> drill-down -> nested drill-do
 	inspector.handleInput("\x1b[6~");
 	const scrolledDetailLines = inspector.render(100);
 	assert.ok(scrolledDetailLines.some((l) => l.includes("Todos:")));
-	assert.ok(scrolledDetailLines.some((l) => l.includes("Nested agents")));
 	assert.ok(scrolledDetailLines.some((l) => l.includes("Output Envelope:")));
+
+	inspector.handleInput("\x1b[F");
+	const endDetailLines = inspector.render(100);
+	assert.ok(endDetailLines.some((l) => l.includes("Nested agents")));
 
 	inspector.handleInput("\r");
 	await new Promise((r) => setTimeout(r, 20));
@@ -2247,6 +2260,231 @@ test("AgentInspector renders visual group rows, plain chronological direction co
 
 	const detailLines = inspector.render(120);
 	assert.ok(detailLines.some((l) => l.includes("nested agent: general-purpose (depth 2)")));
+
+	inspector.dispose();
+});
+
+test("formatRecentActivity shows all human-readable semantic history without internal tool noise", () => {
+	const spawn: JournalEntry = { seq: 1, timestamp: "2025-01-01T00:00:01.000Z", kind: "spawn", agent: "poteto-agent", task: "orchestrate feature", cwd: "/tmp" };
+	const tool: JournalEntry = { seq: 2, timestamp: "2025-01-01T00:00:05.000Z", kind: "tool", name: "read", gist: "src/tree.ts" };
+	const turn: JournalEntry = { seq: 3, timestamp: "2025-01-01T00:00:10.000Z", kind: "turn", turn: 1, summary: "Read tree sources and planned edit" };
+	const phase: JournalEntry = { seq: 4, timestamp: "2025-01-01T00:00:15.000Z", kind: "phase", phase: "integrate", note: "resolving conflicts", blocking: true };
+	const exit: JournalEntry = { seq: 5, timestamp: "2025-01-01T00:00:20.000Z", kind: "exit", exitCode: 0 };
+	const fail: JournalEntry = { seq: 6, timestamp: "2025-01-01T00:00:25.000Z", kind: "failure", error: "process timed out" };
+
+	assert.equal(formatJournalEntry(spawn), "spawned (poteto-agent)");
+	assert.equal(formatJournalEntry(tool), "→ read src/tree.ts");
+	assert.equal(formatJournalEntry(turn), "turn 1: Read tree sources and planned edit");
+	assert.equal(formatJournalEntry(phase), "integrate: resolving conflicts: [blocking]");
+	assert.equal(formatJournalEntry(exit), "completed");
+	assert.equal(formatJournalEntry(fail), "failed: process timed out");
+
+	const screenshotRepro: JournalEntry[] = [
+		spawn,
+		{ seq: 2, timestamp: "2025-01-01T00:00:02.000Z", kind: "turn", turn: 4, summary: "" },
+		{ seq: 3, timestamp: "2025-01-01T00:00:03.000Z", kind: "tool", name: "bash", gist: "cd /Users/dma/.dma/worktrees/dstack/example && git diff" },
+		{ seq: 4, timestamp: "2025-01-01T00:00:04.000Z", kind: "tool", name: "read", gist: "/Users/dma/.dma/worktrees/dstack/example/extensions/background/journal.ts" },
+		{ seq: 5, timestamp: "2025-01-01T00:00:05.000Z", kind: "turn", turn: 5, summary: "" },
+		{ seq: 6, timestamp: "2025-01-01T00:00:06.000Z", kind: "turn", turn: 6, summary: "Reviewed the activity history" },
+		{ seq: 7, timestamp: "2025-01-01T00:00:07.000Z", kind: "phase", phase: "verify", note: "checking the inspector output" },
+	];
+	assert.deepEqual(formatRecentActivity(screenshotRepro), [
+		"Reviewed the activity history",
+		"verify: checking the inspector output",
+	]);
+
+	assert.deepEqual(formatRecentActivity([spawn]), []);
+	assert.deepEqual(formatRecentActivity([]), []);
+	assert.deepEqual(formatRecentActivity(undefined), []);
+
+	const allRelevant: JournalEntry[] = Array.from({ length: 6 }, (_, index) => ({
+		seq: index + 1,
+		timestamp: `2025-01-01T00:00:0${index + 1}.000Z`,
+		kind: "turn",
+		turn: index + 1,
+		summary: `Completed step ${index + 1}`,
+	}));
+	assert.deepEqual(formatRecentActivity(allRelevant), [
+		"Completed step 1",
+		"Completed step 2",
+		"Completed step 3",
+		"Completed step 4",
+		"Completed step 5",
+		"Completed step 6",
+	]);
+});
+
+test("AgentInspector displays Recent Activity and Semantic Status for running depth-1 and depth-2 agents", async () => {
+	const status: SemanticStatus = {
+		phase: "integrate",
+		note: "running integration tests",
+		blocking: false,
+		updatedAt: "2025-01-01T00:02:00.000Z",
+	};
+
+	const snapshot: TreeSnapshot = {
+		workflowId: "wf-live-journal",
+		taskId: "task-live-journal",
+		mode: "single",
+		committed: false,
+		createdAt: "2025-01-01T00:00:00.000Z",
+		counts: { queued: 0, total: 1, running: 1, complete: 0 },
+		slots: { active: 2, capacity: 4 },
+		playbook: "feature",
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		children: [
+			{
+				index: 0,
+				agent: "poteto-agent",
+				state: "running",
+				startedAt: "2025-01-01T00:00:01.000Z",
+				taskPreview: "orchestrate feature development",
+				assignment: "owner",
+				phase: "integrate",
+				status,
+				journal: [
+					{ seq: 1, timestamp: "2025-01-01T00:00:01.000Z", kind: "spawn", agent: "poteto-agent", task: "orchestrate feature development", cwd: "/tmp" },
+					{ seq: 2, timestamp: "2025-01-01T00:01:00.000Z", kind: "tool", name: "read", gist: "src/tree.ts" },
+					{ seq: 3, timestamp: "2025-01-01T00:01:30.000Z", kind: "turn", turn: 2, summary: "reviewed tree renderer changes" },
+					{ seq: 4, timestamp: "2025-01-01T00:02:00.000Z", kind: "phase", phase: "integrate", note: "running integration tests" },
+				],
+				activity: {
+					text: "integrate: running integration tests",
+					updatedAt: "2025-01-01T00:02:00.000Z",
+				},
+				stale: true,
+				nestedGroups: [],
+				nested: [
+					{
+						groupId: "nested-grp-1",
+						nestedIndex: 0,
+						agent: "general-purpose",
+						role: "implementation-worker",
+						assignment: "worker",
+						taskPreview: "run test suite",
+						state: "running",
+						startedAt: "2025-01-01T00:01:00.000Z",
+						updatedAt: "2025-01-01T00:02:00.000Z",
+						live: true,
+						journal: [
+							{ seq: 1, timestamp: "2025-01-01T00:01:00.000Z", kind: "spawn", agent: "general-purpose", task: "run test suite", cwd: "/tmp" },
+							{ seq: 2, timestamp: "2025-01-01T00:01:30.000Z", kind: "tool", name: "bash", gist: "npm test" },
+							{ seq: 3, timestamp: "2025-01-01T00:02:00.000Z", kind: "turn", turn: 1, summary: "all 188 tests passed" },
+						],
+					},
+				],
+			},
+		],
+		capturedAt: "2025-01-01T00:05:00.000Z",
+	};
+
+	const inspector = new AgentInspector({ requestRender: () => {} }, plainTheme(), () => {}, {
+		sessionId: "test-sess-journal",
+		initialTaskId: "task-live-journal",
+		listWorkflows: async () => [
+			{
+				workflowId: "wf-live-journal",
+				taskId: "task-live-journal",
+				artifactDir: "/tmp/wf-live-journal",
+				schedulerRoot: "/tmp/scheduler",
+				committed: false,
+				createdAt: "2025-01-01T00:00:00.000Z",
+				playbook: "feature",
+				unreadable: false,
+			},
+		],
+		getSnapshot: async () => snapshot,
+	});
+
+	await new Promise((r) => setTimeout(r, 20));
+
+	const topDetailLines = inspector.render(100);
+	assert.ok(topDetailLines.some((l) => l.includes("Status:") && l.includes("running")));
+	assert.ok(topDetailLines.some((l) => l.includes("Phase:") && l.includes("integrate")));
+	assert.ok(topDetailLines.some((l) => l.includes("Activity:") && l.includes("integrate: running integration tests")));
+	assert.ok(topDetailLines.some((l) => l.includes("⚠ Stale")));
+	assert.ok(topDetailLines.some((l) => l.includes("Recent Activity:")));
+	assert.ok(topDetailLines.some((l) => l.includes("reviewed tree renderer changes")));
+	assert.ok(!topDetailLines.some((l) => l.includes("→ read src/tree.ts")));
+	assert.ok(!topDetailLines.some((l) => l.includes("turn 2: reviewed tree renderer changes")));
+	assert.ok(topDetailLines.some((l) => l.includes("integrate: running integration tests")));
+
+	inspector.handleInput("\r");
+	const nestedDetailLines = inspector.render(100);
+	assert.ok(nestedDetailLines.some((l) => l.includes("nested agent: general-purpose (depth 2)")));
+	assert.ok(nestedDetailLines.some((l) => l.includes("Recent Activity:")));
+	assert.ok(nestedDetailLines.some((l) => l.includes("all 188 tests passed")));
+	assert.ok(!nestedDetailLines.some((l) => l.includes("→ bash npm test")));
+	assert.ok(!nestedDetailLines.some((l) => l.includes("turn 1: all 188 tests passed")));
+
+	inspector.dispose();
+});
+
+test("AgentInspector does not display Recent Activity for completed agents to preserve outcome behavior", async () => {
+	const snapshot: TreeSnapshot = {
+		workflowId: "wf-completed",
+		taskId: "task-completed",
+		mode: "single",
+		committed: true,
+		createdAt: "2025-01-01T00:00:00.000Z",
+		counts: { queued: 0, total: 1, running: 0, complete: 1 },
+		slots: { active: 0, capacity: 4 },
+		playbook: "feature",
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		children: [
+			{
+				index: 0,
+				agent: "poteto-agent",
+				state: "succeeded",
+				startedAt: "2025-01-01T00:00:01.000Z",
+				endedAt: "2025-01-01T00:01:00.000Z",
+				taskPreview: "finish feature implementation",
+				assignment: "owner",
+				phase: "review",
+				outcome: "All deliverables verified",
+				journal: [
+					{ seq: 1, timestamp: "2025-01-01T00:00:01.000Z", kind: "spawn", agent: "poteto-agent", task: "finish feature", cwd: "/tmp" },
+					{ seq: 2, timestamp: "2025-01-01T00:00:30.000Z", kind: "tool", name: "write", gist: "out.txt" },
+					{ seq: 3, timestamp: "2025-01-01T00:01:00.000Z", kind: "exit", exitCode: 0 },
+				],
+				nestedGroups: [],
+				nested: [],
+			},
+		],
+		capturedAt: "2025-01-01T00:01:00.000Z",
+	};
+
+	const inspector = new AgentInspector({ requestRender: () => {} }, plainTheme(), () => {}, {
+		sessionId: "test-sess-completed",
+		initialTaskId: "task-completed",
+		listWorkflows: async () => [
+			{
+				workflowId: "wf-completed",
+				taskId: "task-completed",
+				artifactDir: "/tmp/wf-completed",
+				schedulerRoot: "/tmp/scheduler",
+				committed: true,
+				createdAt: "2025-01-01T00:00:00.000Z",
+				playbook: "feature",
+				unreadable: false,
+			},
+		],
+		getSnapshot: async () => snapshot,
+		readChildResult: async () => ({
+			state: "succeeded",
+			exitCode: 0,
+			summaryText: "Delivered successfully",
+		}),
+	});
+
+	await new Promise((r) => setTimeout(r, 20));
+
+	const lines = inspector.render(100);
+	assert.ok(lines.some((l) => l.includes("Status:") && l.includes("succeeded")));
+	assert.ok(lines.some((l) => l.includes("Outcome:") && l.includes("All deliverables verified")));
+	assert.ok(!lines.some((l) => l.includes("Recent Activity:")));
 
 	inspector.dispose();
 });
