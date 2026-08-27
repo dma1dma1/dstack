@@ -1766,13 +1766,19 @@ export class AgentInspector implements Component {
 		const lines: string[] = [];
 		const { identity, status, timing, input, output } = inspection;
 
-		const roleLabel = identity.assignment ? `${identity.assignment} (${identity.agent})` : identity.role ? `${identity.role} (${identity.agent})` : identity.agent;
 		const stateGlyph = glyphForState(status.state, this.theme);
 		const durationText = timing.elapsedMs !== undefined ? formatElapsed(timing.elapsedMs) : "queued";
 
 		lines.push(
-			` ${this.theme.fg("toolTitle", "Agent:")} ${this.theme.fg("accent", identity.agent)} ${this.theme.fg("dim", `· depth ${identity.depth} · ${roleLabel}`)}`,
+			` ${this.theme.fg("toolTitle", "Agent:")} ${this.theme.fg("accent", identity.agent)} ${this.theme.fg("dim", `· depth ${identity.depth}`)}`,
 		);
+		if (identity.assignment) {
+			lines.push(` ${this.theme.fg("toolTitle", "Assignment:")} ${this.theme.fg("accent", identity.assignment)}`);
+		}
+		if (identity.role) {
+			const resolvedModel = identity.model ? ` → ${identity.model}` : "";
+			lines.push(` ${this.theme.fg("toolTitle", "Role:")} ${this.theme.fg("accent", identity.role)}${this.theme.fg("dim", resolvedModel)}`);
+		}
 
 		if (identity.parentIdentity !== undefined) {
 			lines.push(

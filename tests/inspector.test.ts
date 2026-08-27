@@ -448,6 +448,7 @@ test("AgentInspector component navigation: list -> drill-down -> nested drill-do
 				state: "running",
 				role: "feature",
 				assignment: "owner",
+				model: "openai-codex/gpt-5.6-sol",
 				phase: "implementation",
 				taskPreview: "build inspector",
 				taskFull: "build inspector with clean frames",
@@ -507,6 +508,9 @@ test("AgentInspector component navigation: list -> drill-down -> nested drill-do
 
 	const detailLines = inspector.render(100);
 	assert.ok(detailLines.some((l) => l.includes("Agent: poteto-agent")));
+	assert.ok(detailLines.some((l) => l.includes("Assignment: owner")));
+	assert.ok(detailLines.some((l) => l.includes("Role: feature → openai-codex/gpt-5.6-sol")));
+	assert.ok(detailLines.some((l) => l.includes("Model: openai-codex/gpt-5.6-sol")));
 	assert.ok(detailLines.some((l) => l.includes("Workflow: feature")));
 	assert.ok(detailLines.some((l) => l.includes("Phase: implementation")));
 	assert.ok(detailLines.some((l) => l.includes("Input Envelope:")));
@@ -514,8 +518,11 @@ test("AgentInspector component navigation: list -> drill-down -> nested drill-do
 	inspector.handleInput("\x1b[6~");
 	const scrolledDetailLines = inspector.render(100);
 	assert.ok(scrolledDetailLines.some((l) => l.includes("Todos:")));
-	assert.ok(scrolledDetailLines.some((l) => l.includes("Nested agents")));
 	assert.ok(scrolledDetailLines.some((l) => l.includes("Output Envelope:")));
+
+	inspector.handleInput("\x1b[F");
+	const endDetailLines = inspector.render(100);
+	assert.ok(endDetailLines.some((l) => l.includes("Nested agents")));
 
 	inspector.handleInput("\r");
 	await new Promise((r) => setTimeout(r, 20));
