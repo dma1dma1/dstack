@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm, unlink, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChildDepth, DstackConfig, TaskRequest, TaskSpec, WorkflowAssignment } from "./types.ts";
+import { SESSION_REF_ENV } from "./types.ts";
 import type { ChildResult } from "./spawn.ts";
 import {
 	buildChildArgv,
@@ -25,6 +26,7 @@ import {
 	type SemanticStatus,
 } from "./background/journal.ts";
 import { acquireChildSlot } from "./background/scheduler.ts";
+import { readChildSessionRef } from "./background/session.ts";
 import {
 	DSTACK_ARTIFACT_DIR_ENV,
 	DSTACK_CHILD_INDEX_ENV,
@@ -609,6 +611,12 @@ export function launchNestedTask(options: {
 			if (system) tmp = await writeTempPrompt(system);
 			try {
 				childTmpDir = await mkdtemp(join(tmpdir(), "dstack-child-"));
+				const sessionBase = canPersistSpawns && artifactDirEnv !== undefined
+					? join(artifactDirEnv, "children", String(parentIndex), "sessions", `${groupId}-${index}`)
+					: childTmpDir;
+				const sessionDir = join(sessionBase, "session");
+				await mkdir(sessionDir, { recursive: true, mode: 0o700 });
+				const sessionRefPath = join(sessionBase, "session-ref.json");
 				const statusPath = join(childTmpDir, "status.json");
 				const journalPath = join(childTmpDir, "journal.json");
 				recorder = new ChildJournalRecorder({ statusPath, journalPath });
@@ -661,9 +669,11 @@ export function launchNestedTask(options: {
 					omitModel: model.value.omitModel,
 					tools: childTools,
 					systemPromptPath: tmp?.filePath,
+					sessionDir,
 				});
 				const env = childEnv(childDepth, process.env, spec.workflow?.assignment);
 				env["DSTACK_STATUS_FILE"] = statusPath;
+				env[SESSION_REF_ENV] = sessionRefPath;
 				let journalUpdates = Promise.resolve();
 				const child = await runChildProcess({
 					args,
@@ -727,6 +737,7 @@ export function launchNestedTask(options: {
 				if (signal.aborted) recorder.recordFailure({ error: "Child agent was aborted" });
 				else recorder.recordExit({ exitCode: child.exitCode, text: child.text });
 				await recorder.persist();
+				const session = await readChildSessionRef({ refPath: sessionRefPath, sessionDir });
 				const completed: TaskResult = {
 					...child,
 					agent: resolved.agent,
@@ -792,6 +803,7 @@ export function launchNestedTask(options: {
 						activity: latestActivity(completed),
 						status: completed.status,
 						journal: completed.journal,
+						session: session ?? existingSpawn.session,
 						updatedAt: now,
 						endedAt: now,
 					};

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -7,18 +7,27 @@ import {
 	AgentInspector,
 	boundedTailRead,
 	buildAgentInspection,
+	createWorkflowListCache,
 	deriveInspectorLayoutMetrics,
+	formatConversationRecords,
 	listSessionWorkflows,
 	parseChildResultDetails,
 	readChildActivityDetails,
 	readChildResultDetails,
 	renderAmbientWidgetLine,
 	wrapText,
+	type AgentInspectorResult,
 	type AmbientStatus,
 	type BoundedReadResult,
 	type InspectorTheme,
+	type ListSessionWorkflowsIO,
 	type WorkflowSummary,
 } from "../extensions/background/inspector.ts";
+import {
+	createSessionTailState,
+	tailSessionFile,
+	type ChildSessionRefV1,
+} from "../extensions/background/session.ts";
 import {
 	formatJournalEntry,
 	formatRecentActivity,
@@ -32,6 +41,7 @@ import {
 	type TreeSnapshot,
 	type TreeTheme,
 } from "../extensions/background/tree.ts";
+import type { LeaseSnapshot } from "../extensions/background/scheduler.ts";
 import type { TodoItem } from "../extensions/types.ts";
 
 function plainTheme(): InspectorTheme & TreeTheme {
@@ -353,8 +363,8 @@ test("AgentInspector component navigation: list -> drill-down -> nested drill-do
 			renderRequested++;
 		},
 	};
-	let closedResult: string | undefined;
-	const done = (res: string) => {
+	let closedResult: AgentInspectorResult | undefined;
+	const done = (res: AgentInspectorResult) => {
 		closedResult = res;
 	};
 
@@ -467,6 +477,7 @@ test("AgentInspector component navigation: list -> drill-down -> nested drill-do
 	inspector.handleInput("\r");
 	await new Promise((r) => setTimeout(r, 20));
 
+	inspector.handleInput("s");
 	const detailLines = inspector.render(100);
 	assert.ok(detailLines.some((l) => l.includes("Agent: poteto-agent")));
 	assert.ok(detailLines.some((l) => l.includes("Assignment: owner")));
@@ -488,11 +499,13 @@ test("AgentInspector component navigation: list -> drill-down -> nested drill-do
 	inspector.handleInput("\r");
 	await new Promise((r) => setTimeout(r, 20));
 
+	inspector.handleInput("s");
 	const nestedDetailLines = inspector.render(100);
 	assert.ok(nestedDetailLines.some((l) => l.includes("nested agent: general-purpose") || l.includes("Agent: general-purpose")));
 	assert.ok(nestedDetailLines.some((l) => l.includes("Parent: poteto-agent")));
 
 	inspector.handleInput("\x1b[D");
+	inspector.handleInput("s");
 	const backParentLines = inspector.render(100);
 	assert.ok(backParentLines.some((l) => l.includes("Agent: poteto-agent")));
 
@@ -634,8 +647,12 @@ test("AgentInspector stale state and explicit raw output tail scrolling behavior
 		},
 	});
 
-	await new Promise((r) => setTimeout(r, 20));
+	for (let attempt = 0; attempt < 50 && tailReads === 0; attempt++) {
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	assert.ok(tailReads > 0);
 
+	inspector.handleInput("s");
 	const detailLines = inspector.render(100);
 	assert.ok(detailLines.some((l) => l.includes("⚠ Stale")));
 	assert.ok(detailLines.some((l) => l.includes("Input Envelope:")));
@@ -714,6 +731,7 @@ test("AgentInspector task view displays full multiline task with vertical scroll
 
 	await new Promise((r) => setTimeout(r, 20));
 
+	inspector.handleInput("s");
 	const summaryLines = inspector.render(100);
 	assert.ok(summaryLines.some((l) => l.includes("press 't' for full task")));
 
@@ -908,6 +926,7 @@ test("AgentInspector depth-2 agent parity in views, labeled fields, and unavaila
 
 	await new Promise((r) => setTimeout(r, 20));
 
+	inspector.handleInput("s");
 	const depth2Summary = inspector.render(100);
 	assert.ok(depth2Summary.some((l) => l.includes("Agent:") && l.includes("general-purpose") && l.includes("depth 2")));
 	assert.ok(depth2Summary.some((l) => l.includes("Parent:") && l.includes("poteto-agent")));
@@ -1146,6 +1165,7 @@ test("AgentInspector summary view bounds viewport, shows line-range indicator, a
 
 	await new Promise((r) => setTimeout(r, 20));
 
+	inspector.handleInput("s");
 	const initialSummary = inspector.render(100);
 	assert.ok(initialSummary.some((l) => l.includes("Agent:") && l.includes("poteto-agent")));
 	assert.ok(initialSummary.some((l) => l.includes("lines 1-14 of")));
@@ -1432,6 +1452,7 @@ test("AgentInspector renders inherited model for running depth-2 child", async (
 	});
 
 	await new Promise((r) => setTimeout(r, 20));
+	inspector.handleInput("s");
 	const lines = inspector.render(100);
 
 	assert.ok(lines.some((l) => l.includes("Agent:") && l.includes("general-purpose") && l.includes("depth 2")));
@@ -1514,6 +1535,7 @@ test("AgentInspector renders child-reported model for completed depth-2 child in
 	});
 
 	await new Promise((r) => setTimeout(r, 20));
+	inspector.handleInput("s");
 	const summaryLines = inspector.render(100);
 	assert.ok(summaryLines.some((l) => l.includes("Model:") && l.includes("google/gemini-2.5-pro")));
 
@@ -1617,6 +1639,7 @@ test("AgentInspector recovers nested model from historical sealed result on disk
 	});
 
 	await new Promise((r) => setTimeout(r, 40));
+	inspector.handleInput("s");
 	const lines = inspector.render(100);
 
 	assert.ok(lines.some((l) => l.includes("Agent:") && l.includes("general-purpose") && l.includes("depth 2")));
@@ -1697,6 +1720,7 @@ test("AgentInspector renders Model: unavailable for historical records without s
 	});
 
 	await new Promise((r) => setTimeout(r, 40));
+	inspector.handleInput("s");
 	const lines = inspector.render(100);
 
 	assert.ok(lines.some((l) => l.includes("Agent:") && l.includes("general-purpose") && l.includes("depth 2")));
@@ -2329,6 +2353,7 @@ test("AgentInspector displays Recent Activity and Semantic Status for running de
 
 	await new Promise((r) => setTimeout(r, 20));
 
+	inspector.handleInput("s");
 	const topDetailLines = inspector.render(100);
 	assert.ok(topDetailLines.some((l) => l.includes("Status:") && l.includes("running")));
 	assert.ok(topDetailLines.some((l) => l.includes("Phase:") && l.includes("integrate")));
@@ -2341,6 +2366,7 @@ test("AgentInspector displays Recent Activity and Semantic Status for running de
 	assert.ok(topDetailLines.some((l) => l.includes("integrate: running integration tests")));
 
 	inspector.handleInput("\r");
+	inspector.handleInput("s");
 	const nestedDetailLines = inspector.render(100);
 	assert.ok(nestedDetailLines.some((l) => l.includes("nested agent: general-purpose (depth 2)")));
 	assert.ok(nestedDetailLines.some((l) => l.includes("Recent Activity:")));
@@ -2411,6 +2437,7 @@ test("AgentInspector does not display Recent Activity for completed agents to pr
 
 	await new Promise((r) => setTimeout(r, 20));
 
+	inspector.handleInput("s");
 	const lines = inspector.render(100);
 	assert.ok(lines.some((l) => l.includes("Status:") && l.includes("succeeded")));
 	assert.ok(lines.some((l) => l.includes("Outcome:") && l.includes("All deliverables verified")));
@@ -2535,4 +2562,554 @@ test("AgentInspector snapshot refresh and retry transition from pending to ok", 
 	assert.ok(refreshedLines.some((l) => l.includes("1 active workflow")));
 
 	inspector.dispose();
+});
+
+test("tailSessionFile handles partial lines, truncation, identity replacement, and caps", async (t) => {
+	const dir = await temporaryDirectory(t);
+	const sessionFile = join(dir, "test.jsonl");
+
+	const state = createSessionTailState();
+
+	await writeFile(sessionFile, '{"type":"session","id":"sess-1"}\n{"type":"message","message":{"role":"user","content":"hello"}}\n', "utf8");
+	const res1 = await tailSessionFile(state, sessionFile);
+	assert.equal(res1.changed, true);
+	assert.equal(state.records.length, 2);
+
+	const res2 = await tailSessionFile(state, sessionFile);
+	assert.equal(res2.changed, false);
+	assert.equal(state.records.length, 2);
+
+	const { appendFile } = await import("node:fs/promises");
+	await appendFile(sessionFile, '{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"incomp', "utf8");
+	const resPartial = await tailSessionFile(state, sessionFile);
+	assert.equal(resPartial.changed, false);
+	assert.equal(state.records.length, 2);
+	assert.ok(state.partial.length > 0);
+
+	await appendFile(sessionFile, 'lete"}]}}\n', "utf8");
+	const resComplete = await tailSessionFile(state, sessionFile);
+	assert.equal(resComplete.changed, true);
+	assert.equal(state.records.length, 3);
+	assert.equal(state.partial.length, 0);
+
+	await writeFile(sessionFile, '{"type":"session","id":"sess-reset"}\n', "utf8");
+	const resTrunc = await tailSessionFile(state, sessionFile);
+	assert.equal(resTrunc.changed, true);
+	assert.equal(state.records.length, 1);
+	assert.equal(state.records[0]?.id, "sess-reset");
+
+	const stateCapped = createSessionTailState();
+	const lines = Array.from({ length: 50 }, (_, i) => `{"type":"message","id":"${i}"}\n`).join("");
+	await writeFile(sessionFile, lines, "utf8");
+	await tailSessionFile(stateCapped, sessionFile, { maxRecords: 10 });
+	assert.equal(stateCapped.records.length, 10);
+	assert.equal(stateCapped.records[0]?.id, "40");
+	assert.equal(stateCapped.records[9]?.id, "49");
+});
+
+test("AgentInspector opens native conversation by default and follows running session", async (t) => {
+	const dir = await temporaryDirectory(t);
+	const sessionFile = join(dir, "live.jsonl");
+
+	const sessionRecord: ChildSessionRefV1 = {
+		schemaVersion: "dstack.child-session.v1",
+		sessionId: "sess-live",
+		sessionFile,
+		sessionDir: dir,
+		createdAt: "2025-01-01T00:00:00.000Z",
+	};
+
+	await writeFile(
+		sessionFile,
+		[
+			'{"type":"session","version":3,"id":"sess-live"}',
+			'{"type":"message","message":{"role":"user","content":"Please implement feature X"}}',
+			'{"type":"message","message":{"role":"assistant","model":"claude-3-7-sonnet","content":[{"type":"thinking","thinking":"Analyzing codebase..."},{"type":"text","text":"I will begin now."},{"type":"toolCall","name":"read","arguments":{"path":"src/index.ts"}}]}}',
+			'{"type":"message","message":{"role":"toolResult","toolName":"read","content":[{"type":"text","text":"export const x = 1;"}],"isError":false}}',
+		].join("\n") + "\n",
+		"utf8",
+	);
+
+	const snapshot: TreeSnapshot = {
+		taskId: "task-live-conv",
+		workflowId: "wf-live-conv",
+		mode: "single",
+		committed: false,
+		createdAt: "2025-01-01T00:00:00.000Z",
+		counts: { queued: 0, running: 1, complete: 0, total: 1 },
+		slots: { active: 1, capacity: 4 },
+		children: [
+			{
+				index: 0,
+				agent: "poteto-agent",
+				state: "running",
+				taskPreview: "implement feature X",
+				session: sessionRecord,
+				nestedGroups: [],
+				nested: [],
+			},
+		],
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		capturedAt: "2025-01-01T00:01:00.000Z",
+	};
+
+	const inspector = new AgentInspector({ requestRender: () => {} }, plainTheme(), () => {}, {
+		sessionId: "test-sess",
+		initialTaskId: "task-live-conv",
+		listWorkflows: async () => [
+			{
+				workflowId: "wf-live-conv",
+				taskId: "task-live-conv",
+				artifactDir: dir,
+				schedulerRoot: dir,
+				committed: false,
+				createdAt: "2025-01-01T00:00:00.000Z",
+				playbook: "feature",
+				manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z", playbook: "feature" },
+			},
+		],
+		getSnapshot: async () => snapshot,
+	});
+
+	await new Promise((r) => setTimeout(r, 30));
+
+	const convLines = inspector.render(100);
+	assert.ok(convLines.some((l) => l.includes("Conversation")));
+	assert.ok(convLines.some((l) => l.includes("User")));
+	assert.ok(convLines.some((l) => l.includes("Please implement feature X")));
+	assert.ok(convLines.some((l) => l.includes("Assistant")));
+	assert.ok(convLines.some((l) => l.includes("Analyzing codebase")));
+	assert.ok(convLines.some((l) => l.includes("I will begin now.")));
+	assert.ok(convLines.some((l) => l.includes("read")));
+
+	inspector.handleInput("\x1b[A");
+	const scrolledUp = inspector.render(100);
+	assert.ok(scrolledUp.some((l) => l.includes("User")));
+
+	inspector.handleInput("\x1b[F");
+	const followedAgain = inspector.render(100);
+	assert.ok(followedAgain.some((l) => l.includes("Conversation")));
+
+	inspector.dispose();
+});
+
+test("AgentInspector offers resume and fork actions for completed sessions", async (t) => {
+	const dir = await temporaryDirectory(t);
+	const sessionFile = join(dir, "completed.jsonl");
+
+	const sessionRecord: ChildSessionRefV1 = {
+		schemaVersion: "dstack.child-session.v1",
+		sessionId: "sess-done",
+		sessionFile,
+		sessionDir: dir,
+		createdAt: "2025-01-01T00:00:00.000Z",
+	};
+
+	await writeFile(
+		sessionFile,
+		'{"type":"session","version":3,"id":"sess-done"}\n{"type":"message","message":{"role":"user","content":"Task done"}}\n',
+		"utf8",
+	);
+
+	const snapshot: TreeSnapshot = {
+		taskId: "task-done-action",
+		workflowId: "wf-done-action",
+		mode: "single",
+		committed: true,
+		createdAt: "2025-01-01T00:00:00.000Z",
+		counts: { queued: 0, running: 0, complete: 1, total: 1 },
+		slots: { active: 0, capacity: 4 },
+		children: [
+			{
+				index: 0,
+				agent: "general-purpose",
+				state: "succeeded",
+				taskPreview: "done task",
+				cwd: "/tmp/working-dir",
+				session: sessionRecord,
+				nestedGroups: [],
+				nested: [],
+			},
+		],
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		capturedAt: "2025-01-01T00:01:00.000Z",
+	};
+
+	let resumeAction: AgentInspectorResult | undefined;
+	const inspectorResume = new AgentInspector(
+		{ requestRender: () => {} },
+		plainTheme(),
+		(res) => {
+			resumeAction = res;
+		},
+		{
+			sessionId: "test-sess",
+			initialTaskId: "task-done-action",
+			listWorkflows: async () => [
+				{
+					workflowId: "wf-done-action",
+					taskId: "task-done-action",
+					artifactDir: dir,
+					schedulerRoot: dir,
+					committed: true,
+					createdAt: "2025-01-01T00:00:00.000Z",
+					manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z" },
+				},
+			],
+			getSnapshot: async () => snapshot,
+		},
+	);
+
+	await new Promise((r) => setTimeout(r, 30));
+	inspectorResume.handleInput("u");
+	assert.deepEqual(resumeAction, { action: "resume", sessionFile });
+	inspectorResume.dispose();
+
+	let forkAction: AgentInspectorResult | undefined;
+	const inspectorFork = new AgentInspector(
+		{ requestRender: () => {} },
+		plainTheme(),
+		(res) => {
+			forkAction = res;
+		},
+		{
+			sessionId: "test-sess",
+			initialTaskId: "task-done-action",
+			listWorkflows: async () => [
+				{
+					workflowId: "wf-done-action",
+					taskId: "task-done-action",
+					artifactDir: dir,
+					schedulerRoot: dir,
+					committed: true,
+					createdAt: "2025-01-01T00:00:00.000Z",
+					manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z" },
+				},
+			],
+			getSnapshot: async () => snapshot,
+		},
+	);
+
+	await new Promise((r) => setTimeout(r, 30));
+	inspectorFork.handleInput("k");
+	assert.deepEqual(forkAction, { action: "fork", sessionFile, cwd: "/tmp/working-dir" });
+	inspectorFork.dispose();
+});
+
+test("AgentInspector does not offer resume/fork actions for running agents", async (t) => {
+	const dir = await temporaryDirectory(t);
+	const sessionFile = join(dir, "running.jsonl");
+
+	const sessionRecord: ChildSessionRefV1 = {
+		schemaVersion: "dstack.child-session.v1",
+		sessionId: "sess-running",
+		sessionFile,
+		sessionDir: dir,
+		createdAt: "2025-01-01T00:00:00.000Z",
+	};
+
+	await writeFile(sessionFile, '{"type":"session","version":3,"id":"sess-running"}\n', "utf8");
+
+	const snapshot: TreeSnapshot = {
+		taskId: "task-running-no-action",
+		workflowId: "wf-running-no-action",
+		mode: "single",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		committed: false,
+		counts: { queued: 0, running: 1, complete: 0, total: 1 },
+		slots: { active: 1, capacity: 4 },
+		children: [
+			{
+				index: 0,
+				agent: "general-purpose",
+				state: "running",
+				taskPreview: "running task",
+				session: sessionRecord,
+				nestedGroups: [],
+				nested: [],
+			},
+		],
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		capturedAt: "2025-01-01T00:01:00.000Z",
+	};
+
+	let actionCalled = false;
+	const inspector = new AgentInspector(
+		{ requestRender: () => {} },
+		plainTheme(),
+		() => {
+			actionCalled = true;
+		},
+		{
+			sessionId: "test-sess",
+			initialTaskId: "task-running-no-action",
+			listWorkflows: async () => [
+				{
+					workflowId: "wf-running-no-action",
+					taskId: "task-running-no-action",
+					artifactDir: dir,
+					schedulerRoot: dir,
+					committed: false,
+					createdAt: "2025-01-01T00:00:00.000Z",
+					manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z" },
+				},
+			],
+			getSnapshot: async () => snapshot,
+		},
+	);
+
+	await new Promise((r) => setTimeout(r, 30));
+	inspector.handleInput("u");
+	inspector.handleInput("k");
+	assert.equal(actionCalled, false);
+	inspector.dispose();
+});
+
+test("AgentInspector caches committed snapshots and passes activeLeases once per tick", async () => {
+	let snapshotCalls = 0;
+	let lastActiveLeases: readonly LeaseSnapshot[] | undefined;
+
+	const committedSnapshot: TreeSnapshot = {
+		taskId: "task-cached",
+		workflowId: "wf-cached",
+		mode: "single",
+		committed: true,
+		createdAt: "2025-01-01T00:00:00.000Z",
+		counts: { queued: 0, running: 0, complete: 1, total: 1 },
+		slots: { active: 0, capacity: 4 },
+		children: [
+			{
+				index: 0,
+				agent: "general-purpose",
+				state: "succeeded",
+				taskPreview: "done task",
+				nestedGroups: [],
+				nested: [],
+			},
+		],
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		capturedAt: "2025-01-01T00:01:00.000Z",
+	};
+
+	const workflows: WorkflowSummary[] = [
+		{
+			workflowId: "wf-cached",
+			taskId: "task-cached",
+			artifactDir: "/tmp/wf-cached",
+			schedulerRoot: "/tmp/scheduler",
+			committed: true,
+			createdAt: "2025-01-01T00:00:00.000Z",
+			manifest: { kind: "ok", createdAt: "2025-01-01T00:00:00.000Z" },
+		},
+	];
+
+	const inspector = new AgentInspector(
+		{ requestRender: () => {} },
+		plainTheme(),
+		() => {},
+		{
+			sessionId: "test-sess",
+			listWorkflows: async () => workflows,
+			getSnapshot: async (input) => {
+				snapshotCalls++;
+				lastActiveLeases = input.activeLeases;
+				return committedSnapshot;
+			},
+			pollIntervalMs: 20,
+		},
+	);
+
+	await new Promise((r) => setTimeout(r, 30));
+	assert.equal(snapshotCalls, 1);
+	assert.ok(lastActiveLeases !== undefined);
+
+	await new Promise((r) => setTimeout(r, 60));
+	assert.equal(snapshotCalls, 1);
+	inspector.dispose();
+});
+
+test("listSessionWorkflows caches immutable manifests and bindings, and observes active-to-committed transitions", async (t) => {
+	const home = await temporaryDirectory(t);
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	t.after(() => {
+		process.env.HOME = previousHome;
+	});
+
+	const sessionId = "scale-test-session";
+	const cache = createWorkflowListCache();
+	const sRoot = join(home, ".pi", "agent", "dstack", "background", encodeURIComponent(sessionId));
+	await mkdir(join(sRoot, "bindings"), { recursive: true });
+	await mkdir(join(sRoot, "workflows", "wf-1"), { recursive: true });
+
+	await writeFile(
+		join(sRoot, "bindings", "task-1.json"),
+		JSON.stringify({ taskId: "task-1", workflowId: "wf-1" }),
+		"utf8",
+	);
+
+	await writeFile(
+		join(sRoot, "workflows", "wf-1", "manifest.json"),
+		JSON.stringify({
+			workflowId: "wf-1",
+			mode: "single",
+			createdAt: "2025-01-01T00:00:00.000Z",
+			specs: [{ agent: "poteto-agent", task: "first task", workflow: { assignment: "owner", playbook: "feature" } }],
+		}),
+		"utf8",
+	);
+	await writeFile(join(sRoot, "workflows", "wf-1", "COMMITTED"), "{}", "utf8");
+
+	let readdirCalls = 0;
+	let readFileCalls = 0;
+	const io: ListSessionWorkflowsIO = {
+		stat,
+		async readdir(path) {
+			readdirCalls++;
+			return readdir(path);
+		},
+		async readFile(path, encoding) {
+			readFileCalls++;
+			return readFile(path, encoding);
+		},
+	};
+
+	const list1 = await listSessionWorkflows(sessionId, cache, io);
+	assert.equal(list1.length, 1);
+	assert.equal(list1[0]?.workflowId, "wf-1");
+	assert.equal(list1[0]?.committed, true);
+
+	const initialReaddirs = readdirCalls;
+	const initialReadFiles = readFileCalls;
+
+	const list1Unchanged = await listSessionWorkflows(sessionId, cache, io);
+	assert.equal(list1Unchanged.length, 1);
+	assert.equal(readdirCalls, initialReaddirs);
+	assert.equal(readFileCalls, initialReadFiles);
+
+	await writeFile(join(sRoot, "workflows", "wf-1", "manifest.json"), "invalid json", "utf8");
+
+	await mkdir(join(sRoot, "workflows", "wf-2"), { recursive: true });
+	await writeFile(
+		join(sRoot, "bindings", "task-2.json"),
+		JSON.stringify({ taskId: "task-2", workflowId: "wf-2" }),
+		"utf8",
+	);
+	await writeFile(
+		join(sRoot, "workflows", "wf-2", "manifest.json"),
+		JSON.stringify({
+			workflowId: "wf-2",
+			mode: "parallel",
+			createdAt: "2025-01-01T00:01:00.000Z",
+			specs: [{ agent: "general-purpose", task: "active task", workflow: { assignment: "worker", playbook: "feature" } }],
+		}),
+		"utf8",
+	);
+
+	const list2 = await listSessionWorkflows(sessionId, cache, io);
+	assert.equal(list2.length, 2);
+	assert.equal(list2[0]?.workflowId, "wf-1");
+	assert.equal(list2[0]?.committed, true);
+	assert.equal(list2[0]?.manifest.kind, "ok");
+	assert.equal(list2[1]?.workflowId, "wf-2");
+	assert.equal(list2[1]?.committed, false);
+
+	await writeFile(join(sRoot, "workflows", "wf-2", "COMMITTED"), "{}", "utf8");
+	const list3 = await listSessionWorkflows(sessionId, cache, io);
+	assert.equal(list3.length, 2);
+	assert.equal(list3[1]?.workflowId, "wf-2");
+	assert.equal(list3[1]?.committed, true);
+
+	const readdirsBeforeCorrupt = readdirCalls;
+	const readFilesBeforeCorrupt = readFileCalls;
+	await writeFile(join(sRoot, "workflows", "wf-2", "manifest.json"), "invalid json", "utf8");
+	const list4 = await listSessionWorkflows(sessionId, cache, io);
+	assert.equal(list4[1]?.workflowId, "wf-2");
+	assert.equal(list4[1]?.committed, true);
+	assert.equal(list4[1]?.manifest.kind, "ok");
+	assert.equal(readdirCalls, readdirsBeforeCorrupt);
+	assert.equal(readFileCalls, readFilesBeforeCorrupt);
+});
+
+test("tailSessionFile returns changed=true on empty replacement and partial replacement reset", async (t) => {
+	const dir = await temporaryDirectory(t);
+	const sessionFile = join(dir, "replace-test.jsonl");
+	const state = createSessionTailState();
+
+	await writeFile(
+		sessionFile,
+		'{"type":"session","id":"sess-init"}\n{"type":"message","message":{"role":"user","content":"start"}}\n',
+		"utf8",
+	);
+	const res1 = await tailSessionFile(state, sessionFile);
+	assert.equal(res1.changed, true);
+	assert.equal(state.records.length, 2);
+
+	await writeFile(sessionFile, "", "utf8");
+	const resEmpty = await tailSessionFile(state, sessionFile);
+	assert.equal(resEmpty.changed, true);
+	assert.equal(state.records.length, 0);
+	assert.equal(state.offset, 0);
+	assert.equal(state.partial.length, 0);
+
+	await writeFile(sessionFile, '{"type":"session","id":"sess-rep"}\n', "utf8");
+	const resRep = await tailSessionFile(state, sessionFile);
+	assert.equal(resRep.changed, true);
+	assert.equal(state.records.length, 1);
+
+	await writeFile(sessionFile, '{"type":"partial"', "utf8");
+	const resPartial = await tailSessionFile(state, sessionFile);
+	assert.equal(resPartial.changed, true);
+	assert.equal(state.records.length, 0);
+	assert.ok(state.partial.length > 0);
+
+	const { appendFile } = await import("node:fs/promises");
+	await appendFile(sessionFile, ',"msg":"continued"}\n', "utf8");
+	const resComplete = await tailSessionFile(state, sessionFile);
+	assert.equal(resComplete.changed, true);
+	assert.equal(state.records.length, 1);
+	assert.equal(state.partial.length, 0);
+});
+
+test("tailSessionFile incrementally advances offset with byte-bounded chunks and stored-record byte caps", async (t) => {
+	const dir = await temporaryDirectory(t);
+	const sessionFile = join(dir, "bounded-tail.jsonl");
+	const state = createSessionTailState();
+
+	const lines = Array.from({ length: 5 }, (_, i) => {
+		const payload = "x".repeat(80);
+		return JSON.stringify({ type: "message", index: i, payload }) + "\n";
+	});
+	await writeFile(sessionFile, lines.join(""), "utf8");
+
+	const lineByteLen = Buffer.byteLength(lines[0]!, "utf8");
+	const totalBytes = lineByteLen * 5;
+
+	const maxBytesPerCall = lineByteLen * 2 + 10;
+	const resCall1 = await tailSessionFile(state, sessionFile, { maxBytesPerCall });
+	assert.equal(resCall1.changed, true);
+	assert.equal(state.records.length, 2);
+	assert.equal(state.offset, maxBytesPerCall);
+	assert.equal(state.partial.length, 10);
+
+	const resCall2 = await tailSessionFile(state, sessionFile, { maxBytesPerCall });
+	assert.equal(resCall2.changed, true);
+	assert.equal(state.records.length, 4);
+	assert.equal(state.offset, maxBytesPerCall * 2);
+	assert.equal(state.partial.length, 20);
+
+	const resCall3 = await tailSessionFile(state, sessionFile, { maxBytesPerCall });
+	assert.equal(resCall3.changed, true);
+	assert.equal(state.records.length, 5);
+	assert.equal(state.offset, totalBytes);
+	assert.equal(state.partial.length, 0);
+
+	const stateByteCapped = createSessionTailState();
+	await tailSessionFile(stateByteCapped, sessionFile, { maxRecordBytes: lineByteLen * 2 + 10 });
+	assert.ok(stateByteCapped.records.length <= 3);
+	assert.ok(stateByteCapped.totalRecordBytes <= lineByteLen * 2 + 10);
 });

@@ -1,4 +1,4 @@
-import { readdir, readFile, stat } from "node:fs/promises";
+import { lstat, readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { TodoItem, TodoStatus, WorkflowArtifact, WorkflowAssignment, WorkflowContext } from "../types.ts";
 import type { ChildContentPart, ChildMessage, ChildResult, ChildUsage } from "../spawn.ts";
@@ -18,6 +18,7 @@ import {
 } from "./journal.ts";
 import { MAX_ACTIVE_CHILDREN, snapshotActiveLeases, type LeaseSnapshot } from "./scheduler.ts";
 export type { LeaseSnapshot } from "./scheduler.ts";
+import { parseChildSessionRef, readChildSessionRef, type ChildSessionRefV1 } from "./session.ts";
 
 export {
 	formatJournalEntry,
@@ -78,6 +79,7 @@ export type SpawnChildV1 = Readonly<{
 	stopReason?: string;
 	exitCode?: number;
 	usage?: ChildUsage;
+	session?: ChildSessionRefV1;
 }>;
 
 export type SpawnRecordV1 = Readonly<{
@@ -119,6 +121,7 @@ export type SpawnNestedChild = Readonly<{
 	stopReason?: string;
 	exitCode?: number;
 	usage?: ChildUsage;
+	session?: ChildSessionRefV1;
 }>;
 
 export type NestedChild = SpawnNestedChild | LeaseSnapshot;
@@ -164,6 +167,7 @@ export type TreeChild = ProgressChildV1 & Readonly<{
 	tools?: string;
 	nestedGroups: readonly NestedGroup[];
 	cost?: number;
+	session?: ChildSessionRefV1;
 	nested: readonly NestedChild[];
 }>;
 
@@ -373,6 +377,7 @@ export function parseSpawnRecordV1(raw: unknown): SpawnRecordV1 | undefined {
 			stopReason,
 			exitCode,
 			usage,
+			session,
 		} = item;
 		if (typeof nestedIndex !== "number" || !Number.isSafeInteger(nestedIndex) || nestedIndex < 0) continue;
 		if (typeof agent !== "string" || agent === "") continue;
@@ -404,6 +409,7 @@ export function parseSpawnRecordV1(raw: unknown): SpawnRecordV1 | undefined {
 			stopReason: typeof stopReason === "string" && stopReason !== "" ? stopReason : undefined,
 			exitCode: typeof exitCode === "number" && Number.isSafeInteger(exitCode) ? exitCode : undefined,
 			usage: parseChildUsage(usage),
+			session: parseChildSessionRef(session),
 		});
 	}
 
@@ -829,6 +835,7 @@ export function parseNestedChild(item: unknown): NestedChild | undefined {
 			stopReason: typeof item.stopReason === "string" ? item.stopReason : undefined,
 			exitCode: typeof item.exitCode === "number" ? item.exitCode : undefined,
 			usage: parseChildUsage(item.usage),
+			session: parseChildSessionRef(item.session),
 		};
 	}
 	if (
@@ -1016,6 +1023,7 @@ export function parseTreeSnapshot(raw: unknown): TreeSnapshot | undefined {
 			tools: typeof child.tools === "string" ? child.tools : undefined,
 			nestedGroups,
 			cost,
+			session: parseChildSessionRef(child.session),
 			nested,
 		});
 	}
@@ -1037,6 +1045,21 @@ export function parseTreeSnapshot(raw: unknown): TreeSnapshot | undefined {
 	};
 }
 
+export type FileStatIdentity = Readonly<{
+	dev: number;
+	ino: number;
+	size: number;
+	mtimeMs: number;
+}>;
+
+export type CachedSessionRefEntry = Readonly<{
+	ref: ChildSessionRefV1;
+	refIdentity: FileStatIdentity;
+	sessionIdentity: FileStatIdentity;
+}>;
+
+export type SessionRefCache = Map<string, CachedSessionRefEntry>;
+
 export type BuildTreeSnapshotInput = Readonly<{
 	taskId: string;
 	workflowId: string;
@@ -1045,8 +1068,66 @@ export type BuildTreeSnapshotInput = Readonly<{
 	todoPath?: string;
 	playbook?: string;
 	activeLeases?: readonly LeaseSnapshot[];
+	sessionRefCache?: SessionRefCache;
 	now?: Date;
 }>;
+
+const MAX_SESSION_REF_CACHE_SIZE = 500;
+
+async function getFileStatIdentity(path: string): Promise<FileStatIdentity | undefined> {
+	try {
+		const s = await lstat(path);
+		if (!s.isFile() || s.isSymbolicLink()) return undefined;
+		return {
+			dev: s.dev,
+			ino: s.ino,
+			size: s.size,
+			mtimeMs: s.mtimeMs,
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+function statIdentityMatches(a?: FileStatIdentity, b?: FileStatIdentity): boolean {
+	if (a === undefined || b === undefined) return false;
+	return a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeMs === b.mtimeMs;
+}
+
+export async function getCachedSessionRef(
+	cache: SessionRefCache | undefined,
+	refPath: string,
+	sessionDir: string,
+): Promise<ChildSessionRefV1 | undefined> {
+	if (cache !== undefined) {
+		const cached = cache.get(refPath);
+		if (cached !== undefined) {
+			const currentRefIdentity = await getFileStatIdentity(refPath);
+			const currentSessionIdentity = await getFileStatIdentity(cached.ref.sessionFile);
+			if (
+				statIdentityMatches(cached.refIdentity, currentRefIdentity) &&
+				statIdentityMatches(cached.sessionIdentity, currentSessionIdentity)
+			) {
+				return cached.ref;
+			}
+			cache.delete(refPath);
+		}
+	}
+
+	const ref = await readChildSessionRef({ refPath, sessionDir });
+	if (ref !== undefined && cache !== undefined) {
+		const refIdentity = await getFileStatIdentity(refPath);
+		const sessionIdentity = await getFileStatIdentity(ref.sessionFile);
+		if (refIdentity !== undefined && sessionIdentity !== undefined) {
+			if (cache.size >= MAX_SESSION_REF_CACHE_SIZE && !cache.has(refPath)) {
+				const oldest = cache.keys().next().value;
+				if (oldest !== undefined) cache.delete(oldest);
+			}
+			cache.set(refPath, { ref, refIdentity, sessionIdentity });
+		}
+	}
+	return ref;
+}
 
 export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<TreeSnapshot | undefined> {
 	let rawManifest: unknown;
@@ -1130,6 +1211,36 @@ export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<
 	const spawnRecordsByChild = await Promise.all(
 		manifest.specs.map((_spec, index) => readSpawns(input.artifactDir, index, manifest.workflowId)),
 	);
+	const sessionRefs = await Promise.all(
+		manifest.specs.map((_spec, index) => {
+			const childDir = join(input.artifactDir, "children", String(index));
+			return getCachedSessionRef(
+				input.sessionRefCache,
+				join(childDir, "session-ref.json"),
+				join(childDir, "session"),
+			);
+		}),
+	);
+	const nestedSessionRefsByChild = await Promise.all(
+		manifest.specs.map(async (_spec, index) => {
+			const spawns = spawnRecordsByChild[index] ?? [];
+			const refsBySpawn: Array<Array<ChildSessionRefV1 | undefined>> = [];
+			for (const spawnRecord of spawns) {
+				const refs = await Promise.all(
+					spawnRecord.children.map((spawnChild) => {
+						const nestedBase = join(input.artifactDir, "children", String(index), "sessions", `${spawnRecord.groupId}-${spawnChild.nestedIndex}`);
+						return getCachedSessionRef(
+							input.sessionRefCache,
+							join(nestedBase, "session-ref.json"),
+							join(nestedBase, "session"),
+						);
+					}),
+				);
+				refsBySpawn.push(refs);
+			}
+			return refsBySpawn;
+		}),
+	);
 	const parentResultsByChild = await Promise.all(
 		manifest.specs.map((_spec, index) => {
 			const spawns = spawnRecordsByChild[index] ?? [];
@@ -1202,9 +1313,13 @@ export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<
 		}
 
 		const nestedGroups: NestedGroup[] = [];
-		for (const spawnRecord of spawns) {
+		for (let sIdx = 0; sIdx < spawns.length; sIdx++) {
+			const spawnRecord = spawns[sIdx];
+			if (spawnRecord === undefined) continue;
 			const groupChildren: SpawnNestedChild[] = [];
-			for (const spawnChild of spawnRecord.children) {
+			for (let cIdx = 0; cIdx < spawnRecord.children.length; cIdx++) {
+				const spawnChild = spawnRecord.children[cIdx];
+				if (spawnChild === undefined) continue;
 				const leaseChildId = `${spawnRecord.groupId}-${spawnChild.nestedIndex}`;
 				const matchLease = depth2Leases.find((l) => l.childId === leaseChildId);
 
@@ -1232,6 +1347,7 @@ export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<
 						? recoverNestedModelFromParentResult(parentResultRaw, spawnChild.nestedIndex, spawnChild.agent)
 						: undefined
 				);
+				const nestedSession = nestedSessionRefsByChild[index]?.[sIdx]?.[cIdx];
 				groupChildren.push({
 					groupId: spawnRecord.groupId,
 					nestedIndex: spawnChild.nestedIndex,
@@ -1260,6 +1376,7 @@ export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<
 					stopReason: spawnChild.stopReason,
 					exitCode: spawnChild.exitCode,
 					usage: spawnChild.usage,
+					session: nestedSession,
 				});
 			}
 			nestedGroups.push({
@@ -1320,6 +1437,7 @@ export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<
 			tools: spec.tools,
 			cost,
 			nestedGroups,
+			session: sessionRefs[index],
 			nested,
 		};
 	});

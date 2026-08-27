@@ -48,6 +48,15 @@ test("spawn argv isolates extensions and loads dstack explicitly", () => {
 	assert.equal(args.at(-1), "Task: look around");
 });
 
+test("spawn argv uses a contained session dir instead of --no-session when provided", () => {
+	const args = childArgv({ task: "look around", sessionDir: "/tmp/dstack/wf/children/0/session" });
+	assert.equal(args.includes("--no-session"), false);
+	assert.equal(args[args.indexOf("--session-dir") + 1], "/tmp/dstack/wf/children/0/session");
+	assert.deepEqual(args.slice(0, 5), ["--mode", "json", "-p", "--session-dir", "/tmp/dstack/wf/children/0/session"]);
+	assert.equal(args[args.indexOf("-e") + 1], extensionPath);
+	assert.equal(args.at(-1), "Task: look around");
+});
+
 test("inherit-parent omits --model", () => {
 	const args = childArgv({ task: "x", omitModel: true, model: "acme/fast" });
 	assert.equal(args.includes("--model"), false);

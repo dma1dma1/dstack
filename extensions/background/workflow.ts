@@ -3,10 +3,11 @@ import { join } from "node:path";
 import type { TaskDetails, TaskResult } from "../dstack.ts";
 import { buildChildArgv, capOutput, childEnv, runChildProcess, type ChildInvocation, type ChildResult } from "../spawn.ts";
 import type { WorkflowContext, WorktreeFrom } from "../types.ts";
-import { MAX_CONCURRENCY, NESTING_ENV, STATUS_FILE_ENV } from "../types.ts";
+import { MAX_CONCURRENCY, NESTING_ENV, SESSION_REF_ENV, STATUS_FILE_ENV } from "../types.ts";
 import { createWorktree } from "../worktree.ts";
 import { atomicWriteFile, readOutputArtifact, toAbsolutePath, writeSealedArtifact, type OutputArtifactSeal } from "./artifacts.ts";
 import { allowStatusTool, ChildJournalRecorder } from "./journal.ts";
+import { readChildSessionRef, type ChildSessionRefV1 } from "./session.ts";
 import { acquireChildSlot } from "./scheduler.ts";
 import { latestActivity, type ChildActivityV1, type ProgressChildV1, type WorkflowProgressV2 } from "./tree.ts";
 
@@ -105,11 +106,26 @@ export function createLocalSlotAcquirer(capacity = MAX_CONCURRENCY): SlotAcquire
 
 type ChildState = "succeeded" | "failed" | "cancelled" | "skipped";
 
-type ChildIndexEntry = Readonly<{
+export type ChildIndexEntry = Readonly<{
 	index: number;
 	state: ChildState;
 	output: OutputArtifactSeal;
 	result: OutputArtifactSeal;
+	session?: ChildSessionRefV1;
+}>;
+
+export type GroupOutcome = "succeeded" | "failed" | "cancelled";
+
+export type GroupSummary = Readonly<{ total: number; succeeded: number; failed: number; cancelled: number }>;
+
+export type WorkflowExecutionResult = Readonly<{
+	workflowId: string;
+	manifestSha256: string;
+	mode: WorkflowMode;
+	outcome: GroupOutcome;
+	summary: GroupSummary;
+	package: TaskDetails;
+	children: readonly ChildIndexEntry[];
 }>;
 
 export type WorkflowResultIndexV1 = Readonly<{
@@ -117,11 +133,71 @@ export type WorkflowResultIndexV1 = Readonly<{
 	workflowId: string;
 	manifestSha256: string;
 	mode: WorkflowMode;
-	outcome: "succeeded" | "failed" | "cancelled";
-	summary: Readonly<{ total: number; succeeded: number; failed: number; cancelled: number }>;
+	outcome: GroupOutcome;
+	summary: GroupSummary;
 	package: TaskDetails;
 	children: readonly ChildIndexEntry[];
 }>;
+
+export type ResultIndexChildSummary = Readonly<{
+	agent: string;
+	task: string;
+	exitCode: number;
+	text: string;
+}>;
+
+export type ResultIndexChildV2 = Readonly<{
+	index: number;
+	state: ChildState;
+	summary: ResultIndexChildSummary;
+	result: OutputArtifactSeal;
+}>;
+
+export type WorkflowResultIndexV2 = Readonly<{
+	schemaVersion: "dstack.result-index.v2";
+	workflowId: string;
+	manifestSha256: string;
+	mode: WorkflowMode;
+	outcome: GroupOutcome;
+	summary: GroupSummary;
+	children: readonly ResultIndexChildV2[];
+}>;
+
+export const INDEX_SUMMARY_TASK_CAP = 2 * 1024;
+export const INDEX_SUMMARY_TEXT_CAP = 8 * 1024;
+
+export function boundedSummaryText(value: string, cap: number): string {
+	if (Buffer.byteLength(value, "utf8") <= cap) return value;
+	let text = value.slice(0, cap);
+	while (Buffer.byteLength(text, "utf8") > cap) text = text.slice(0, -1);
+	return `${text}\n\n[truncated; read the sealed result.json for the remainder]`;
+}
+
+export function compactResultIndex(execution: WorkflowExecutionResult): WorkflowResultIndexV2 {
+	return {
+		schemaVersion: "dstack.result-index.v2",
+		workflowId: execution.workflowId,
+		manifestSha256: execution.manifestSha256,
+		mode: execution.mode,
+		outcome: execution.outcome,
+		summary: execution.summary,
+		children: execution.children.map((child) => {
+			const result = execution.package.results[child.index];
+			if (result === undefined) throw new Error("result index package is missing a child result");
+			return {
+				index: child.index,
+				state: child.state,
+				summary: {
+					agent: result.agent,
+					task: boundedSummaryText(result.task, INDEX_SUMMARY_TASK_CAP),
+					exitCode: result.exitCode,
+					text: boundedSummaryText(result.text, INDEX_SUMMARY_TEXT_CAP),
+				},
+				result: { ...child.result },
+			};
+		}),
+	};
+}
 
 type WorkflowDependencies = Readonly<{
 	slots?: SlotAcquirer;
@@ -177,6 +253,7 @@ async function sealChild(input: Readonly<{
 	fullOutput: string;
 	startedAt?: string;
 	endedAt?: string;
+	session?: ChildSessionRefV1;
 }>): Promise<ChildIndexEntry> {
 	const directory = join(input.manifest.artifactDir, "children", String(input.index));
 	await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -191,9 +268,10 @@ async function sealChild(input: Readonly<{
 		endedAt: input.endedAt,
 		result: input.result,
 		output,
+		...(input.session !== undefined ? { session: input.session } : {}),
 	};
 	const result = await writeSealedArtifact(resultPath, `${JSON.stringify(metadata)}\n`);
-	return { index: input.index, state: input.state, output, result };
+	return { index: input.index, state: input.state, output, result, ...(input.session !== undefined ? { session: input.session } : {}) };
 }
 
 function abortError(signal: AbortSignal): Error {
@@ -274,7 +352,7 @@ export async function executeWorkflow(
 	manifestSha256: string,
 	signal: AbortSignal,
 	dependencies: WorkflowDependencies = {},
-): Promise<WorkflowResultIndexV1> {
+): Promise<WorkflowExecutionResult> {
 	const spawnChild = dependencies.spawnChild ?? runChildProcess;
 	const makeWorktree = dependencies.createWorktree ?? createWorktree;
 	const childMeta: ProgressChildV1[] = manifest.specs.map((spec, index) => ({
@@ -320,6 +398,9 @@ export async function executeWorkflow(
 			}
 			const childDirectory = join(manifest.artifactDir, "children", String(index));
 			await mkdir(childDirectory, { recursive: true, mode: 0o700 });
+			const sessionDir = join(childDirectory, "session");
+			await mkdir(sessionDir, { recursive: true, mode: 0o700 });
+			const sessionRefPath = join(childDirectory, "session-ref.json");
 			const journalPath = join(childDirectory, "journal.json");
 			const statusPath = join(childDirectory, "status.json");
 			const recorder = new ChildJournalRecorder({ journalPath, statusPath });
@@ -342,6 +423,7 @@ export async function executeWorkflow(
 				omitModel: spec.omitModel,
 				tools: allowStatusTool(spec.tools),
 				systemPromptPath,
+				sessionDir,
 			});
 			const invocation: ChildInvocation = {
 				command: manifest.piChildLaunch.executable,
@@ -354,6 +436,7 @@ export async function executeWorkflow(
 			env[DSTACK_CHILD_INDEX_ENV] = String(index);
 			env[DSTACK_ARTIFACT_DIR_ENV] = manifest.artifactDir;
 			env[STATUS_FILE_ENV] = statusPath;
+			env[SESSION_REF_ENV] = sessionRefPath;
 			const activityPath = join(childDirectory, "activity.json");
 			const throttledActivity = createThrottledWriter<ChildActivityV1>(activityPath, 1000);
 			let journalUpdates = Promise.resolve();
@@ -406,7 +489,8 @@ export async function executeWorkflow(
 			completed.journal = recorder.getEntries();
 			completed.status = recorder.getLatestStatus();
 			results[index] = completed;
-			entries[index] = await sealChild({ manifest, index, state, result: completed, fullOutput: child.text, startedAt, endedAt });
+			const session = await readChildSessionRef({ refPath: sessionRefPath, sessionDir });
+			entries[index] = await sealChild({ manifest, index, state, result: completed, fullOutput: child.text, startedAt, endedAt, session });
 			childMeta[index] = {
 				...childMeta[index],
 				state,
@@ -484,7 +568,6 @@ export async function executeWorkflow(
 	const outcome = cancelled > 0 ? "cancelled" : failed > 0 ? "failed" : "succeeded";
 	await writeProgress(manifest, childMeta);
 	return {
-		schemaVersion: "dstack.result-index.v1",
 		workflowId: manifest.workflowId,
 		manifestSha256,
 		mode: manifest.mode,
@@ -495,7 +578,7 @@ export async function executeWorkflow(
 	};
 }
 
-export async function verifyChildOutputs(index: WorkflowResultIndexV1): Promise<void> {
+export async function verifyChildOutputs(index: Pick<WorkflowExecutionResult, "children">): Promise<void> {
 	for (const child of index.children) await readOutputArtifact(child.output);
 }
 
