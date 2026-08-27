@@ -67,6 +67,44 @@ test("EventBus v1 launch emits only the documented closed run schema", async () 
 	uninstall();
 });
 
+test("EventBus v1 kill emits kill request schema and parses response", async () => {
+	const events = createEventBus();
+	const requests: unknown[] = [];
+	const stop = events.on("pi-background-tasks:request:v1", (raw: unknown) => {
+		requests.push(raw);
+		const req = raw as { request_id: string; operation: string; payload: { taskId: string } };
+		if (req.operation === "kill") {
+			events.emit("pi-background-tasks:response:v1", {
+				schema_version: "pi-background-tasks.extension-response.v1",
+				request_id: req.request_id,
+				operation: "kill",
+				ok: true,
+				result: {
+					message: "Task was killed",
+					task: {
+						id: req.payload.taskId,
+						command: "runner",
+						status: "killed",
+						outputPath: "/tmp/out.txt",
+					},
+				},
+			});
+		}
+	});
+	const port = createEventBusV1Port({ events, makeRequestId: () => "request-kill-001" });
+	const killed = await port.kill("task-kill-123");
+	assert.equal(killed.id, "task-kill-123");
+	assert.equal(killed.status, "killed");
+	assert.deepEqual(requests, [{
+		schema_version: "pi-background-tasks.extension-request.v1",
+		request_id: "request-kill-001",
+		operation: "kill",
+		payload: { taskId: "task-kill-123" },
+	}]);
+	port.close();
+	stop();
+});
+
 test("launch correlates acceptance before an immediate terminal frame", async () => {
 	const events = createEventBus();
 	const order: string[] = [];

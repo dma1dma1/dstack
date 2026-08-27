@@ -486,6 +486,14 @@ test("executeWorkflow generates per-child journal and merges semantic status", a
 
 });
 
+async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs = 2000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!(await predicate())) {
+		if (Date.now() >= deadline) throw new Error(`condition not met within ${timeoutMs}ms`);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+}
+
 test("nested depth-1 task execution propagates worker journal and semantic status", async (t) => {
 	const home = await mkdtemp(join(tmpdir(), "dstack-nested-status-"));
 	t.after(() => rm(home, { recursive: true, force: true }));
@@ -549,10 +557,22 @@ test("nested depth-1 task execution propagates worker journal and semantic statu
 		}, undefined, undefined, ctx);
 
 		assert.equal(res.isError, false);
-		const resultDetails = res.details;
-		assert.ok(typeof resultDetails === "object" && resultDetails !== null);
-		assert.ok("results" in resultDetails && Array.isArray(resultDetails.results));
-		const child = resultDetails.results[0];
+		const receipt = res.details as { taskId: string };
+		assert.ok(receipt?.taskId);
+
+		const resultTool = tools.get("dstack_result");
+		assert.ok(resultTool);
+
+		await waitUntil(async () => {
+			const inspect = await resultTool.execute("res-test", { taskId: receipt.taskId, detail: "full" }, undefined, undefined, ctx);
+			const details = inspect.details as { kind: string };
+			return details?.kind === "complete";
+		});
+
+		const fullResult = await resultTool.execute("res-test", { taskId: receipt.taskId, detail: "full" }, undefined, undefined, ctx);
+		const resultDetails = fullResult.details as { kind: string; package: { results: TaskResult[] } };
+		assert.equal(resultDetails.kind, "complete");
+		const child = resultDetails.package.results[0];
 		assert.equal(child?.status?.phase, "verification");
 		assert.ok(child?.journal?.some((entry: JournalEntry) => entry.kind === "tool" && entry.name === "read"));
 		assert.equal(child?.journal?.at(-1)?.kind, "exit");

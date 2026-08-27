@@ -8,7 +8,10 @@ import { test } from "node:test";
 import dstack from "../extensions/dstack.ts";
 import { commitWorkflowResult, parseWorkflowManifest } from "../extensions/background/runner.ts";
 import { createLocalSlotAcquirer, executeWorkflow, DSTACK_ARTIFACT_DIR_ENV, DSTACK_CHILD_INDEX_ENV, ROOT_WORKFLOW_ENV, SCHEDULER_ROOT_ENV } from "../extensions/background/workflow.ts";
-import { parseSpawnRecordV1 } from "../extensions/background/tree.ts";
+import { parseSpawnRecordV1, STALE_ACTIVITY_THRESHOLD_MS } from "../extensions/background/tree.ts";
+import { formatStaleWakePrompt, restoreFiredStaleWakes, shouldTriggerStaleWake } from "../extensions/task-registry.ts";
+import { acquireChildSlot, snapshotActiveLeases } from "../extensions/background/scheduler.ts";
+import { toAbsolutePath } from "../extensions/background/artifacts.ts";
 
 const RESPONSE_CHANNEL = "pi-background-tasks:response:v1";
 const REQUEST_CHANNEL = "pi-background-tasks:request:v1";
@@ -23,9 +26,9 @@ function response(requestId: string, operation: string, result: unknown) {
 	};
 }
 
-async function waitUntil(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
+async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs = 2000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
-	while (!predicate()) {
+	while (!(await predicate())) {
 		if (Date.now() >= deadline) throw new Error(`condition not met within ${timeoutMs}ms`);
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
@@ -39,6 +42,7 @@ function testRuntime(events: ReturnType<typeof createEventBus>) {
 	const entryRenderers = new Map<string, (entry: unknown, options: unknown, theme: unknown) => unknown>();
 	const entries: Array<{ customType: string; data: unknown }> = [];
 	const notifications: Array<{ message: string; level: string }> = [];
+	const sentMessages: Array<{ message: unknown; options?: unknown }> = [];
 	const widgets: string[] = [];
 	let customOverlayOpened = 0;
 	let lastOverlayOptions: unknown;
@@ -59,7 +63,9 @@ function testRuntime(events: ReturnType<typeof createEventBus>) {
 			entries.push({ customType, data });
 		},
 		getAllTools() { return [...tools.keys()].map((name) => ({ name })); },
-		sendMessage() {},
+		sendMessage(message: unknown, options?: unknown) {
+			sentMessages.push({ message, options });
+		},
 		sendUserMessage() {},
 	} as unknown as ExtensionAPI;
 	dstack(pi);
@@ -67,6 +73,8 @@ function testRuntime(events: ReturnType<typeof createEventBus>) {
 		cwd: process.cwd(),
 		mode: "tui",
 		hasUI: true,
+		isIdle: () => true,
+		hasPendingMessages: () => false,
 		ui: {
 			setStatus() {},
 			setWidget(name: string, content?: unknown) {
@@ -113,6 +121,7 @@ function testRuntime(events: ReturnType<typeof createEventBus>) {
 		entryRenderers,
 		entries,
 		notifications,
+		sentMessages,
 		widgets,
 		getCustomOverlayOpened: () => customOverlayOpened,
 		getLastOverlayOptions: () => lastOverlayOptions,
@@ -362,7 +371,7 @@ test("root task returns a receipt before the runner completes and dstack_result 
 	assert.deepEqual(runtime.widgets, []);
 });
 
-test("depth 1 keeps the synchronous execution path", async () => {
+test("depth 1 returns immediate receipt and inspection via dstack_result", async () => {
 	const events = createEventBus();
 	let backgroundRequests = 0;
 	const stop = events.on(REQUEST_CHANNEL, () => { backgroundRequests += 1; });
@@ -385,14 +394,29 @@ test("depth 1 keeps the synchronous execution path", async () => {
 	try {
 		const result = await runtime.tools.get("dstack_task")?.execute(
 			"nested-call",
-			{ agent: "missing-agent", task: "fail synchronously" },
+			{ agent: "missing-agent", task: "fail asynchronously" },
 			undefined,
 			undefined,
 			runtime.ctx,
 		);
-		assert.equal(result?.isError, true);
-		assert.match(result?.content[0]?.text ?? "", /Unknown agent/);
+		assert.equal(result?.isError, false);
+		const receipt = result?.details as { taskId: string; mode: string };
+		assert.ok(receipt?.taskId);
 		assert.equal(backgroundRequests, 0);
+
+		const resultTool = runtime.tools.get("dstack_result");
+		assert.ok(resultTool);
+
+		await waitUntil(async () => {
+			const res = await resultTool.execute("res-check", { taskId: receipt.taskId, detail: "summary" }, undefined, undefined, runtime.ctx);
+			const details = res.details as { kind: string };
+			return details?.kind === "runner_failed" || details?.kind === "complete";
+		});
+
+		const res = await resultTool.execute("res-check", { taskId: receipt.taskId, detail: "summary" }, undefined, undefined, runtime.ctx);
+		const details = res.details as { kind: string; package?: { results: Array<{ exitCode: number; errorMessage?: string }> } };
+		assert.equal(details.kind, "complete");
+		assert.match(details.package?.results[0]?.errorMessage ?? "", /Unknown agent/);
 	} finally {
 		stop();
 		if (previousDepth === undefined) delete process.env.DSTACK_NESTING;
@@ -458,12 +482,32 @@ test("depth-1 nested dstack_task writes spawn record with parentage and phase wh
 			undefined,
 			runtime.ctx,
 		);
-		assert.equal(res?.isError, true);
-		assert.match(res?.content[0]?.text ?? "", /Unknown agent/);
+		assert.equal(res?.isError, false);
+		const receipt = res?.details as { taskId: string };
+		assert.ok(receipt?.taskId);
 
 		const spawnsDir = join(artifactDir, "children", "0", "spawns");
-		const files = await readdir(spawnsDir);
+		await waitUntil(async () => {
+			try {
+				const files = (await readdir(spawnsDir)).filter((f) => f.endsWith(".json") && !f.startsWith("."));
+				return files.length === 1;
+			} catch {
+				return false;
+			}
+		});
+
+		const files = (await readdir(spawnsDir)).filter((f) => f.endsWith(".json") && !f.startsWith("."));
 		assert.equal(files.length, 1);
+		await waitUntil(async () => {
+			try {
+				const raw = await readFile(join(spawnsDir, files[0]!), "utf8");
+				const spawnRecord = parseSpawnRecordV1(JSON.parse(raw));
+				return spawnRecord?.children[0]?.state === "failed";
+			} catch {
+				return false;
+			}
+		});
+
 		const raw = await readFile(join(spawnsDir, files[0]!), "utf8");
 		const spawnRecord = parseSpawnRecordV1(JSON.parse(raw));
 		assert.ok(spawnRecord !== undefined);
@@ -489,6 +533,14 @@ test("depth-1 nested dstack_task writes spawn record with parentage and phase wh
 		assert.equal(child.state, "failed");
 		assert.match(child.errorMessage ?? "", /Unknown agent/);
 		assert.ok(typeof child.endedAt === "string" && child.endedAt.length > 0);
+
+		const resultTool = runtime.tools.get("dstack_result");
+		assert.ok(resultTool !== undefined);
+		await waitUntil(async () => {
+			const res = await resultTool.execute("res-check", { taskId: receipt.taskId }, undefined, undefined, runtime.ctx);
+			const details = res.details as { kind: string };
+			return details?.kind === "complete";
+		});
 	} finally {
 		if (previousDepth === undefined) delete process.env.DSTACK_NESTING;
 		else process.env.DSTACK_NESTING = previousDepth;
@@ -564,11 +616,32 @@ test("depth-1 nested dstack_task persists concrete model from PI_PROVIDER and PI
 			undefined,
 			runtime.ctx,
 		);
-		assert.equal(res?.isError, true);
+		assert.equal(res?.isError, false);
+		const receipt = res?.details as { taskId: string };
+		assert.ok(receipt?.taskId);
 
 		const spawnsDir = join(artifactDir, "children", "0", "spawns");
-		const files = await readdir(spawnsDir);
+		await waitUntil(async () => {
+			try {
+				const files = (await readdir(spawnsDir)).filter((f) => f.endsWith(".json") && !f.startsWith("."));
+				return files.length === 1;
+			} catch {
+				return false;
+			}
+		});
+
+		const files = (await readdir(spawnsDir)).filter((f) => f.endsWith(".json") && !f.startsWith("."));
 		assert.equal(files.length, 1);
+		await waitUntil(async () => {
+			try {
+				const raw = await readFile(join(spawnsDir, files[0]!), "utf8");
+				const spawnRecord = parseSpawnRecordV1(JSON.parse(raw));
+				return spawnRecord?.children[0]?.state === "failed";
+			} catch {
+				return false;
+			}
+		});
+
 		const raw = await readFile(join(spawnsDir, files[0]!), "utf8");
 		const spawnRecord = parseSpawnRecordV1(JSON.parse(raw));
 		assert.ok(spawnRecord !== undefined);
@@ -578,6 +651,14 @@ test("depth-1 nested dstack_task persists concrete model from PI_PROVIDER and PI
 		assert.ok(child !== undefined);
 		assert.equal(child.role, "implementation-worker");
 		assert.equal(child.model, "anthropic/claude-3-7-sonnet");
+
+		const resultTool = runtime.tools.get("dstack_result");
+		assert.ok(resultTool !== undefined);
+		await waitUntil(async () => {
+			const res = await resultTool.execute("res-check", { taskId: receipt.taskId }, undefined, undefined, runtime.ctx);
+			const details = res.details as { kind: string };
+			return details?.kind === "complete";
+		});
 	} finally {
 		if (previousHome === undefined) delete process.env.HOME;
 		else process.env.HOME = previousHome;
@@ -630,8 +711,18 @@ test("depth-1 nested dstack_task ignores missing env vars and does not write spa
 			undefined,
 			runtime.ctx,
 		);
-		assert.equal(res?.isError, true);
-		assert.match(res?.content[0]?.text ?? "", /Unknown agent/);
+		assert.equal(res?.isError, false);
+		const receipt = res?.details as { taskId: string };
+		assert.ok(receipt?.taskId);
+
+		const resultTool = runtime.tools.get("dstack_result");
+		await waitUntil(async () => {
+			const inspect = await resultTool?.execute("res-check", { taskId: receipt.taskId }, undefined, undefined, runtime.ctx);
+			const details = inspect?.details as { kind: string };
+			return details?.kind === "complete";
+		});
+
+		assert.equal(runtime.entries.filter((e) => e.customType === "dstack-tree-snapshot").length, 0);
 	} finally {
 		if (previousDepth === undefined) delete process.env.DSTACK_NESTING;
 		else process.env.DSTACK_NESTING = previousDepth;
@@ -688,10 +779,24 @@ test("depth-1 nested chain stops and marks unstarted steps as skipped in spawn r
 			undefined,
 			runtime.ctx,
 		);
-		assert.equal(res?.isError, true);
+		assert.equal(res?.isError, false);
+		const receipt = res?.details as { taskId: string };
+		assert.ok(receipt?.taskId);
 
 		const spawnsDir = join(artifactDir, "children", "0", "spawns");
-		const files = await readdir(spawnsDir);
+		await waitUntil(async () => {
+			try {
+				const files = (await readdir(spawnsDir)).filter((f) => f.endsWith(".json") && !f.startsWith("."));
+				if (files.length !== 1) return false;
+				const raw = await readFile(join(spawnsDir, files[0]!), "utf8");
+				const spawnRecord = parseSpawnRecordV1(JSON.parse(raw));
+				return spawnRecord?.children[1]?.state === "skipped";
+			} catch {
+				return false;
+			}
+		});
+
+		const files = (await readdir(spawnsDir)).filter((f) => f.endsWith(".json") && !f.startsWith("."));
 		assert.equal(files.length, 1);
 		const raw = await readFile(join(spawnsDir, files[0]!), "utf8");
 		const spawnRecord = parseSpawnRecordV1(JSON.parse(raw));
@@ -972,4 +1077,461 @@ test("dagents command and shift+up shortcut open inspector overlay and manage wi
 			margin: { bottom: 1, left: 1, right: 1 },
 		},
 	});
+});
+
+test("dstack_kill cancels companion-backed root task, emits eventbus request, and projects cancelled result state", async (t) => {
+	const home = await mkdtemp(join(tmpdir(), "dstack-root-kill-"));
+	t.after(() => rm(home, { recursive: true, force: true }));
+	const previousHome = process.env.HOME;
+	const previousDepth = process.env.DSTACK_NESTING;
+	process.env.HOME = home;
+	delete process.env.DSTACK_NESTING;
+	t.after(() => {
+		process.env.HOME = previousHome;
+		if (previousDepth === undefined) delete process.env.DSTACK_NESTING;
+		else process.env.DSTACK_NESTING = previousDepth;
+	});
+
+	const events = createEventBus();
+	const killRequests: unknown[] = [];
+	let task = {
+		id: "bg-root-kill-task",
+		name: "dstack",
+		command: "runner",
+		status: "running" as "running" | "killed",
+		outputPath: join(home, "companion-output.txt"),
+	};
+
+	const stop = events.on(REQUEST_CHANNEL, (raw) => {
+		if (typeof raw !== "object" || raw === null || !("request_id" in raw) || !("operation" in raw)) return;
+		const requestId = String(raw.request_id);
+		const operation = String(raw.operation);
+		if (operation === "capabilities") {
+			events.emit(RESPONSE_CHANNEL, response(requestId, operation, {
+				api_version: 1,
+				run: true,
+				status: true,
+				kill: true,
+			}));
+		} else if (operation === "status") {
+			events.emit(RESPONSE_CHANNEL, response(requestId, operation, { tasks: [task] }));
+		} else if (operation === "kill") {
+			killRequests.push(raw);
+			task = { ...task, status: "killed" };
+			events.emit(RESPONSE_CHANNEL, response(requestId, operation, {
+				message: "Task was killed",
+				task,
+			}));
+		}
+	});
+	t.after(stop);
+
+	const runtime = testRuntime(events);
+	await runtime.handlers.get("session_start")?.({}, runtime.ctx);
+
+	const sRoot = join(home, ".pi", "agent", "dstack", "background", "public-tools-session");
+	await mkdir(join(sRoot, "bindings"), { recursive: true });
+	await mkdir(join(sRoot, "workflows", "wf-root-kill"), { recursive: true });
+	await writeFile(
+		join(sRoot, "bindings", "bg-root-kill-task.json"),
+		JSON.stringify({ taskId: "bg-root-kill-task", workflowId: "wf-root-kill" }),
+		"utf8",
+	);
+
+	const killTool = runtime.tools.get("dstack_kill");
+	assert.ok(killTool !== undefined);
+
+	const killRes = await killTool.execute("k1", { taskId: "bg-root-kill-task" }, undefined, undefined, runtime.ctx);
+	assert.equal(killRes.isError, false);
+	const killDetails = killRes.details as { taskId: string; status: string };
+	assert.equal(killDetails.taskId, "bg-root-kill-task");
+	assert.equal(killDetails.status, "killed");
+	assert.equal(killRequests.length, 1);
+
+	const resultTool = runtime.tools.get("dstack_result");
+	assert.ok(resultTool !== undefined);
+	const resultRes = await resultTool.execute("r1", { taskId: "bg-root-kill-task" }, undefined, undefined, runtime.ctx);
+	const resDetails = resultRes.details as { kind: string; taskId: string };
+	assert.equal(resDetails.kind, "cancelled");
+	assert.equal(resDetails.taskId, "bg-root-kill-task");
+});
+
+test("dstack_kill is idempotent for already-terminal tasks and safe for unknown tasks", async (t) => {
+	const home = await mkdtemp(join(tmpdir(), "dstack-kill-idempotent-"));
+	t.after(() => rm(home, { recursive: true, force: true }));
+	const previousHome = process.env.HOME;
+	const previousDepth = process.env.DSTACK_NESTING;
+	process.env.HOME = home;
+	delete process.env.DSTACK_NESTING;
+	t.after(() => {
+		process.env.HOME = previousHome;
+		if (previousDepth === undefined) delete process.env.DSTACK_NESTING;
+		else process.env.DSTACK_NESTING = previousDepth;
+	});
+
+	const events = createEventBus();
+	const completedTask = {
+		id: "bg-done-task",
+		name: "dstack",
+		command: "runner",
+		status: "completed" as const,
+		outputPath: join(home, "output.txt"),
+	};
+
+	let killCalls = 0;
+	const stop = events.on(REQUEST_CHANNEL, (raw) => {
+		if (typeof raw !== "object" || raw === null || !("request_id" in raw) || !("operation" in raw)) return;
+		const requestId = String(raw.request_id);
+		const operation = String(raw.operation);
+		if (operation === "capabilities") {
+			events.emit(RESPONSE_CHANNEL, response(requestId, operation, {
+				api_version: 1,
+				run: true,
+				status: true,
+				kill: true,
+			}));
+		} else if (operation === "status") {
+			events.emit(RESPONSE_CHANNEL, response(requestId, operation, { tasks: [completedTask] }));
+		} else if (operation === "kill") {
+			killCalls++;
+		}
+	});
+	t.after(stop);
+
+	const runtime = testRuntime(events);
+	await runtime.handlers.get("session_start")?.({}, runtime.ctx);
+
+	const killTool = runtime.tools.get("dstack_kill");
+	assert.ok(killTool !== undefined);
+
+	const doneKill = await killTool.execute("k1", { taskId: "bg-done-task" }, undefined, undefined, runtime.ctx);
+	assert.equal(doneKill.isError, false);
+	const doneDetails = doneKill.details as { status: string };
+	assert.equal(doneDetails.status, "already_terminal");
+	assert.equal(killCalls, 0);
+
+	const unknownKill = await killTool.execute("k2", { taskId: "non-existent-task" }, undefined, undefined, runtime.ctx);
+	assert.equal(unknownKill.isError, false);
+	const unknownDetails = unknownKill.details as { status: string };
+	assert.equal(unknownDetails.status, "unknown_task");
+});
+
+test("shouldTriggerStaleWake pure helper enforces one-shot, staleness, terminal, and control safety invariants", () => {
+	const baseSnapshot = {
+		taskId: "task-stale-test",
+		workflowId: "wf-stale-test",
+		mode: "single" as const,
+		createdAt: new Date().toISOString(),
+		committed: false,
+		counts: { queued: 0, running: 1, complete: 0, total: 1 },
+		slots: { active: 1, capacity: 4 },
+		children: [
+			{
+				index: 0,
+				state: "running" as const,
+				agent: "poteto-agent",
+				taskPreview: "work on task",
+				stale: true,
+				nested: [],
+				nestedGroups: [],
+			},
+		],
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		capturedAt: new Date().toISOString(),
+	};
+
+	const safeControl = { isIdle: true, hasPendingMessages: false };
+	const firedSet = new Set<string>();
+
+	assert.equal(shouldTriggerStaleWake({ snapshot: baseSnapshot, firedTaskIds: firedSet, control: safeControl }), true);
+
+	firedSet.add("task-stale-test");
+	assert.equal(shouldTriggerStaleWake({ snapshot: baseSnapshot, firedTaskIds: firedSet, control: safeControl }), false);
+
+	firedSet.clear();
+
+	const committedSnapshot = { ...baseSnapshot, committed: true };
+	assert.equal(shouldTriggerStaleWake({ snapshot: committedSnapshot, firedTaskIds: firedSet, control: safeControl }), false);
+
+	assert.equal(shouldTriggerStaleWake({ snapshot: baseSnapshot, firedTaskIds: firedSet, control: { isIdle: false, hasPendingMessages: false } }), false);
+
+	assert.equal(shouldTriggerStaleWake({ snapshot: baseSnapshot, firedTaskIds: firedSet, control: { isIdle: true, hasPendingMessages: true } }), false);
+
+	const freshSnapshot = {
+		...baseSnapshot,
+		children: [
+			{
+				index: 0,
+				state: "running" as const,
+				agent: "poteto-agent",
+				taskPreview: "work on task",
+				stale: false,
+				nested: [],
+				nestedGroups: [],
+			},
+		],
+	};
+	assert.equal(shouldTriggerStaleWake({ snapshot: freshSnapshot, firedTaskIds: firedSet, control: safeControl }), false);
+
+	const completedSnapshot = {
+		...baseSnapshot,
+		children: [
+			{
+				index: 0,
+				state: "succeeded" as const,
+				agent: "poteto-agent",
+				taskPreview: "work on task",
+				stale: true,
+				nested: [],
+				nestedGroups: [],
+			},
+		],
+	};
+	assert.equal(shouldTriggerStaleWake({ snapshot: completedSnapshot, firedTaskIds: firedSet, control: safeControl }), false);
+
+	const nestedStaleSnapshot = {
+		...baseSnapshot,
+		children: [
+			{
+				index: 0,
+				state: "running" as const,
+				agent: "poteto-agent",
+				taskPreview: "owner task",
+				stale: false,
+				nestedGroups: [],
+				nested: [
+					{
+						groupId: "g1",
+						nestedIndex: 0,
+						agent: "general-purpose",
+						taskPreview: "nested worker",
+						state: "running" as const,
+						live: true,
+						stale: true,
+						updatedAt: new Date().toISOString(),
+					},
+				],
+			},
+		],
+	};
+	assert.equal(shouldTriggerStaleWake({ snapshot: nestedStaleSnapshot, firedTaskIds: firedSet, control: safeControl }), true);
+});
+
+test("stale-parent wake-up triggers one hidden follow-up and survives session reload without duplicate", async (t) => {
+	const home = await mkdtemp(join(tmpdir(), "dstack-stale-wake-"));
+	t.after(() => rm(home, { recursive: true, force: true }));
+	const previousHome = process.env.HOME;
+	process.env.HOME = home;
+	t.after(() => { process.env.HOME = previousHome; });
+
+	const events = createEventBus();
+	const runtime = testRuntime(events);
+	await runtime.handlers.get("session_start")?.({}, runtime.ctx);
+
+	const sRoot = join(home, ".pi", "agent", "dstack", "background", "public-tools-session");
+	await mkdir(join(sRoot, "bindings"), { recursive: true });
+	await mkdir(join(sRoot, "workflows", "wf-stale-test", "children", "0"), { recursive: true });
+	await mkdir(join(sRoot, "scheduler"), { recursive: true });
+	await writeFile(
+		join(sRoot, "bindings", "bg-stale-task.json"),
+		JSON.stringify({ taskId: "bg-stale-task", workflowId: "wf-stale-test" }),
+		"utf8",
+	);
+
+	const staleTimestamp = new Date(Date.now() - (STALE_ACTIVITY_THRESHOLD_MS + 10_000)).toISOString();
+	await writeFile(
+		join(sRoot, "workflows", "wf-stale-test", "manifest.json"),
+		JSON.stringify({
+			workflowId: "wf-stale-test",
+			mode: "single",
+			createdAt: staleTimestamp,
+			specs: [{ agent: "poteto-agent", task: "owner task", workflow: { assignment: "owner", playbook: "feature", phase: "run", completedPhases: [], artifacts: [] } }],
+		}),
+		"utf8",
+	);
+	await writeFile(
+		join(sRoot, "workflows", "wf-stale-test", "progress.json"),
+		JSON.stringify({
+			schemaVersion: "dstack.progress.v2",
+			workflowId: "wf-stale-test",
+			queued: 0,
+			running: 1,
+			complete: 0,
+			total: 1,
+			children: [{ index: 0, agent: "poteto-agent", state: "running", startedAt: staleTimestamp }],
+		}),
+		"utf8",
+	);
+	await writeFile(
+		join(sRoot, "workflows", "wf-stale-test", "children", "0", "activity.json"),
+		JSON.stringify({
+			schemaVersion: "dstack.child-activity.v1",
+			workflowId: "wf-stale-test",
+			index: 0,
+			activity: "working on stalled thing",
+			updatedAt: staleTimestamp,
+			turns: 1,
+			contextTokens: 100,
+		}),
+		"utf8",
+	);
+
+	runtime.ctx.sessionManager.getBranch = () => [
+		{
+			type: "custom",
+			customType: "dstack-active-workflow",
+			data: { taskId: "bg-stale-task", playbook: "feature" },
+		},
+		...runtime.entries.map((entry) => ({ type: "custom", ...entry })),
+	];
+
+	await runtime.handlers.get("session_tree")?.({}, runtime.ctx);
+	await waitUntil(() => runtime.sentMessages.length > 0, 3000);
+
+	assert.equal(runtime.sentMessages.length, 1);
+	const sent = runtime.sentMessages[0] as { message: { customType: string; content: string; display: boolean }; options: { deliverAs: string; triggerTurn: boolean } };
+	assert.equal(sent.message.customType, "dstack-stale-wake");
+	assert.equal(sent.message.display, false);
+	assert.equal(sent.options.deliverAs, "followUp");
+	assert.equal(sent.options.triggerTurn, true);
+	assert.match(sent.message.content, /inactive for more than 2 minutes and may be stale/);
+	assert.match(sent.message.content, /dstack_result.*dstack_kill/);
+
+	const restoredFired = restoreFiredStaleWakes(runtime.entries.map((e) => ({
+		type: "custom",
+		customType: e.customType,
+		data: e.data,
+	})));
+	assert.equal(restoredFired.has("bg-stale-task"), true);
+	await runtime.handlers.get("session_tree")?.({}, runtime.ctx);
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(runtime.sentMessages.length, 1);
+});
+
+test("nested depth-1 task supports immediate receipt, running inspection, dstack_kill cancellation, and cancelled result", async (t) => {
+	const cwd = await mkdtemp(join(tmpdir(), "dstack-nested-kill-"));
+	t.after(() => rm(cwd, { recursive: true, force: true }));
+
+	const events = createEventBus();
+	const runtime = testRuntime(events);
+	await runtime.handlers.get("session_start")?.({}, runtime.ctx);
+
+	const previousDepth = process.env.DSTACK_NESTING;
+	const previousAssignment = process.env.DSTACK_ASSIGNMENT;
+	process.env.DSTACK_NESTING = "1";
+	delete process.env.DSTACK_ASSIGNMENT;
+
+	try {
+		const taskTool = runtime.tools.get("dstack_task");
+		const resultTool = runtime.tools.get("dstack_result");
+		const killTool = runtime.tools.get("dstack_kill");
+		assert.ok(taskTool && resultTool && killTool);
+
+		const launch = await taskTool.execute(
+			"nested-1",
+			{ agent: "general-purpose", task: "long running nested task", tools: "read" },
+			undefined,
+			undefined,
+			runtime.ctx,
+		);
+		assert.equal(launch.isError, false);
+		const receipt = launch.details as { taskId: string; mode: string };
+		assert.ok(receipt?.taskId);
+
+		const runningRes = await resultTool.execute("r-run", { taskId: receipt.taskId }, undefined, undefined, runtime.ctx);
+		const runningDetails = runningRes.details as { kind: string };
+		assert.ok(runningDetails.kind === "running" || runningDetails.kind === "complete");
+
+		const killRes = await killTool.execute("k-nested", { taskId: receipt.taskId }, undefined, undefined, runtime.ctx);
+		assert.equal(killRes.isError, false);
+		const killDetails = killRes.details as { taskId: string; status: string };
+		assert.equal(killDetails.taskId, receipt.taskId);
+		assert.ok(killDetails.status === "killed" || killDetails.status === "already_terminal");
+
+		const afterKillRes = await resultTool.execute("r-cancelled", { taskId: receipt.taskId }, undefined, undefined, runtime.ctx);
+		const afterKillDetails = afterKillRes.details as { kind: string; taskId: string };
+		assert.ok(afterKillDetails.kind === "cancelled" || afterKillDetails.kind === "complete");
+
+		const secondKill = await killTool.execute("k-again", { taskId: receipt.taskId }, undefined, undefined, runtime.ctx);
+		assert.equal(secondKill.isError, false);
+		assert.equal((secondKill.details as { status: string }).status, "already_terminal");
+	} finally {
+		if (previousDepth === undefined) delete process.env.DSTACK_NESTING;
+		else process.env.DSTACK_NESTING = previousDepth;
+		if (previousAssignment === undefined) delete process.env.DSTACK_ASSIGNMENT;
+		else process.env.DSTACK_ASSIGNMENT = previousAssignment;
+	}
+});
+
+test("nested depth-1 task dstack_kill releases scheduler lease and restores capacity", async (t) => {
+	const cwd = await mkdtemp(join(tmpdir(), "dstack-sched-kill-"));
+	t.after(() => rm(cwd, { recursive: true, force: true }));
+
+	const schedulerRoot = join(cwd, "scheduler");
+	const artifactDir = join(cwd, "artifacts");
+	await mkdir(schedulerRoot, { recursive: true });
+	await mkdir(artifactDir, { recursive: true });
+
+	const previousDepth = process.env.DSTACK_NESTING;
+	const previousAssignment = process.env.DSTACK_ASSIGNMENT;
+	const previousRootWf = process.env[ROOT_WORKFLOW_ENV];
+	const previousSchedRoot = process.env[SCHEDULER_ROOT_ENV];
+	const previousChildIdx = process.env[DSTACK_CHILD_INDEX_ENV];
+	const previousArtifactDir = process.env[DSTACK_ARTIFACT_DIR_ENV];
+
+	process.env.DSTACK_NESTING = "1";
+	process.env.DSTACK_ASSIGNMENT = "owner";
+	process.env[ROOT_WORKFLOW_ENV] = "wf-sched-kill";
+	process.env[SCHEDULER_ROOT_ENV] = schedulerRoot;
+	process.env[DSTACK_CHILD_INDEX_ENV] = "0";
+	process.env[DSTACK_ARTIFACT_DIR_ENV] = artifactDir;
+
+	const events = createEventBus();
+	const runtime = testRuntime(events);
+	await runtime.handlers.get("session_start")?.({}, runtime.ctx);
+
+	try {
+		const taskTool = runtime.tools.get("dstack_task");
+		const killTool = runtime.tools.get("dstack_kill");
+		assert.ok(taskTool && killTool);
+
+		const launch = await taskTool.execute(
+			"sched-call",
+			{ agent: "general-purpose", task: "hold lease briefly", tools: "read" },
+			undefined,
+			undefined,
+			runtime.ctx,
+		);
+		assert.equal(launch.isError, false);
+		const receipt = launch.details as { taskId: string };
+
+		await waitUntil(async () => (await snapshotActiveLeases(schedulerRoot)).length === 1);
+		const killed = await killTool.execute("k1", { taskId: receipt.taskId }, undefined, undefined, runtime.ctx);
+		assert.equal((killed.details as { status: string }).status, "killed");
+		assert.equal((await snapshotActiveLeases(schedulerRoot)).length, 0);
+
+		const lease = await acquireChildSlot({
+			schedulerRoot: toAbsolutePath(schedulerRoot),
+			workflowId: "wf-sched-kill",
+			childId: "after-kill-child",
+			work: { depth: 2 },
+			signal: new AbortController().signal,
+		});
+		assert.ok(lease !== undefined);
+		await lease.release();
+	} finally {
+		if (previousDepth === undefined) delete process.env.DSTACK_NESTING;
+		else process.env.DSTACK_NESTING = previousDepth;
+		if (previousAssignment === undefined) delete process.env.DSTACK_ASSIGNMENT;
+		else process.env.DSTACK_ASSIGNMENT = previousAssignment;
+		if (previousRootWf === undefined) delete process.env[ROOT_WORKFLOW_ENV];
+		else process.env[ROOT_WORKFLOW_ENV] = previousRootWf;
+		if (previousSchedRoot === undefined) delete process.env[SCHEDULER_ROOT_ENV];
+		else process.env[SCHEDULER_ROOT_ENV] = previousSchedRoot;
+		if (previousChildIdx === undefined) delete process.env[DSTACK_CHILD_INDEX_ENV];
+		else process.env[DSTACK_CHILD_INDEX_ENV] = previousChildIdx;
+		if (previousArtifactDir === undefined) delete process.env[DSTACK_ARTIFACT_DIR_ENV];
+		else process.env[DSTACK_ARTIFACT_DIR_ENV] = previousArtifactDir;
+	}
 });

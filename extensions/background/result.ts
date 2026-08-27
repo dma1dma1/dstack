@@ -210,7 +210,7 @@ function bounded(value: string, cap: number): string {
 	return `${text}\n\n[truncated; call dstack_result with detail: "full" for the remainder]`;
 }
 
-function summaryPackage(committed: Extract<CommittedResult, { kind: "complete" }>): TaskSummaryDetails {
+export function summaryPackage(committed: Extract<CommittedResult, { kind: "complete" }>): TaskSummaryDetails {
 	return {
 		mode: committed.package.mode,
 		results: committed.package.results.map((result) => ({
