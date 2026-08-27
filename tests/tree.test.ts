@@ -22,6 +22,7 @@ import {
 	stripAnsi,
 	truncateToWidth,
 	visibleWidth,
+	type LeaseSnapshot,
 	type TreeSnapshot,
 	type TreeTheme,
 } from "../extensions/background/tree.ts";
@@ -178,6 +179,21 @@ test("renderTreeLines generates compact live widget lines with glyphs, elapsed t
 				assignment: "owner",
 				startedAt: "2025-01-01T00:00:02.000Z",
 				taskPreview: "orchestrate feature development",
+				nestedGroups: [
+					{
+						groupId: "group",
+						mode: "unknown",
+						createdAt: "2025-01-01T00:11:39.000Z",
+						children: [
+							{
+								workflowId: "wf-100",
+								childId: "group-0",
+								depth: 2,
+								acquiredAt: "2025-01-01T00:11:39.000Z",
+							},
+						],
+					},
+				],
 				nested: [
 					{
 						workflowId: "wf-100",
@@ -196,6 +212,7 @@ test("renderTreeLines generates compact live widget lines with glyphs, elapsed t
 				startedAt: "2025-01-01T00:01:00.000Z",
 				endedAt: "2025-01-01T00:05:02.000Z",
 				taskPreview: "ground and design the MVP",
+				nestedGroups: [],
 				nested: [],
 			},
 			{
@@ -207,6 +224,7 @@ test("renderTreeLines generates compact live widget lines with glyphs, elapsed t
 				startedAt: "2025-01-01T00:05:10.000Z",
 				endedAt: "2025-01-01T00:07:21.000Z",
 				taskPreview: "implement todo timestamps",
+				nestedGroups: [],
 				nested: [],
 			},
 			{
@@ -216,6 +234,7 @@ test("renderTreeLines generates compact live widget lines with glyphs, elapsed t
 				role: "implementation-worker",
 				assignment: "worker",
 				taskPreview: "write tree renderer tests",
+				nestedGroups: [],
 				nested: [],
 			},
 		],
@@ -227,9 +246,10 @@ test("renderTreeLines generates compact live widget lines with glyphs, elapsed t
 		now: new Date("2025-01-01T00:12:41.000Z"),
 	});
 
-	assert.equal(lines[0], "dstack · feature · slots 3/4 · 2/4 done · 12m41s · todos 1/3");
+	assert.equal(lines[0], truncateToWidth("dstack · feature · slots 3/4 · 2/4 done · 12m41s · todos 1/3 · oldest at top · newest at bottom", 78));
 	assert.ok(lines.some((l) => l.includes("├─ ◐ owner poteto-agent 12m39s orchestrate feature development")));
-	assert.ok(lines.some((l) => l.includes("└─ ◐ nested (1m02s)")));
+	assert.ok(lines.some((l) => l.includes("run · 1 agent · mode unavailable")));
+	assert.ok(lines.some((l) => l.includes("◐ agent details pending (1m02s)")));
 	assert.ok(lines.some((l) => l.includes("├─ ✓ worker general-purpose (4m02s) ground and design the MVP")));
 	assert.ok(lines.some((l) => l.includes("├─ ✗ worker general-purpose (2m11s) failed implement todo timestamps")));
 	assert.ok(lines.some((l) => l.includes("└─ ○ worker general-purpose queued 12m41s write tree renderer tests")));
@@ -270,6 +290,7 @@ test("renderTreeLines applies theme colors and renders frozen frame without slot
 				startedAt: "2025-01-01T00:00:00.000Z",
 				endedAt: "2025-01-01T00:04:02.000Z",
 				taskPreview: "finish everything",
+				nestedGroups: [],
 				nested: [],
 			},
 		],
@@ -283,7 +304,7 @@ test("renderTreeLines applies theme colors and renders frozen frame without slot
 		now: new Date("2025-01-01T00:04:02.000Z"),
 	});
 
-	assert.equal(lines[0], "dstack · feature · 1/1 done · 4m02s · todos 1/1");
+	assert.equal(lines[0], truncateToWidth("dstack · feature · 1/1 done · 4m02s · todos 1/1 · oldest at top · newest at bottom", 80));
 	assert.ok(lines.some((l) => l.includes("[success]✓[/success]")));
 	assert.ok(lines.some((l) => l.includes("todos (1/1 done, owner: session root):")));
 	assert.ok(lines.some((l) => l.includes("[success]☑[/success]")));
@@ -301,6 +322,7 @@ test("renderTreeLines prioritizes failed and live rows during maxLines truncatio
 			startedAt: "2025-01-01T00:00:00.000Z",
 			endedAt: state !== "running" ? "2025-01-01T00:01:00.000Z" : undefined,
 			taskPreview: `task number ${i}`,
+			nestedGroups: [],
 			nested: [],
 		});
 	}
@@ -820,6 +842,7 @@ test("renderTreeLines displays waiting on slot when queued and slots are full", 
 				state: "queued",
 				assignment: "worker",
 				taskPreview: "review changes",
+				nestedGroups: [],
 				nested: [],
 			},
 		],
@@ -998,6 +1021,85 @@ test("renderTreeLines formats all nested child states", () => {
 				assignment: "owner",
 				taskPreview: "orchestrator",
 				startedAt: "2025-01-01T00:00:00.000Z",
+				nestedGroups: [
+					{
+						groupId: "g-1",
+						mode: "single",
+						createdAt: "2025-01-01T00:00:00.000Z",
+						children: [
+							{
+								groupId: "g-1",
+								nestedIndex: 0,
+								agent: "general-purpose",
+								assignment: "worker",
+								taskPreview: "queued task preview",
+								state: "queued",
+								updatedAt: "2025-01-01T00:02:00.000Z",
+								live: false,
+							},
+							{
+								groupId: "g-1",
+								nestedIndex: 1,
+								agent: "general-purpose",
+								assignment: "worker",
+								taskPreview: "running task",
+								state: "running",
+								activity: "→ bash npm test",
+								startedAt: "2025-01-01T00:02:00.000Z",
+								updatedAt: "2025-01-01T00:02:30.000Z",
+								live: true,
+							},
+							{
+								groupId: "g-1",
+								nestedIndex: 2,
+								agent: "general-purpose",
+								assignment: "worker",
+								taskPreview: "succeeded task",
+								state: "succeeded",
+								activity: "all tests passed",
+								startedAt: "2025-01-01T00:01:00.000Z",
+								endedAt: "2025-01-01T00:01:45.000Z",
+								updatedAt: "2025-01-01T00:01:45.000Z",
+								live: false,
+							},
+							{
+								groupId: "g-1",
+								nestedIndex: 3,
+								agent: "general-purpose",
+								assignment: "worker",
+								taskPreview: "failed task",
+								state: "failed",
+								activity: "assertion failed on line 12",
+								startedAt: "2025-01-01T00:01:00.000Z",
+								endedAt: "2025-01-01T00:01:30.000Z",
+								updatedAt: "2025-01-01T00:01:30.000Z",
+								live: false,
+							},
+							{
+								groupId: "g-1",
+								nestedIndex: 4,
+								agent: "general-purpose",
+								assignment: "worker",
+								taskPreview: "cancelled task",
+								state: "cancelled",
+								startedAt: "2025-01-01T00:01:00.000Z",
+								endedAt: "2025-01-01T00:01:15.000Z",
+								updatedAt: "2025-01-01T00:01:15.000Z",
+								live: false,
+							},
+							{
+								groupId: "g-1",
+								nestedIndex: 5,
+								agent: "general-purpose",
+								assignment: "worker",
+								taskPreview: "skipped task",
+								state: "skipped",
+								updatedAt: "2025-01-01T00:02:00.000Z",
+								live: false,
+							},
+						],
+					},
+				],
 				nested: [
 					{
 						groupId: "g-1",
@@ -1086,7 +1188,7 @@ test("renderTreeLines formats all nested child states", () => {
 	assert.ok(lines.some((l) => l.includes("✓ worker general-purpose (0m45s) — all tests passed")));
 	assert.ok(lines.some((l) => l.includes("✗ worker general-purpose (0m30s) failed — assertion failed on line 12")));
 	assert.ok(lines.some((l) => l.includes("⊘ worker general-purpose (0m15s) cancelled")));
-	assert.ok(lines.some((l) => l.includes("⊘ worker general-purpose skipped skipped task preview")));
+	assert.ok(lines.some((l) => l.includes("⊘ worker general-purpose skipped skipped task")));
 });
 
 test("recoverNestedModelFromParentResult extracts model when unambiguous and rejects conflicting candidates", () => {
@@ -1529,6 +1631,7 @@ test("renderTreeLines formats known costs and omits unavailable costs", () => {
 				taskPreview: "orchestrator",
 				startedAt: "2025-01-01T00:00:00.000Z",
 				cost: 0.084,
+				nestedGroups: [],
 				nested: [
 					{
 						groupId: "g-1",
@@ -1592,7 +1695,377 @@ test("renderTreeLines formats known costs and omits unavailable costs", () => {
 	assert.ok(lines.some((l) => l.includes("worker general-purpose (0m45s) $0.0420 — completed work")), `Expected nested cost in: ${lines.join("\n")}`);
 	assert.ok(lines.some((l) => l.includes("worker general-purpose (0m30s) $0.0000 — free work")), `Expected known zero cost in: ${lines.join("\n")}`);
 	assert.ok(lines.some((l) => l.includes("worker general-purpose (0m30s) — legacy work")), `Expected unavailable cost omission in: ${lines.join("\n")}`);
-	assert.ok(lines.some((l) => l.includes("nested (0m20s)")), `Expected lease row in: ${lines.join("\n")}`);
+	assert.ok(lines.some((l) => l.includes("agent details pending (0m20s)")), `Expected lease row in: ${lines.join("\n")}`);
+});
+
+test("buildTreeSnapshot preserves invocation group identity and orders groups chronologically (oldest at top)", async (t) => {
+	const artifactDir = await temporaryDirectory(t);
+	const schedulerRoot = await temporaryDirectory(t);
+
+	const manifest = {
+		schemaVersion: "dstack.workflow.v1",
+		workflowId: "wf-grouped-ordering",
+		sessionId: "sess-order",
+		mode: "single",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		specs: [
+			{
+				agent: "poteto-agent",
+				task: "owner task",
+				requestedRole: "feature",
+				workflow: { assignment: "owner", playbook: "feature", phase: "grounding" },
+			},
+		],
+	};
+	await writeFile(join(artifactDir, "manifest.json"), JSON.stringify(manifest), "utf8");
+
+	const spawnsDir = join(artifactDir, "children", "0", "spawns");
+	await mkdir(spawnsDir, { recursive: true });
+
+	const group1 = {
+		schemaVersion: "dstack.spawn-record.v1",
+		workflowId: "wf-grouped-ordering",
+		parentIndex: 0,
+		groupId: "grp-1-parallel",
+		mode: "parallel",
+		phase: "grounding",
+		createdAt: "2025-01-01T00:01:00.000Z",
+		children: [
+			{ nestedIndex: 0, agent: "general-purpose", role: "worker", taskPreview: "parallel worker 1", state: "succeeded", updatedAt: "2025-01-01T00:02:00.000Z" },
+			{ nestedIndex: 1, agent: "general-purpose", role: "worker", taskPreview: "parallel worker 2", state: "succeeded", updatedAt: "2025-01-01T00:02:30.000Z" },
+		],
+	};
+	const group2 = {
+		schemaVersion: "dstack.spawn-record.v1",
+		workflowId: "wf-grouped-ordering",
+		parentIndex: 0,
+		groupId: "grp-2-chain",
+		mode: "chain",
+		phase: "implementation",
+		createdAt: "2025-01-01T00:03:00.000Z",
+		children: [
+			{ nestedIndex: 0, agent: "general-purpose", role: "worker", taskPreview: "step 1", state: "succeeded", updatedAt: "2025-01-01T00:04:00.000Z" },
+			{ nestedIndex: 1, agent: "general-purpose", role: "worker", taskPreview: "step 2", state: "running", updatedAt: "2025-01-01T00:04:30.000Z" },
+		],
+	};
+	const group3 = {
+		schemaVersion: "dstack.spawn-record.v1",
+		workflowId: "wf-grouped-ordering",
+		parentIndex: 0,
+		groupId: "grp-3-single",
+		mode: "single",
+		phase: "review",
+		createdAt: "2025-01-01T00:05:00.000Z",
+		children: [
+			{ nestedIndex: 0, agent: "general-purpose", role: "reviewer", taskPreview: "final review", state: "queued", updatedAt: "2025-01-01T00:05:00.000Z" },
+		],
+	};
+
+	await writeFile(join(spawnsDir, "grp-3.json"), JSON.stringify(group3), "utf8");
+	await writeFile(join(spawnsDir, "grp-1.json"), JSON.stringify(group1), "utf8");
+	await writeFile(join(spawnsDir, "grp-2.json"), JSON.stringify(group2), "utf8");
+
+	const snapshot = await buildTreeSnapshot({
+		taskId: "task-grouped",
+		workflowId: "wf-grouped-ordering",
+		artifactDir,
+		schedulerRoot,
+		now: new Date("2025-01-01T00:06:00.000Z"),
+	});
+
+	assert.ok(snapshot !== undefined);
+	const owner = snapshot.children[0];
+	assert.ok(owner !== undefined);
+	assert.equal(owner.nestedGroups.length, 3);
+
+	assert.equal(owner.nestedGroups[0]?.groupId, "grp-1-parallel");
+	assert.equal(owner.nestedGroups[0]?.mode, "parallel");
+	assert.equal(owner.nestedGroups[0]?.children.length, 2);
+
+	assert.equal(owner.nestedGroups[1]?.groupId, "grp-2-chain");
+	assert.equal(owner.nestedGroups[1]?.mode, "chain");
+	assert.equal(owner.nestedGroups[1]?.children.length, 2);
+
+	assert.equal(owner.nestedGroups[2]?.groupId, "grp-3-single");
+	assert.equal(owner.nestedGroups[2]?.mode, "single");
+	assert.equal(owner.nestedGroups[2]?.children.length, 1);
+
+	const lines = renderTreeLines(snapshot, {
+		width: 100,
+		maxLines: Infinity,
+		now: new Date("2025-01-01T00:06:00.000Z"),
+	});
+
+	assert.ok(lines[0]?.includes("oldest at top · newest at bottom"));
+
+	const g1Idx = lines.findIndex((l) => l.includes("parallel · 2 agents · phase grounding"));
+	assert.ok(g1Idx >= 0, "parallel group header rendered");
+	assert.ok(lines[g1Idx]?.includes("├─ parallel · 2 agents"));
+	assert.ok(lines[g1Idx + 1]?.includes("│  ├─ ✓ worker general-purpose"));
+	assert.ok(lines[g1Idx + 2]?.includes("│  └─ ✓ worker general-purpose"));
+
+	const g2Idx = lines.findIndex((l) => l.includes("sequence · 2 steps · phase implementation"));
+	assert.ok(g2Idx > g1Idx, "sequence group appears after parallel group chronologically");
+	assert.ok(lines[g2Idx]?.includes("├─ sequence · 2 steps"));
+	assert.ok(lines[g2Idx + 1]?.includes("│  ├─ ✓ worker general-purpose"));
+	assert.ok(lines[g2Idx + 2]?.includes("│  └─ ◐ worker general-purpose"));
+
+	const g3Idx = lines.findIndex((l) => l.includes("single · phase review"));
+	assert.ok(g3Idx > g2Idx, "single group appears last chronologically");
+	assert.ok(lines[g3Idx]?.includes("└─ single · phase review"));
+	assert.ok(lines[g3Idx + 1]?.includes("      └─ ○ reviewer general-purpose"));
+});
+
+test("renderTreeLines prefers errorMessage then stderr over activity/taskPreview on failed nested rows", () => {
+	const snapshot: TreeSnapshot = {
+		taskId: "task-failed-diag",
+		workflowId: "wf-failed-diag",
+		mode: "single",
+		playbook: "feature",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		committed: false,
+		counts: { queued: 0, running: 0, complete: 1, total: 1 },
+		slots: { active: 0, capacity: 4 },
+		capturedAt: "2025-01-01T00:05:00.000Z",
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		children: [
+			{
+				index: 0,
+				agent: "poteto-agent",
+				state: "running",
+				assignment: "owner",
+				taskPreview: "orchestrate feature",
+				nestedGroups: [
+					{
+						groupId: "grp-failures",
+						mode: "parallel",
+						createdAt: "2025-01-01T00:01:00.000Z",
+						children: [
+							{
+								groupId: "grp-failures",
+								nestedIndex: 0,
+								agent: "missing-agent",
+								state: "failed",
+								taskPreview: "task preview should be ignored",
+								activity: "activity should be ignored",
+								errorMessage: "Unknown agent \"missing-agent\". Must be poteto-agent, general-purpose, or comment-sicko.",
+								updatedAt: "2025-01-01T00:02:00.000Z",
+								live: false,
+							},
+							{
+								groupId: "grp-failures",
+								nestedIndex: 1,
+								agent: "general-purpose",
+								state: "failed",
+								taskPreview: "task preview should be ignored",
+								stderr: "SyntaxError: Unexpected identifier in worker script",
+								updatedAt: "2025-01-01T00:02:00.000Z",
+								live: false,
+							},
+							{
+								groupId: "grp-failures",
+								nestedIndex: 2,
+								agent: "general-purpose",
+								state: "failed",
+								taskPreview: "fallback task preview",
+								activity: "fallback activity text",
+								updatedAt: "2025-01-01T00:02:00.000Z",
+								live: false,
+							},
+						],
+					},
+				],
+				nested: [],
+			},
+		],
+	};
+
+	const lines = renderTreeLines(snapshot, {
+		width: 140,
+		maxLines: Infinity,
+		now: new Date("2025-01-01T00:05:00.000Z"),
+	});
+
+	assert.ok(lines.some((l) => l.includes("Unknown agent \"missing-agent\"")), "renders errorMessage on unknown agent failure");
+	assert.ok(!lines.some((l) => l.includes("task preview should be ignored")), "does not show taskPreview when errorMessage exists");
+
+	assert.ok(lines.some((l) => l.includes("SyntaxError: Unexpected identifier in worker script")), "renders stderr when errorMessage is absent");
+
+	assert.ok(lines.some((l) => l.includes("fallback activity text")), "renders activity when errorMessage and stderr are absent");
+});
+
+test("buildTreeSnapshot derives stale state for running parent and nested children without activity records", async (t) => {
+	const artifactDir = await temporaryDirectory(t);
+	const schedulerRoot = await temporaryDirectory(t);
+
+	const manifest = {
+		schemaVersion: "dstack.workflow.v1",
+		workflowId: "wf-stale-no-act",
+		sessionId: "sess-stale",
+		mode: "single",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		specs: [
+			{
+				agent: "poteto-agent",
+				task: "owner running task",
+				requestedRole: "feature",
+				workflow: { assignment: "owner", playbook: "feature", phase: "implement" },
+			},
+		],
+	};
+	await writeFile(join(artifactDir, "manifest.json"), JSON.stringify(manifest), "utf8");
+
+	const progress = {
+		schemaVersion: "dstack.workflow-progress.v2",
+		workflowId: "wf-stale-no-act",
+		queued: 0,
+		running: 1,
+		complete: 0,
+		total: 1,
+		children: [
+			{
+				index: 0,
+				agent: "poteto-agent",
+				state: "running",
+				role: "feature",
+				assignment: "owner",
+				startedAt: "2025-01-01T00:00:05.000Z",
+			},
+		],
+	};
+	await writeFile(join(artifactDir, "progress.json"), JSON.stringify(progress), "utf8");
+
+	const spawnsDir = join(artifactDir, "children", "0", "spawns");
+	await mkdir(spawnsDir, { recursive: true });
+
+	const spawnRecord = {
+		schemaVersion: "dstack.spawn-record.v1",
+		workflowId: "wf-stale-no-act",
+		parentIndex: 0,
+		groupId: "grp-stale-child",
+		mode: "single",
+		createdAt: "2025-01-01T00:00:10.000Z",
+		children: [
+			{
+				nestedIndex: 0,
+				agent: "general-purpose",
+				role: "worker",
+				assignment: "worker",
+				taskPreview: "nested worker running without activity updates",
+				state: "running",
+				startedAt: "2025-01-01T00:00:15.000Z",
+				updatedAt: "2025-01-01T00:00:15.000Z",
+			},
+		],
+	};
+	await writeFile(join(spawnsDir, "grp-stale.json"), JSON.stringify(spawnRecord), "utf8");
+
+	const nowMs = Date.parse("2025-01-01T00:10:00.000Z");
+	const snapshot = await buildTreeSnapshot({
+		taskId: "task-stale-test",
+		workflowId: "wf-stale-no-act",
+		artifactDir,
+		schedulerRoot,
+		now: new Date(nowMs),
+	});
+
+	assert.ok(snapshot !== undefined);
+	const parent = snapshot.children[0];
+	assert.ok(parent !== undefined);
+	assert.equal(parent.state, "running");
+	assert.equal(parent.stale, true);
+
+	const nestedGroup = parent.nestedGroups[0];
+	assert.ok(nestedGroup !== undefined);
+	const nested = nestedGroup.children[0];
+	assert.ok(nested !== undefined && !isLeaseSnapshot(nested));
+	assert.equal(nested.state, "running");
+	assert.equal(nested.stale, true);
+
+	const lines = renderTreeLines(snapshot, {
+		width: 120,
+		maxLines: Infinity,
+		now: new Date(nowMs),
+	});
+	assert.ok(lines.some((l) => l.includes("owner poteto-agent") && l.includes("stale 9m55s")));
+	assert.ok(lines.some((l) => l.includes("worker general-purpose") && l.includes("stale 9m45s")));
+});
+
+test("buildTreeSnapshot groups unmatched depth-2 leases by parsed groupId into mode unknown with agent details pending", async (t) => {
+	const artifactDir = await temporaryDirectory(t);
+	const schedulerRoot = await temporaryDirectory(t);
+
+	const manifest = {
+		schemaVersion: "dstack.workflow.v1",
+		workflowId: "wf-unmatched-leases",
+		sessionId: "sess-unmatched",
+		mode: "single",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		specs: [
+			{
+				agent: "poteto-agent",
+				task: "owner with multiple unmatched runs",
+				requestedRole: "feature",
+				workflow: { assignment: "owner", playbook: "feature" },
+			},
+		],
+	};
+	await writeFile(join(artifactDir, "manifest.json"), JSON.stringify(manifest), "utf8");
+
+	const leases: LeaseSnapshot[] = [
+		{
+			workflowId: "wf-unmatched-leases",
+			childId: "grpA-0",
+			depth: 2,
+			acquiredAt: "2025-01-01T00:01:00.000Z",
+		},
+		{
+			workflowId: "wf-unmatched-leases",
+			childId: "grpB-0",
+			depth: 2,
+			acquiredAt: "2025-01-01T00:02:00.000Z",
+		},
+	];
+
+	const snapshot = await buildTreeSnapshot({
+		taskId: "task-unmatched",
+		workflowId: "wf-unmatched-leases",
+		artifactDir,
+		schedulerRoot,
+		activeLeases: leases,
+		now: new Date("2025-01-01T00:03:00.000Z"),
+	});
+
+	assert.ok(snapshot !== undefined);
+	const owner = snapshot.children[0];
+	assert.ok(owner !== undefined);
+	assert.equal(owner.nestedGroups.length, 2);
+
+	assert.equal(owner.nestedGroups[0]?.groupId, "grpA");
+	assert.equal(owner.nestedGroups[0]?.mode, "unknown");
+	assert.equal(owner.nestedGroups[0]?.children.length, 1);
+	const childA = owner.nestedGroups[0]?.children[0];
+	assert.ok(childA !== undefined && !isLeaseSnapshot(childA));
+	assert.equal(childA.agent, "agent details pending");
+
+	assert.equal(owner.nestedGroups[1]?.groupId, "grpB");
+	assert.equal(owner.nestedGroups[1]?.mode, "unknown");
+	assert.equal(owner.nestedGroups[1]?.children.length, 1);
+	const childB = owner.nestedGroups[1]?.children[0];
+	assert.ok(childB !== undefined && !isLeaseSnapshot(childB));
+	assert.equal(childB.agent, "agent details pending");
+
+	const lines = renderTreeLines(snapshot, {
+		width: 120,
+		maxLines: Infinity,
+		now: new Date("2025-01-01T00:03:00.000Z"),
+	});
+
+	const modeUnavailLines = lines.filter((l) => l.includes("run · 1 agent · mode unavailable"));
+	assert.equal(modeUnavailLines.length, 2);
+	const agentPendingLines = lines.filter((l) => l.includes("◐ agent details pending"));
+	assert.equal(agentPendingLines.length, 2);
 });
 
 test("buildTreeSnapshot prefers fresh semantic status over low-level activity and renders it cleanly", async (t) => {
@@ -1946,6 +2419,7 @@ test("buildTreeSnapshot and boundary parsers handle malformed status and journal
 				state: "running",
 				status: "not an object",
 				journal: "not an array",
+				nestedGroups: [],
 				nested: [],
 			},
 		],
@@ -2009,6 +2483,7 @@ test("terminal child rendering remains unchanged with outcome and duration", () 
 				endedAt: "2025-01-01T00:03:00.000Z",
 				taskPreview: "orchestrate feature",
 				outcome: "All changes integrated and verified",
+				nestedGroups: [],
 				nested: [],
 			},
 			{
@@ -2020,6 +2495,7 @@ test("terminal child rendering remains unchanged with outcome and duration", () 
 				endedAt: "2025-01-01T00:01:30.000Z",
 				taskPreview: "run tests",
 				outcome: "AssertionError: 3 !== 4",
+				nestedGroups: [],
 				nested: [],
 			},
 		],
@@ -2031,7 +2507,7 @@ test("terminal child rendering remains unchanged with outcome and duration", () 
 		now: new Date("2025-01-01T00:04:00.000Z"),
 	});
 
-	assert.equal(lines[0], "dstack · feature · 2/2 done · 4m00s");
+	assert.equal(lines[0], "dstack · feature · 2/2 done · 4m00s · oldest at top · newest at bottom");
 	assert.ok(lines.some((l) => l.includes("✓ owner poteto-agent (3m00s) — All changes integrated and verified")));
 	assert.ok(lines.some((l) => l.includes("✗ worker general-purpose (1m30s) failed — AssertionError: 3 !== 4")));
 });
@@ -2069,25 +2545,33 @@ test("renderTreeLines expanded view exposes compact recent activity history for 
 					{ seq: 3, timestamp: "2025-01-01T00:01:45.000Z", kind: "tool", name: "edit", gist: "src/tree.ts" },
 					{ seq: 4, timestamp: "2025-01-01T00:02:30.000Z", kind: "phase", phase: "implement", note: "editing tree renderer" },
 				],
-				nested: [
+				nestedGroups: [
 					{
 						groupId: "grp-1",
-						nestedIndex: 0,
-						agent: "general-purpose",
-						role: "implementation-worker",
-						assignment: "worker",
-						taskPreview: "run test suite",
-						state: "running",
-						startedAt: "2025-01-01T00:01:00.000Z",
-						updatedAt: "2025-01-01T00:02:30.000Z",
-						live: true,
-						journal: [
-							{ seq: 1, timestamp: "2025-01-01T00:01:00.000Z", kind: "spawn", agent: "general-purpose", task: "run tests", cwd: "/tmp" },
-							{ seq: 2, timestamp: "2025-01-01T00:01:30.000Z", kind: "tool", name: "bash", gist: "npm test" },
-							{ seq: 3, timestamp: "2025-01-01T00:02:30.000Z", kind: "turn", turn: 1, summary: "tests running suite 1" },
+						mode: "single",
+						createdAt: "2025-01-01T00:01:00.000Z",
+						children: [
+							{
+								groupId: "grp-1",
+								nestedIndex: 0,
+								agent: "general-purpose",
+								role: "implementation-worker",
+								assignment: "worker",
+								taskPreview: "run test suite",
+								state: "running",
+								startedAt: "2025-01-01T00:01:00.000Z",
+								updatedAt: "2025-01-01T00:02:30.000Z",
+								live: true,
+								journal: [
+									{ seq: 1, timestamp: "2025-01-01T00:01:00.000Z", kind: "spawn", agent: "general-purpose", task: "run tests", cwd: "/tmp" },
+									{ seq: 2, timestamp: "2025-01-01T00:01:30.000Z", kind: "tool", name: "bash", gist: "npm test" },
+									{ seq: 3, timestamp: "2025-01-01T00:02:30.000Z", kind: "turn", turn: 1, summary: "tests running suite 1" },
+								],
+							},
 						],
 					},
 				],
+				nested: [],
 			},
 			{
 				index: 1,
@@ -2104,6 +2588,7 @@ test("renderTreeLines expanded view exposes compact recent activity history for 
 					{ seq: 2, timestamp: "2025-01-01T00:00:30.000Z", kind: "tool", name: "read", gist: "README.md" },
 					{ seq: 3, timestamp: "2025-01-01T00:01:00.000Z", kind: "exit", exitCode: 0 },
 				],
+				nestedGroups: [],
 				nested: [],
 			},
 		],

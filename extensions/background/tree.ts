@@ -17,6 +17,7 @@ import {
 	type SemanticStatus,
 } from "./journal.ts";
 import { MAX_ACTIVE_CHILDREN, snapshotActiveLeases, type LeaseSnapshot } from "./scheduler.ts";
+export type { LeaseSnapshot } from "./scheduler.ts";
 
 export {
 	formatJournalEntry,
@@ -122,6 +123,14 @@ export type SpawnNestedChild = Readonly<{
 
 export type NestedChild = SpawnNestedChild | LeaseSnapshot;
 
+export type NestedGroup = Readonly<{
+	groupId: string;
+	mode: "single" | "parallel" | "chain" | "unknown";
+	createdAt: string;
+	phase?: string;
+	children: readonly NestedChild[];
+}>;
+
 export type ProgressChildV1 = Readonly<{
 	index: number;
 	agent: string;
@@ -153,6 +162,7 @@ export type TreeChild = ProgressChildV1 & Readonly<{
 	cwd?: string;
 	model?: string;
 	tools?: string;
+	nestedGroups: readonly NestedGroup[];
 	cost?: number;
 	nested: readonly NestedChild[];
 }>;
@@ -778,14 +788,132 @@ async function readSpawns(artifactDir: string, parentIndex: number, expectedWork
 				if (parsed !== undefined && parsed.workflowId === expectedWorkflowId && parsed.parentIndex === parentIndex) {
 					records.push(parsed);
 				}
-			} catch {
-				// Ignore malformed or uncommitted file
-			}
+			} catch {}
 		}
 		return records.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 	} catch {
 		return [];
 	}
+}
+
+export function parseNestedChild(item: unknown): NestedChild | undefined {
+	if (!isRecord(item)) return undefined;
+	if (typeof item.groupId === "string" && typeof item.agent === "string") {
+		const state: SpawnChildV1["state"] = isSpawnChildState(item.state)
+			? item.state
+			: "running";
+		return {
+			groupId: item.groupId,
+			nestedIndex: typeof item.nestedIndex === "number" ? item.nestedIndex : 0,
+			agent: item.agent,
+			role: typeof item.role === "string" ? item.role : undefined,
+			assignment: isWorkflowAssignment(item.assignment) ? item.assignment : undefined,
+			taskPreview: typeof item.taskPreview === "string" ? item.taskPreview : "",
+			state,
+			activity: typeof item.activity === "string" ? item.activity : undefined,
+			status: parseSemanticStatus(item.status),
+			journal: parseJournalEntries(item.journal),
+			startedAt: typeof item.startedAt === "string" ? item.startedAt : undefined,
+			endedAt: typeof item.endedAt === "string" ? item.endedAt : undefined,
+			updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : "",
+			live: typeof item.live === "boolean" ? item.live : state === "running",
+			stale: typeof item.stale === "boolean" ? item.stale : undefined,
+			taskFull: typeof item.taskFull === "string" ? item.taskFull : undefined,
+			workflow: parseWorkflowContext(item.workflow),
+			model: typeof item.model === "string" ? item.model : undefined,
+			cwd: typeof item.cwd === "string" ? item.cwd : undefined,
+			tools: typeof item.tools === "string" ? item.tools : undefined,
+			finalResponse: typeof item.finalResponse === "string" ? item.finalResponse : undefined,
+			errorMessage: typeof item.errorMessage === "string" ? item.errorMessage : undefined,
+			stderr: typeof item.stderr === "string" ? item.stderr : undefined,
+			stopReason: typeof item.stopReason === "string" ? item.stopReason : undefined,
+			exitCode: typeof item.exitCode === "number" ? item.exitCode : undefined,
+			usage: parseChildUsage(item.usage),
+		};
+	}
+	if (
+		typeof item.workflowId === "string" &&
+		typeof item.childId === "string" &&
+		(item.depth === 1 || item.depth === 2) &&
+		typeof item.acquiredAt === "string"
+	) {
+		const { groupId, nestedIndex } = parseLeaseChildId(item.childId);
+		return {
+			groupId,
+			nestedIndex,
+			agent: "agent details pending",
+			taskPreview: "",
+			state: "running",
+			startedAt: item.acquiredAt,
+			updatedAt: item.acquiredAt,
+			live: true,
+			lease: {
+				workflowId: item.workflowId,
+				childId: item.childId,
+				depth: item.depth,
+				acquiredAt: item.acquiredAt,
+			},
+		};
+	}
+	return undefined;
+}
+
+export function parseNestedGroup(raw: unknown): NestedGroup | undefined {
+	if (!isRecord(raw)) return undefined;
+	const { groupId, mode, createdAt, phase, children: rawChildren } = raw;
+	if (typeof groupId !== "string" || groupId === "") return undefined;
+	if (mode !== "single" && mode !== "parallel" && mode !== "chain" && mode !== "unknown") return undefined;
+	if (typeof createdAt !== "string" || createdAt === "") return undefined;
+	if (!Array.isArray(rawChildren)) return undefined;
+
+	const children: NestedChild[] = [];
+	for (const item of rawChildren) {
+		const child = parseNestedChild(item);
+		if (child !== undefined) {
+			children.push(child);
+		}
+	}
+
+	return {
+		groupId,
+		mode,
+		createdAt,
+		phase: typeof phase === "string" && phase !== "" ? phase : undefined,
+		children,
+	};
+}
+
+export function groupNestedChildren(children: readonly NestedChild[]): readonly NestedGroup[] {
+	const groupsMap = new Map<string, { createdAt: string; phase?: string; children: NestedChild[] }>();
+	for (const c of children) {
+		const groupId = isLeaseSnapshot(c) ? parseLeaseChildId(c.childId).groupId : c.groupId;
+		const existing = groupsMap.get(groupId);
+		const createdAt = isLeaseSnapshot(c) ? c.acquiredAt : (c.startedAt ?? c.updatedAt ?? new Date(0).toISOString());
+		const phase = !isLeaseSnapshot(c) ? c.workflow?.phase : undefined;
+		if (existing === undefined) {
+			groupsMap.set(groupId, {
+				createdAt,
+				phase,
+				children: [c],
+			});
+		} else {
+			existing.children.push(c);
+			if (existing.phase === undefined && phase !== undefined) {
+				existing.phase = phase;
+			}
+		}
+	}
+	const groups: NestedGroup[] = [];
+	for (const [groupId, groupData] of groupsMap) {
+		groups.push({
+			groupId,
+			mode: "unknown",
+			createdAt: groupData.createdAt,
+			phase: groupData.phase,
+			children: groupData.children,
+		});
+	}
+	return groups;
 }
 
 export function parseTreeSnapshot(raw: unknown): TreeSnapshot | undefined {
@@ -834,62 +962,26 @@ export function parseTreeSnapshot(raw: unknown): TreeSnapshot | undefined {
 	for (const child of children) {
 		if (!isRecord(child)) continue;
 		if (typeof child.index !== "number" || typeof child.agent !== "string" || !isTreeChildState(child.state)) continue;
-		const nested: NestedChild[] = [];
-		if (Array.isArray(child.nested)) {
-			for (const item of child.nested) {
-				if (!isRecord(item)) continue;
-				if (typeof item.groupId === "string" && typeof item.agent === "string") {
-					const state: SpawnChildV1["state"] = isSpawnChildState(item.state)
-						? item.state
-						: "running";
-					nested.push({
-						groupId: item.groupId,
-						nestedIndex: typeof item.nestedIndex === "number" ? item.nestedIndex : 0,
-						agent: item.agent,
-						role: typeof item.role === "string" ? item.role : undefined,
-						assignment: isWorkflowAssignment(item.assignment) ? item.assignment : undefined,
-						taskPreview: typeof item.taskPreview === "string" ? item.taskPreview : "",
-						state,
-						activity: typeof item.activity === "string" ? item.activity : undefined,
-						status: parseSemanticStatus(item.status),
-						journal: parseJournalEntries(item.journal),
-						startedAt: typeof item.startedAt === "string" ? item.startedAt : undefined,
-						endedAt: typeof item.endedAt === "string" ? item.endedAt : undefined,
-						updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : "",
-						live: typeof item.live === "boolean" ? item.live : true,
-						stale: typeof item.stale === "boolean" ? item.stale : undefined,
-						taskFull: typeof item.taskFull === "string" ? item.taskFull : undefined,
-						workflow: parseWorkflowContext(item.workflow),
-						model: typeof item.model === "string" ? item.model : undefined,
-						cwd: typeof item.cwd === "string" ? item.cwd : undefined,
-						tools: typeof item.tools === "string" ? item.tools : undefined,
-						finalResponse: typeof item.finalResponse === "string" ? item.finalResponse : undefined,
-						errorMessage: typeof item.errorMessage === "string" ? item.errorMessage : undefined,
-						stderr: typeof item.stderr === "string" ? item.stderr : undefined,
-						stopReason: typeof item.stopReason === "string" ? item.stopReason : undefined,
-						exitCode: typeof item.exitCode === "number" ? item.exitCode : undefined,
-						usage: parseChildUsage(item.usage),
-					});
-				} else if (typeof item.workflowId === "string" && typeof item.childId === "string" && (item.depth === 1 || item.depth === 2) && typeof item.acquiredAt === "string") {
-					const { groupId, nestedIndex } = parseLeaseChildId(item.childId);
-					nested.push({
-						groupId,
-						nestedIndex,
-						agent: "nested",
-						taskPreview: "",
-						state: "running",
-						startedAt: item.acquiredAt,
-						updatedAt: item.acquiredAt,
-						live: true,
-						lease: {
-							workflowId: item.workflowId,
-							childId: item.childId,
-							depth: item.depth,
-							acquiredAt: item.acquiredAt,
-						},
-					});
+
+		let nestedGroups: NestedGroup[] = [];
+		let nested: NestedChild[] = [];
+
+		if (Array.isArray(child.nestedGroups)) {
+			for (const groupItem of child.nestedGroups) {
+				const group = parseNestedGroup(groupItem);
+				if (group !== undefined) {
+					nestedGroups.push(group);
 				}
 			}
+			nested = nestedGroups.flatMap((g) => g.children);
+		} else if (Array.isArray(child.nested)) {
+			for (const item of child.nested) {
+				const parsedChild = parseNestedChild(item);
+				if (parsedChild !== undefined) {
+					nested.push(parsedChild);
+				}
+			}
+			nestedGroups = [...groupNestedChildren(nested)];
 		}
 
 		let activityObj: Readonly<{ text: string; updatedAt: string }> | undefined;
@@ -918,6 +1010,11 @@ export function parseTreeSnapshot(raw: unknown): TreeSnapshot | undefined {
 			journal: parseJournalEntries(child.journal),
 			stale: typeof child.stale === "boolean" ? child.stale : undefined,
 			outcome: typeof child.outcome === "string" ? child.outcome : undefined,
+			workflow: parseWorkflowContext(child.workflow),
+			cwd: typeof child.cwd === "string" ? child.cwd : undefined,
+			model: typeof child.model === "string" ? child.model : undefined,
+			tools: typeof child.tools === "string" ? child.tools : undefined,
+			nestedGroups,
 			cost,
 			nested,
 		});
@@ -1096,20 +1193,21 @@ export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<
 				latestUpdatedAt = activityRecord.updatedAt;
 			}
 
-			if (latestUpdatedAt !== undefined) {
-				stale = !isFreshActivity(latestUpdatedAt, nowMs);
-			}
+			const staleTimestamp = latestUpdatedAt ?? startedAt ?? manifest.createdAt;
+			stale = !isFreshActivity(staleTimestamp, nowMs);
 
 			if (latestActivityText !== undefined && latestUpdatedAt !== undefined) {
 				activityRecordObj = { text: latestActivityText, updatedAt: latestUpdatedAt };
 			}
 		}
 
-		const nested: NestedChild[] = [];
+		const nestedGroups: NestedGroup[] = [];
 		for (const spawnRecord of spawns) {
+			const groupChildren: SpawnNestedChild[] = [];
 			for (const spawnChild of spawnRecord.children) {
 				const leaseChildId = `${spawnRecord.groupId}-${spawnChild.nestedIndex}`;
 				const matchLease = depth2Leases.find((l) => l.childId === leaseChildId);
+
 				const nestedStatusText = spawnChild.status === undefined ? undefined : semanticStatusText(spawnChild.status);
 				const nestedStatusIsFresh = spawnChild.status !== undefined && isFreshActivity(spawnChild.status.updatedAt, nowMs);
 				const lastNestedJournalEntry = spawnChild.journal?.at(-1);
@@ -1123,16 +1221,18 @@ export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<
 					nestedUpdatedAt = lastNestedJournalEntry.timestamp;
 				}
 
-				const childUpdatedMs = Date.parse(nestedUpdatedAt);
-				const isStale = spawnChild.state === "running" && nestedActivityText !== undefined && (
+				const staleTimestamp = nestedUpdatedAt || spawnChild.startedAt || spawnRecord.createdAt;
+				const childUpdatedMs = Date.parse(staleTimestamp);
+				const isStale = spawnChild.state === "running" && (
 					!Number.isNaN(childUpdatedMs) && nowMs - childUpdatedMs > STALE_ACTIVITY_THRESHOLD_MS
 				);
+
 				const model = spawnChild.model ?? (
 					parentResultRaw !== undefined
 						? recoverNestedModelFromParentResult(parentResultRaw, spawnChild.nestedIndex, spawnChild.agent)
 						: undefined
 				);
-				nested.push({
+				groupChildren.push({
 					groupId: spawnRecord.groupId,
 					nestedIndex: spawnChild.nestedIndex,
 					agent: spawnChild.agent,
@@ -1162,8 +1262,16 @@ export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<
 					usage: spawnChild.usage,
 				});
 			}
+			nestedGroups.push({
+				groupId: spawnRecord.groupId,
+				mode: spawnRecord.mode,
+				createdAt: spawnRecord.createdAt,
+				phase: spawnRecord.phase,
+				children: groupChildren,
+			});
 		}
 
+		const nested = nestedGroups.flatMap((group) => group.children);
 		const rawCost = terminalChild !== undefined
 			? terminalChild.cost
 			: activityRecord !== undefined
@@ -1211,6 +1319,7 @@ export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<
 			model: spec.model,
 			tools: spec.tools,
 			cost,
+			nestedGroups,
 			nested,
 		};
 	});
@@ -1238,7 +1347,7 @@ export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<
 					return {
 						groupId,
 						nestedIndex,
-						agent: "nested",
+						agent: "agent details pending",
 						taskPreview: "",
 						state: "running",
 						startedAt: lease.acquiredAt,
@@ -1247,8 +1356,10 @@ export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<
 						lease,
 					};
 				});
+				const unmatchedGroups = groupNestedChildren(legacyNested);
 				children[targetIndex] = {
 					...targetChild,
+					nestedGroups: [...targetChild.nestedGroups, ...unmatchedGroups],
 					nested: [...targetChild.nested, ...legacyNested],
 				};
 			}
@@ -1368,6 +1479,59 @@ type PreparedTreeRow = Readonly<{
 	render: (isLast: boolean, theme: TreeTheme, width: number) => string;
 }>;
 
+export function formatGroupLabel(group: NestedGroup): string {
+	const count = group.children.length;
+	let base: string;
+	if (group.mode === "parallel") {
+		base = `parallel · ${count} agent${count === 1 ? "" : "s"}`;
+	} else if (group.mode === "chain") {
+		base = `sequence · ${count} step${count === 1 ? "" : "s"}`;
+	} else if (group.mode === "single") {
+		base = "single";
+	} else {
+		base = `run · ${count} agent${count === 1 ? "" : "s"} · mode unavailable`;
+	}
+	if (group.phase !== undefined && group.phase.length > 0) {
+		return `${base} · phase ${group.phase}`;
+	}
+	return base;
+}
+
+export function nestedChildDetail(nestedChild: NestedChild): string {
+	if (isLeaseSnapshot(nestedChild)) return "";
+	const taskPreview = typeof nestedChild.taskPreview === "string" ? nestedChild.taskPreview : "";
+	if (nestedChild.state === "failed") {
+		if (nestedChild.errorMessage !== undefined && nestedChild.errorMessage.trim().length > 0) {
+			const line = firstNonEmptyLine(nestedChild.errorMessage);
+			if (line !== undefined) return line;
+		}
+		if (nestedChild.stderr !== undefined && nestedChild.stderr.trim().length > 0) {
+			const line = firstNonEmptyLine(nestedChild.stderr);
+			if (line !== undefined) return line;
+		}
+		if (nestedChild.activity !== undefined && nestedChild.activity.trim().length > 0) {
+			const line = firstNonEmptyLine(nestedChild.activity);
+			if (line !== undefined) return line;
+		}
+		return taskPreview;
+	}
+	if (nestedChild.state === "running") {
+		const act = nestedChild.activity ?? (taskPreview.length > 0 ? taskPreview : undefined);
+		return act ?? "";
+	}
+	if (nestedChild.state === "queued" || nestedChild.state === "skipped") {
+		return taskPreview;
+	}
+	if (nestedChild.state === "cancelled") {
+		if (nestedChild.errorMessage !== undefined && nestedChild.errorMessage.trim().length > 0) {
+			const line = firstNonEmptyLine(nestedChild.errorMessage);
+			if (line !== undefined) return line;
+		}
+	}
+	const act = nestedChild.activity ?? (taskPreview.length > 0 ? taskPreview : undefined);
+	return act ?? "";
+}
+
 export function isLeaseSnapshot(child: NestedChild): child is LeaseSnapshot {
 	return "childId" in child && typeof child.childId === "string" && !("agent" in child);
 }
@@ -1391,6 +1555,7 @@ export function renderTreeLines(snapshot: TreeSnapshot, opts: RenderTreeOptions)
 	if (snapshot.todos.length > 0) {
 		header += ` · todos ${snapshot.todoCounts.completed}/${snapshot.todoCounts.total}`;
 	}
+	header += " · oldest at top · newest at bottom";
 
 	const lines: string[] = [truncateToWidth(header, width)];
 
@@ -1427,7 +1592,7 @@ export function renderTreeLines(snapshot: TreeSnapshot, opts: RenderTreeOptions)
 				} else if (currentChild.state === "running") {
 					let staleTag = "";
 					if (currentChild.stale) {
-						const staleBase = currentChild.activity?.updatedAt;
+						const staleBase = currentChild.activity?.updatedAt ?? currentChild.startedAt;
 						const staleMs = staleBase !== undefined ? Date.parse(staleBase) : Number.NaN;
 						const staleElapsed = !Number.isNaN(staleMs) ? Math.max(0, nowMs - staleMs) : 0;
 						staleTag = ` ${rowTheme.fg("dim", `stale ${formatElapsed(staleElapsed)}`)}`;
@@ -1452,90 +1617,128 @@ export function renderTreeLines(snapshot: TreeSnapshot, opts: RenderTreeOptions)
 			},
 		});
 
-		for (let nIdx = 0; nIdx < child.nested.length; nIdx++) {
-			const nestedChild = child.nested[nIdx];
-			if (nestedChild === undefined) continue;
-			const nestedOrder = orderIndex++;
-			let nestedPriority = 4;
-			if (isLeaseSnapshot(nestedChild)) {
-				nestedPriority = 2;
-			} else if (nestedChild.state === "failed") {
-				nestedPriority = 1;
-			} else if (nestedChild.state === "running" || nestedChild.state === "queued") {
-				nestedPriority = 2;
+		const childGroups = currentChild.nestedGroups.length > 0
+			? currentChild.nestedGroups
+			: groupNestedChildren(currentChild.nested);
+
+		for (let gIdx = 0; gIdx < childGroups.length; gIdx++) {
+			const group = childGroups[gIdx];
+			if (group === undefined) continue;
+			const isLastGroup = gIdx === childGroups.length - 1;
+
+			let groupPriority = 4;
+			for (const c of group.children) {
+				if (isLeaseSnapshot(c)) {
+					groupPriority = Math.min(groupPriority, 2);
+				} else if (c.state === "failed") {
+					groupPriority = Math.min(groupPriority, 1);
+				} else if (c.state === "running" || c.state === "queued") {
+					groupPriority = Math.min(groupPriority, 2);
+				}
 			}
 
-			const isLastNested = nIdx === child.nested.length - 1;
+			const groupOrder = orderIndex++;
+			const groupLabelText = formatGroupLabel(group);
+
 			rows.push({
 				kind: "nested",
-				priority: nestedPriority,
-				order: nestedOrder,
+				priority: groupPriority,
+				order: groupOrder,
 				render: (_isLast, rowTheme, renderWidth) => {
-					const guide = rowTheme.fg("dim", isLastNested ? "   └─ " : "   ├─ ");
-					if (isLeaseSnapshot(nestedChild)) {
-						const leaseAcquiredMs = Date.parse(nestedChild.acquiredAt);
-						const leaseElapsed = Number.isNaN(leaseAcquiredMs) ? 0 : Math.max(0, nowMs - leaseAcquiredMs);
-						const glyph = rowTheme.fg("accent", "◐");
-						const rawLine = `${guide}${glyph} nested (${formatElapsed(leaseElapsed)})`;
-						return truncateToWidth(rawLine, renderWidth);
-					}
-
-					const glyph = glyphForState(nestedChild.state, rowTheme);
-					let role = nestedChild.agent;
-					if (nestedChild.assignment !== undefined) {
-						role = `${nestedChild.assignment} ${nestedChild.agent}`;
-					} else if (nestedChild.role !== undefined) {
-						role = `${nestedChild.role} ${nestedChild.agent}`;
-					}
-
-					const costToken = formatCost(nestedChild.usage?.cost);
-					const costSuffix = costToken !== undefined ? ` ${costToken}` : "";
-
-					const taskPreview = typeof nestedChild.taskPreview === "string" ? nestedChild.taskPreview : "";
-					let durationStr = "";
-					let detail = "";
-					if (nestedChild.state === "queued") {
-						const createdMs = Date.parse(nestedChild.updatedAt);
-						const elapsed = !Number.isNaN(createdMs) ? Math.max(0, nowMs - createdMs) : 0;
-						durationStr = `queued ${formatElapsed(elapsed)}`;
-						if (taskPreview.length > 0) {
-							detail = ` ${taskPreview}`;
-						}
-					} else if (nestedChild.state === "running") {
-						const startedMs = nestedChild.startedAt !== undefined ? Date.parse(nestedChild.startedAt) : Date.parse(nestedChild.updatedAt);
-						const elapsed = !Number.isNaN(startedMs) ? Math.max(0, nowMs - startedMs) : 0;
-						durationStr = formatElapsed(elapsed);
-						let staleTag = "";
-						if (nestedChild.stale) {
-							const staleMs = Date.parse(nestedChild.updatedAt);
-							const staleElapsed = !Number.isNaN(staleMs) ? Math.max(0, nowMs - staleMs) : 0;
-							staleTag = ` ${rowTheme.fg("dim", `stale ${formatElapsed(staleElapsed)}`)}`;
-						}
-						const act = nestedChild.activity ?? (taskPreview.length > 0 ? taskPreview : undefined);
-						detail = `${staleTag}${act !== undefined ? ` — ${act}` : ""}`;
-					} else if (nestedChild.state === "skipped") {
-						durationStr = "skipped";
-						if (taskPreview.length > 0) {
-							detail = ` ${taskPreview}`;
-						}
-					} else {
-						const startedMs = nestedChild.startedAt !== undefined ? Date.parse(nestedChild.startedAt) : Date.parse(nestedChild.updatedAt);
-						const endedMs = Date.parse(nestedChild.endedAt ?? nestedChild.updatedAt);
-						const duration = Number.isNaN(startedMs) || Number.isNaN(endedMs) ? 0 : Math.max(0, endedMs - startedMs);
-						const durationFormatted = `(${formatElapsed(duration)})`;
-						durationStr = nestedChild.state === "failed"
-							? `${durationFormatted} failed`
-							: nestedChild.state === "cancelled"
-								? `${durationFormatted} cancelled`
-								: durationFormatted;
-						const act = nestedChild.activity ?? (taskPreview.length > 0 ? taskPreview : undefined);
-						detail = act !== undefined ? ` — ${act}` : "";
-					}
-
-					const rawLine = `${guide}${glyph} ${role} ${durationStr}${costSuffix}${detail}`;
+					const guide = rowTheme.fg("dim", isLastGroup ? "   └─ " : "   ├─ ");
+					const rawLine = `${guide}${rowTheme.fg("dim", groupLabelText)}`;
 					return truncateToWidth(rawLine, renderWidth);
 				},
 			});
+
+			for (let cIdx = 0; cIdx < group.children.length; cIdx++) {
+				const nestedChild = group.children[cIdx];
+				if (nestedChild === undefined) continue;
+				const isLastChildInGroup = cIdx === group.children.length - 1;
+				const nestedOrder = orderIndex++;
+
+				let nestedPriority = 4;
+				if (isLeaseSnapshot(nestedChild)) {
+					nestedPriority = 2;
+				} else if (nestedChild.state === "failed") {
+					nestedPriority = 1;
+				} else if (nestedChild.state === "running" || nestedChild.state === "queued") {
+					nestedPriority = 2;
+				}
+
+				rows.push({
+					kind: "nested",
+					priority: nestedPriority,
+					order: nestedOrder,
+					render: (_isLast, rowTheme, renderWidth) => {
+						const prefix = isLastGroup ? "      " : "   │  ";
+						const guide = rowTheme.fg("dim", `${prefix}${isLastChildInGroup ? "└─ " : "├─ "}`);
+
+						if (isLeaseSnapshot(nestedChild)) {
+							const leaseAcquiredMs = Date.parse(nestedChild.acquiredAt);
+							const leaseElapsed = Number.isNaN(leaseAcquiredMs) ? 0 : Math.max(0, nowMs - leaseAcquiredMs);
+							const glyph = rowTheme.fg("accent", "◐");
+							const rawLine = `${guide}${glyph} agent details pending (${formatElapsed(leaseElapsed)})`;
+							return truncateToWidth(rawLine, renderWidth);
+						}
+
+						const glyph = glyphForState(nestedChild.state, rowTheme);
+						let role = nestedChild.agent;
+						if (nestedChild.assignment !== undefined) {
+							role = `${nestedChild.assignment} ${nestedChild.agent}`;
+						} else if (nestedChild.role !== undefined) {
+							role = `${nestedChild.role} ${nestedChild.agent}`;
+						}
+
+						const costToken = formatCost(nestedChild.usage?.cost);
+						const costSuffix = costToken !== undefined ? ` ${costToken}` : "";
+						let durationStr = "";
+						let detail = "";
+						if (nestedChild.state === "queued") {
+							const createdMs = Date.parse(nestedChild.updatedAt);
+							const elapsed = !Number.isNaN(createdMs) ? Math.max(0, nowMs - createdMs) : 0;
+							durationStr = `queued ${formatElapsed(elapsed)}`;
+							const detailText = nestedChildDetail(nestedChild);
+							if (detailText.length > 0) {
+								detail = ` ${detailText}`;
+							}
+						} else if (nestedChild.state === "running") {
+							const startedMs = nestedChild.startedAt !== undefined ? Date.parse(nestedChild.startedAt) : Date.parse(nestedChild.updatedAt);
+							const elapsed = !Number.isNaN(startedMs) ? Math.max(0, nowMs - startedMs) : 0;
+							durationStr = formatElapsed(elapsed);
+							let staleTag = "";
+							if (nestedChild.stale) {
+								const staleMs = Date.parse(nestedChild.updatedAt);
+								const staleElapsed = !Number.isNaN(staleMs) ? Math.max(0, nowMs - staleMs) : 0;
+								staleTag = ` ${rowTheme.fg("dim", `stale ${formatElapsed(staleElapsed)}`)}`;
+							}
+							const detailText = nestedChildDetail(nestedChild);
+							detail = `${staleTag}${detailText.length > 0 ? ` — ${detailText}` : ""}`;
+						} else if (nestedChild.state === "skipped") {
+							durationStr = "skipped";
+							const detailText = nestedChildDetail(nestedChild);
+							if (detailText.length > 0) {
+								detail = ` ${detailText}`;
+							}
+						} else {
+							const startedMs = nestedChild.startedAt !== undefined ? Date.parse(nestedChild.startedAt) : Date.parse(nestedChild.updatedAt);
+							const endedMs = Date.parse(nestedChild.endedAt ?? nestedChild.updatedAt);
+							const duration = Number.isNaN(startedMs) || Number.isNaN(endedMs) ? 0 : Math.max(0, endedMs - startedMs);
+							const durationFormatted = `(${formatElapsed(duration)})`;
+							durationStr = nestedChild.state === "failed"
+								? `${durationFormatted} failed`
+								: nestedChild.state === "cancelled"
+									? `${durationFormatted} cancelled`
+									: durationFormatted;
+							const detailText = nestedChildDetail(nestedChild);
+							detail = detailText.length > 0 ? ` — ${detailText}` : "";
+						}
+
+						const rawLine = `${guide}${glyph} ${role} ${durationStr}${costSuffix}${detail}`;
+						return truncateToWidth(rawLine, renderWidth);
+					},
+				});
+			}
 		}
 	}
 
@@ -1593,7 +1796,10 @@ export function renderTreeLines(snapshot: TreeSnapshot, opts: RenderTreeOptions)
 					lines.push(truncateToWidth(`    ${theme.fg("dim", "•")} ${act}`, width));
 				}
 			}
-			for (const n of child.nested) {
+			const nestedChildren = child.nested.length > 0
+				? child.nested
+				: child.nestedGroups.flatMap((group) => group.children);
+			for (const n of nestedChildren) {
 				if (!isLeaseSnapshot(n) && n.state === "running" && n.journal && n.journal.length > 0) {
 					const recent = formatRecentActivity(n.journal);
 					for (const act of recent) {

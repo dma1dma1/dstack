@@ -67,7 +67,7 @@ test("boundedTailRead reads bounded bytes from end of file without throwing", as
 	assert.equal(readTail.content, line100.slice(line100.length - 50));
 });
 
-test("listSessionWorkflows enumerates session workflows, maps bindings, and sorts newest first", async (t) => {
+test("listSessionWorkflows enumerates session workflows, maps bindings, and sorts oldest first", async (t) => {
 	const home = await temporaryDirectory(t);
 	const previousHome = process.env.HOME;
 	process.env.HOME = home;
@@ -124,11 +124,8 @@ test("listSessionWorkflows enumerates session workflows, maps bindings, and sort
 
 	const list = await listSessionWorkflows(sessionId);
 	assert.equal(list.length, 3);
-	assert.equal(list[0]?.workflowId, "wf-newer");
-	assert.equal(list[0]?.taskId, "task-newer");
-	assert.equal(list[0]?.committed, false);
-	assert.equal(list[0]?.playbook, "explore");
-	assert.equal(list[0]?.unreadable, false);
+	assert.equal(list[0]?.workflowId, "wf-corrupt");
+	assert.equal(list[0]?.unreadable, true);
 
 	assert.equal(list[1]?.workflowId, "wf-older");
 	assert.equal(list[1]?.taskId, "task-older");
@@ -136,8 +133,11 @@ test("listSessionWorkflows enumerates session workflows, maps bindings, and sort
 	assert.equal(list[1]?.playbook, "feature");
 	assert.equal(list[1]?.unreadable, false);
 
-	assert.equal(list[2]?.workflowId, "wf-corrupt");
-	assert.equal(list[2]?.unreadable, true);
+	assert.equal(list[2]?.workflowId, "wf-newer");
+	assert.equal(list[2]?.taskId, "task-newer");
+	assert.equal(list[2]?.committed, false);
+	assert.equal(list[2]?.playbook, "explore");
+	assert.equal(list[2]?.unreadable, false);
 });
 
 test("readChildResultDetails and readChildActivityDetails parse usage telemetry", async (t) => {
@@ -220,10 +220,10 @@ test("renderAmbientWidgetLine renders concise one-line indicators for running an
 		counts: { queued: 1, running: 2, complete: 1, total: 4 },
 		slots: { active: 2, capacity: 4 },
 		children: [
-			{ index: 0, agent: "poteto-agent", state: "running", taskPreview: "plan", nested: [] },
-			{ index: 1, agent: "general-purpose", state: "running", taskPreview: "code", nested: [] },
-			{ index: 2, agent: "general-purpose", state: "queued", taskPreview: "test", nested: [] },
-			{ index: 3, agent: "general-purpose", state: "succeeded", taskPreview: "init", nested: [] },
+			{ index: 0, agent: "poteto-agent", state: "running", taskPreview: "plan", nestedGroups: [], nested: [] },
+			{ index: 1, agent: "general-purpose", state: "running", taskPreview: "code", nestedGroups: [], nested: [] },
+			{ index: 2, agent: "general-purpose", state: "queued", taskPreview: "test", nestedGroups: [], nested: [] },
+			{ index: 3, agent: "general-purpose", state: "succeeded", taskPreview: "init", nestedGroups: [], nested: [] },
 		],
 		todos: [],
 		todoCounts: { total: 0, completed: 0, inProgress: 0 },
@@ -242,10 +242,10 @@ test("renderAmbientWidgetLine renders concise one-line indicators for running an
 		committed: true,
 		counts: { queued: 0, running: 0, complete: 4, total: 4 },
 		children: [
-			{ index: 0, agent: "poteto-agent", state: "succeeded", taskPreview: "plan", nested: [] },
-			{ index: 1, agent: "general-purpose", state: "succeeded", taskPreview: "code", nested: [] },
-			{ index: 2, agent: "general-purpose", state: "succeeded", taskPreview: "test", nested: [] },
-			{ index: 3, agent: "general-purpose", state: "succeeded", taskPreview: "init", nested: [] },
+			{ index: 0, agent: "poteto-agent", state: "succeeded", taskPreview: "plan", nestedGroups: [], nested: [] },
+			{ index: 1, agent: "general-purpose", state: "succeeded", taskPreview: "code", nestedGroups: [], nested: [] },
+			{ index: 2, agent: "general-purpose", state: "succeeded", taskPreview: "test", nestedGroups: [], nested: [] },
+			{ index: 3, agent: "general-purpose", state: "succeeded", taskPreview: "init", nestedGroups: [], nested: [] },
 		],
 	};
 
@@ -267,7 +267,7 @@ test("renderAmbientWidgetLine reports session-wide active workflow count when mu
 		counts: { queued: 0, running: 1, complete: 0, total: 1 },
 		slots: { active: 3, capacity: 4 },
 		children: [
-			{ index: 0, agent: "poteto-agent", state: "running", taskPreview: "fix bug", nested: [] },
+			{ index: 0, agent: "poteto-agent", state: "running", taskPreview: "fix bug", nestedGroups: [], nested: [] },
 		],
 		todos: [],
 		todoCounts: { total: 0, completed: 0, inProgress: 0 },
@@ -309,7 +309,7 @@ test("renderAmbientWidgetLine hides a committed tracked workflow while another w
 		counts: { queued: 0, running: 0, complete: 1, total: 1 },
 		slots: { active: 1, capacity: 4 },
 		children: [
-			{ index: 0, agent: "poteto-agent", state: "succeeded", taskPreview: "fix bug", nested: [] },
+			{ index: 0, agent: "poteto-agent", state: "succeeded", taskPreview: "fix bug", nestedGroups: [], nested: [] },
 		],
 		todos: [],
 		todoCounts: { total: 0, completed: 0, inProgress: 0 },
@@ -361,7 +361,7 @@ test("AgentInspector subtitle uses shared scheduler slot count when multiple act
 		counts: { queued: 0, running: 1, complete: 0, total: 1 },
 		slots: { active: 3, capacity: 4 },
 		children: [
-			{ index: 0, agent: "poteto-agent", state: "running", role: "feature", assignment: "owner", taskPreview: "owner 1", nested: [] },
+			{ index: 0, agent: "poteto-agent", state: "running", role: "feature", assignment: "owner", taskPreview: "owner 1", nestedGroups: [], nested: [] },
 		],
 		todos: [],
 		todoCounts: { total: 0, completed: 0, inProgress: 0 },
@@ -378,7 +378,7 @@ test("AgentInspector subtitle uses shared scheduler slot count when multiple act
 		counts: { queued: 0, running: 1, complete: 0, total: 1 },
 		slots: { active: 3, capacity: 4 },
 		children: [
-			{ index: 0, agent: "poteto-agent", state: "running", role: "bug-fix", assignment: "owner", taskPreview: "owner 2", nested: [] },
+			{ index: 0, agent: "poteto-agent", state: "running", role: "bug-fix", assignment: "owner", taskPreview: "owner 2", nestedGroups: [], nested: [] },
 		],
 		todos: [],
 		todoCounts: { total: 0, completed: 0, inProgress: 0 },
@@ -454,6 +454,28 @@ test("AgentInspector component navigation: list -> drill-down -> nested drill-do
 				taskFull: "build inspector with clean frames",
 				startedAt: "2025-01-01T00:00:10.000Z",
 				activity: { text: "writing component", updatedAt: "2025-01-01T00:01:00.000Z" },
+				nestedGroups: [
+					{
+						groupId: "nested-grp-1",
+						mode: "single",
+						createdAt: "2025-01-01T00:00:20.000Z",
+						children: [
+							{
+								groupId: "nested-grp-1",
+								nestedIndex: 0,
+								agent: "general-purpose",
+								role: "worker",
+								assignment: "worker",
+								taskPreview: "nested worker job",
+								state: "running",
+								activity: "compiling",
+								startedAt: "2025-01-01T00:00:20.000Z",
+								updatedAt: "2025-01-01T00:01:00.000Z",
+								live: true,
+							},
+						],
+					},
+				],
 				nested: [
 					{
 						groupId: "nested-grp-1",
@@ -582,6 +604,7 @@ test("AgentInspector history toggle and empty states", async () => {
 				startedAt: "2025-01-01T00:00:00.000Z",
 				endedAt: "2025-01-01T00:04:00.000Z",
 				outcome: "all steps finished",
+				nestedGroups: [],
 				nested: [],
 			},
 		],
@@ -646,6 +669,7 @@ test("AgentInspector stale state and explicit raw output tail scrolling behavior
 				stale: true,
 				startedAt: "2025-01-01T00:00:00.000Z",
 				activity: { text: "last saw progress 10m ago", updatedAt: "2025-01-01T00:01:00.000Z" },
+				nestedGroups: [],
 				nested: [],
 			},
 		],
@@ -722,6 +746,7 @@ test("AgentInspector task view displays full multiline task with vertical scroll
 				taskPreview: "Step 1: Investigate...",
 				taskFull: multilineTask,
 				startedAt: "2025-01-01T00:00:00.000Z",
+				nestedGroups: [],
 				nested: [],
 			},
 		],
@@ -788,6 +813,7 @@ test("AgentInspector final response view renders free-form text with labeled env
 				taskPreview: "run task",
 				startedAt: "2025-01-01T00:00:00.000Z",
 				endedAt: "2025-01-01T00:02:00.000Z",
+				nestedGroups: [],
 				nested: [],
 			},
 		],
@@ -904,6 +930,14 @@ test("AgentInspector depth-2 agent parity in views, labeled fields, and unavaila
 				assignment: "owner",
 				taskPreview: "parent owner",
 				startedAt: "2025-01-01T00:00:00.000Z",
+				nestedGroups: [
+					{
+						groupId: "grp-nested-parity",
+						mode: "single",
+						createdAt: "2025-01-01T00:00:00.000Z",
+						children: [nestedChild],
+					},
+				],
 				nested: [nestedChild],
 			},
 		],
@@ -1146,6 +1180,7 @@ test("AgentInspector summary view bounds viewport, shows line-range indicator, a
 						{ name: "plan-doc", path: "/tmp/plan.md" },
 					],
 				},
+				nestedGroups: [],
 				nested: [],
 			},
 		],
@@ -1322,6 +1357,7 @@ test("AgentInspector freezes committed workflow elapsed time using child end tim
 				taskPreview: "done task",
 				startedAt: "2025-01-01T00:00:00.000Z",
 				endedAt: "2025-01-01T00:03:00.000Z",
+				nestedGroups: [],
 				nested: [],
 			},
 		],
@@ -1421,6 +1457,14 @@ test("AgentInspector renders inherited model for running depth-2 child", async (
 				assignment: "owner",
 				taskPreview: "parent owner",
 				startedAt: "2025-01-01T00:00:00.000Z",
+				nestedGroups: [
+					{
+						groupId: "grp-running",
+						mode: "single",
+						createdAt: "2025-01-01T00:00:10.000Z",
+						children: [runningNested],
+					},
+				],
 				nested: [runningNested],
 			},
 		],
@@ -1495,6 +1539,14 @@ test("AgentInspector renders child-reported model for completed depth-2 child in
 				assignment: "owner",
 				taskPreview: "parent owner",
 				startedAt: "2025-01-01T00:00:00.000Z",
+				nestedGroups: [
+					{
+						groupId: "grp-completed",
+						mode: "single",
+						createdAt: "2025-01-01T00:00:10.000Z",
+						children: [completedNested],
+					},
+				],
 				nested: [completedNested],
 			},
 		],
@@ -1796,6 +1848,7 @@ test("AgentInspector grows frame and view budgets on tall viewports", async () =
 				taskPreview: "tall viewport task",
 				assignment: "owner",
 				phase: "implement",
+				nestedGroups: [],
 				nested: [],
 			},
 		],
@@ -1865,6 +1918,7 @@ test("AgentInspector bounds frame and preserves borders, footer, and scrolling o
 		taskPreview: `step ${i + 1} task preview description`,
 		assignment: "worker" as const,
 		phase: `phase-${i + 1}`,
+		nestedGroups: [],
 		nested: [],
 	}));
 
@@ -1971,6 +2025,7 @@ test("AgentInspector calculates Final view row budget with fully populated envel
 				taskPreview: "task preview",
 				assignment: "owner",
 				phase: "implement",
+				nestedGroups: [],
 				nested: [],
 			},
 		],
@@ -2059,6 +2114,152 @@ test("AgentInspector calculates Final view row budget with fully populated envel
 	assert.ok(tallLines[50]?.includes("lines 1-20 of 20"));
 	assert.ok(tallLines.some((l) => l.includes("Final response paragraph line 1")));
 	assert.ok(tallLines.some((l) => l.includes("Final response paragraph line 20")));
+
+	inspector.dispose();
+});
+
+test("AgentInspector renders visual group rows, plain chronological direction copy, and failure diagnostics", async () => {
+	const tui = { requestRender: () => {} };
+	const done = () => {};
+
+	const snapshot: TreeSnapshot = {
+		taskId: "task-inspector-groups",
+		workflowId: "wf-inspector-groups",
+		mode: "single",
+		playbook: "feature",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		committed: false,
+		counts: { queued: 0, running: 1, complete: 2, total: 3 },
+		slots: { active: 1, capacity: 4 },
+		capturedAt: "2025-01-01T00:06:00.000Z",
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		children: [
+			{
+				index: 0,
+				agent: "poteto-agent",
+				state: "running",
+				assignment: "owner",
+				taskPreview: "orchestrate feature",
+				startedAt: "2025-01-01T00:00:05.000Z",
+				nestedGroups: [
+					{
+						groupId: "grp-1-parallel",
+						mode: "parallel",
+						phase: "grounding",
+						createdAt: "2025-01-01T00:01:00.000Z",
+						children: [
+							{
+								groupId: "grp-1-parallel",
+								nestedIndex: 0,
+								agent: "general-purpose",
+								role: "worker",
+								taskPreview: "explore code",
+								state: "succeeded",
+								startedAt: "2025-01-01T00:01:05.000Z",
+								endedAt: "2025-01-01T00:02:00.000Z",
+								updatedAt: "2025-01-01T00:02:00.000Z",
+								live: false,
+							},
+							{
+								groupId: "grp-1-parallel",
+								nestedIndex: 1,
+								agent: "missing-worker",
+								taskPreview: "should be ignored",
+								state: "failed",
+								errorMessage: "Unknown agent \"missing-worker\". Must be poteto-agent, general-purpose, or comment-sicko.",
+								startedAt: "2025-01-01T00:01:05.000Z",
+								endedAt: "2025-01-01T00:01:10.000Z",
+								updatedAt: "2025-01-01T00:01:10.000Z",
+								live: false,
+							},
+						],
+					},
+					{
+						groupId: "grp-2-sequence",
+						mode: "chain",
+						phase: "implementation",
+						createdAt: "2025-01-01T00:03:00.000Z",
+						children: [
+							{
+								groupId: "grp-2-sequence",
+								nestedIndex: 0,
+								agent: "general-purpose",
+								role: "worker",
+								taskPreview: "step 1",
+								state: "succeeded",
+								startedAt: "2025-01-01T00:03:05.000Z",
+								endedAt: "2025-01-01T00:04:00.000Z",
+								updatedAt: "2025-01-01T00:04:00.000Z",
+								live: false,
+							},
+							{
+								groupId: "grp-2-sequence",
+								nestedIndex: 1,
+								agent: "general-purpose",
+								role: "worker",
+								taskPreview: "step 2",
+								state: "running",
+								activity: "running tests",
+								startedAt: "2025-01-01T00:04:05.000Z",
+								updatedAt: "2025-01-01T00:05:00.000Z",
+								live: true,
+							},
+						],
+					},
+				],
+				nested: [],
+			},
+		],
+	};
+
+	const workflows: WorkflowSummary[] = [
+		{
+			workflowId: "wf-inspector-groups",
+			taskId: "task-inspector-groups",
+			artifactDir: "/tmp/wf-inspector-groups",
+			schedulerRoot: "/tmp/scheduler",
+			committed: false,
+			createdAt: "2025-01-01T00:00:00.000Z",
+			playbook: "feature",
+			unreadable: false,
+		},
+	];
+
+	const inspector = new AgentInspector(tui, plainTheme(), done, {
+		sessionId: "test-sess",
+		listWorkflows: async () => workflows,
+		getSnapshot: async () => snapshot,
+		readOutputTail: async () => ({ content: "", truncated: false, bytesRead: 0, totalBytes: 0 }),
+		now: () => new Date("2025-01-01T00:06:00.000Z"),
+	});
+
+	await new Promise((r) => setTimeout(r, 20));
+
+	const listLines = inspector.render(120);
+
+	assert.ok(listLines.some((l) => l.includes("oldest at top · newest at bottom")), "subtitle states chronological direction");
+
+	assert.ok(listLines.some((l) => l.includes("├─ parallel · 2 agents · phase grounding")), "parallel group row rendered");
+	assert.ok(listLines.some((l) => l.includes("│  ├─ ✓ worker general-purpose")), "parallel child 1 indented under group");
+	assert.ok(listLines.some((l) => l.includes("│  └─ ✗ missing-worker")), "parallel child 2 indented under group");
+
+	assert.ok(listLines.some((l) => l.includes("└─ sequence · 2 steps · phase implementation")), "sequence group row rendered");
+	assert.ok(listLines.some((l) => l.includes("   ├─ ✓ worker general-purpose")), "sequence step 1 indented under group");
+	assert.ok(listLines.some((l) => l.includes("   └─ ◐ worker general-purpose")), "sequence step 2 indented under group");
+
+	assert.ok(
+		listLines.some((l) => l.includes("Unknown agent \"missing-worker\"")),
+		"failed nested row in list shows errorMessage instead of taskPreview",
+	);
+
+	inspector.handleInput("\x1b[B");
+	inspector.handleInput("\x1b[B");
+	inspector.handleInput("\r");
+	await new Promise((r) => setTimeout(r, 20));
+
+	const detailLines = inspector.render(120);
+	assert.ok(detailLines.some((l) => l.includes("nested agent: general-purpose (depth 2)")));
 
 	inspector.dispose();
 });
@@ -2153,6 +2354,7 @@ test("AgentInspector displays Recent Activity and Semantic Status for running de
 					updatedAt: "2025-01-01T00:02:00.000Z",
 				},
 				stale: true,
+				nestedGroups: [],
 				nested: [
 					{
 						groupId: "nested-grp-1",
@@ -2247,6 +2449,7 @@ test("AgentInspector does not display Recent Activity for completed agents to pr
 					{ seq: 2, timestamp: "2025-01-01T00:00:30.000Z", kind: "tool", name: "write", gist: "out.txt" },
 					{ seq: 3, timestamp: "2025-01-01T00:01:00.000Z", kind: "exit", exitCode: 0 },
 				],
+				nestedGroups: [],
 				nested: [],
 			},
 		],

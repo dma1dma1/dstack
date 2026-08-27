@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, realpath } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { AgentConfig } from "../agents.ts";
@@ -52,8 +52,12 @@ export type BackgroundReceipt = Readonly<{
 	resultTool: "dstack_result";
 }>;
 
+export function backgroundRoot(): string {
+	return join(homedir(), ".pi", "agent", "dstack", "background");
+}
+
 export function sessionRoot(sessionId: string): string {
-	return join(homedir(), ".pi", "agent", "dstack", "background", encodeURIComponent(sessionId));
+	return join(backgroundRoot(), encodeURIComponent(sessionId));
 }
 
 function bindingPath(root: string, taskId: string): string {
@@ -169,26 +173,58 @@ export async function launchTaskGroup(input: Readonly<{
 	return { taskId: task.id, workflowId, mode: input.request.kind, childCount: specs.length, resultTool: "dstack_result" };
 }
 
+function hasErrorCode(error: unknown, code: string): boolean {
+	return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === code;
+}
+
 export function createTaskResultFiles(sessionId: string): Readonly<{
 	readBinding: (taskId: string) => Promise<TaskBinding | undefined>;
 	readProgress: (binding: TaskBinding) => Promise<WorkflowProgress>;
 	readCommittedResult: (binding: TaskBinding) => Promise<CommittedResult | undefined>;
 	claimUsage: (binding: TaskBinding) => Promise<boolean>;
 }> {
-	const root = sessionRoot(sessionId);
-	const workflowDir = (binding: TaskBinding) => join(root, "workflows", binding.workflowId);
+	const currentRoot = sessionRoot(sessionId);
+	const bgRoot = backgroundRoot();
+	const workflowDir = (binding: TaskBinding) => join(binding.root ?? currentRoot, "workflows", binding.workflowId);
 	return {
 		async readBinding(taskId) {
+			const encodedFileName = `${encodeURIComponent(taskId)}.json`;
+
 			try {
-				const value: unknown = JSON.parse(await readFile(bindingPath(root, taskId), "utf8"));
-				if (typeof value !== "object" || value === null || !("taskId" in value) || !("workflowId" in value)) return undefined;
-				return typeof value.taskId === "string" && typeof value.workflowId === "string"
-					? { taskId: value.taskId, workflowId: value.workflowId }
-					: undefined;
+				const content = await readFile(join(currentRoot, "bindings", encodedFileName), "utf8");
+				const value: unknown = JSON.parse(content);
+				if (typeof value === "object" && value !== null && "taskId" in value && "workflowId" in value) {
+					if (typeof value.taskId === "string" && typeof value.workflowId === "string" && value.taskId === taskId) {
+						return { taskId: value.taskId, workflowId: value.workflowId, root: currentRoot };
+					}
+				}
 			} catch (error) {
-				if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return undefined;
-				throw error;
+				if (!hasErrorCode(error, "ENOENT")) throw error;
 			}
+
+			try {
+				const entries = await readdir(bgRoot, { withFileTypes: true });
+				for (const entry of entries) {
+					if (!entry.isDirectory()) continue;
+					const sessDir = join(bgRoot, entry.name);
+					if (sessDir === currentRoot) continue;
+					try {
+						const content = await readFile(join(sessDir, "bindings", encodedFileName), "utf8");
+						const value: unknown = JSON.parse(content);
+						if (typeof value === "object" && value !== null && "taskId" in value && "workflowId" in value) {
+							if (typeof value.taskId === "string" && typeof value.workflowId === "string" && value.taskId === taskId) {
+								return { taskId: value.taskId, workflowId: value.workflowId, root: sessDir };
+							}
+						}
+					} catch (error) {
+						if (!hasErrorCode(error, "ENOENT")) throw error;
+					}
+				}
+			} catch (error) {
+				if (!hasErrorCode(error, "ENOENT")) throw error;
+			}
+
+			return undefined;
 		},
 		async readProgress(binding) {
 			const dir = workflowDir(binding);
