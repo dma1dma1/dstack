@@ -8,8 +8,8 @@ Be scientific. Every shipped line traces to runtime evidence. Belt-and-suspender
 2. Binary-search the cause. Form the candidate hypotheses, then rule them out until one survives. Seed them with `how` over the affected subsystem and the **why** skill for regression history. Each pass, take the split that cuts the most remaining problem space, get runtime evidence, eliminate. When program state is unclear, add instrumentation or logging and read it as the code runs. Don't guess. Drive a long or stubborn hunt with the host wake companion if it is installed. Confirm the surviving *mechanism* with runtime evidence before planning the fix.
 3. Plan the smallest fix the evidence supports. Use Architect only if the confirmed mechanism leaves a consequential unresolved structural choice. Delegate implementation with a specific scope and structured workflow metadata, including artifact paths when they exist. Review the combined diff yourself.
 4. Verify on the same surface; the original repro now passes. "Inconclusive" or wrong-surface is not a pass; flag it. Unit tests show branch behavior, not bug absence.
-5. Stage the commits so the failing repro lands before the fix in git history; the diff tells the story. See the **tdd** skill for the failing-test-first cadence when the bug has a cheap local test path; skip it when the test would be expensive, integration-heavy, or unclear.
-   This is the canonical **sequence-verifiable-units** principle skill, the failing test first and the fix on top.
+5. Preserve failing-before and passing-after evidence. If a new test independently clears **Test restraint**, stage it before the fix so the history shows red then green. Otherwise keep the reproduction as a one-off artifact or captured output and add no test. See the **tdd** skill for this cadence.
+   This is the canonical **sequence-verifiable-units** principle skill, the failing proof first and the fix on top.
 6. Run **Opening a PR**.
 
 Investigation fans out `how` + `why` as parallel subagents.

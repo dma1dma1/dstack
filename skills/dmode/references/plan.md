@@ -45,10 +45,10 @@ NN-slug/
 
 ### Phase sizing
 
-- One function or type plus tests, or one bug fix. Not "one file".
+- One function or type plus its verification, or one bug fix. Not "one file".
 - Two to three files touched, max.
 - Prefer eight to ten small phases over three to four large ones to preserve option value (the **foundational-thinking** principle skill).
-- Split if a phase has more than five test cases or three functions.
+- Split if a phase has more than three functions. A plan that proposes multiple new tests must justify each one independently under **Test restraint** before using them to size phases.
 
 ### Overview file
 
@@ -79,7 +79,7 @@ If a phase creates or edits a skill, the phase instructs the implementer to use 
 
 Each phase needs both:
 
-**Static.** Type check, lint, project tests pass.
+**Static.** Run the relevant existing type check, lint, and targeted tests. Do not add tests merely to satisfy this section.
 
 **Runtime.** Exercise the feature on the matching surface via the relevant control skill:
 

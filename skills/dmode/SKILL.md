@@ -138,6 +138,18 @@ Choose the role by work type, never by difficulty. Pass `model` only with a non-
 
 The owner owns every worker's work. Review the combined diff and write an original summary. Do not pass through worker output. Interrupt-chained resumes silently drop directives, so fire a fresh worker with consolidated scope rather than trusting a "done" summary.
 
+## Test restraint
+
+Persistent automated tests are production code with permanent maintenance and runtime costs. Default to no new test. An oversized suite is a severe codebase liability; unnecessary tests are more damaging than missing low-value coverage.
+
+Before writing or materially expanding each test, justify that exact test on its own. Name the behavior or regression it uniquely protects, why existing tests and cheaper checks are insufficient, the realistic failure it will catch, its maintenance and runtime cost, and why the codebase would be significantly worse without it. Proceed only with exceedingly strong conviction on every point. A generic desire for coverage, a changed codepath, uncovered lines, conventional TDD, or "this might regress" does not qualify. One test cannot borrow another test's justification.
+
+Avoid long-running tests. Add one only when the protected behavior is essential, no faster focused check can provide the signal, and the expected value clearly exceeds its ongoing cost. Prefer one narrow, high-signal test over a matrix of cases. Do not add sibling cases, snapshots, broad integration scenarios, or new harness infrastructure for completeness. Delete or consolidate redundant tests when it is safe and in scope.
+
+Verification does not imply adding a test. Prefer an existing targeted test, type checking, linting, a one-off script, a runtime reproduction, or direct inspection when that proves the change without permanently enlarging the suite. Lower-level guidance about failing-test-first, characterization pins, scaffolding, or commit sequencing is conditional on this section and cannot override it.
+
+In the final reply, list every test added or materially expanded with its individual justification. If none were added, say so and name the non-test verification used.
+
 ## Writing the reply
 
 Write the reply clean as you draft it. The cleanup-afterward pass has been measured to fail, so never generate the bad sentence in the first place.
