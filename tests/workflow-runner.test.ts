@@ -515,6 +515,7 @@ test("child execution exports index and artifact dir env vars and writes activit
 		activity: string;
 		turns: number;
 		contextTokens: number;
+		cost?: number;
 		updatedAt: string;
 	};
 
@@ -524,6 +525,7 @@ test("child execution exports index and artifact dir env vars and writes activit
 	assert.ok(activity.activity.includes("npm test") || activity.activity.includes("read"));
 	assert.ok(activity.turns >= 1);
 	assert.ok(typeof activity.updatedAt === "string");
+	assert.equal(activity.cost, 0.002);
 
 	await writeFile(join(workflow.artifactDir, "manifest.json"), JSON.stringify(workflow), "utf8");
 	const snapshot = await buildTreeSnapshot({
@@ -536,4 +538,38 @@ test("child execution exports index and artifact dir env vars and writes activit
 	assert.ok(snapshot !== undefined);
 	assert.equal(snapshot.children[0]?.state, "succeeded");
 	assert.equal(snapshot.children[0]?.outcome, "all done");
+});
+
+test("workflow execution persists child usage and buildTreeSnapshot recovers terminal cost", async (t) => {
+	const cwd = await temporaryDirectory(t);
+	const workflow = manifest({
+		artifactDir: join(cwd, "artifacts"),
+		cwd,
+		mode: "single",
+		specs: [spec(cwd, "task-with-cost")],
+	});
+
+	const index = await executeWorkflow(workflow, "d".repeat(64), new AbortController().signal, {
+		slots: createLocalSlotAcquirer(1),
+		spawnChild: async () => ({
+			text: "completed with cost",
+			exitCode: 0,
+			stderr: "",
+			messages: [],
+			usage: { input: 1000, output: 500, cacheRead: 0, cacheWrite: 0, cost: 0.084, contextTokens: 1500, turns: 3 },
+		}),
+	});
+	await commitWorkflowResult(workflow, index);
+
+	await writeFile(join(workflow.artifactDir, "manifest.json"), JSON.stringify(workflow), "utf8");
+	const snapshot = await buildTreeSnapshot({
+		taskId: "task-terminal-cost",
+		workflowId: workflow.workflowId,
+		artifactDir: workflow.artifactDir,
+		schedulerRoot: workflow.schedulerRoot,
+	});
+
+	assert.ok(snapshot !== undefined);
+	assert.equal(snapshot.children[0]?.state, "succeeded");
+	assert.equal(snapshot.children[0]?.cost, 0.084);
 });

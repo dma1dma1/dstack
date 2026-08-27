@@ -32,7 +32,7 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 1000): Promise<vo
 }
 
 function testRuntime(events: ReturnType<typeof createEventBus>) {
-	const tools = new Map<string, { execute: (...args: unknown[]) => Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown; isError?: boolean }> }>();
+	const tools = new Map<string, { execute: (...args: unknown[]) => Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown; isError?: boolean; usage?: unknown }> }>();
 	const handlers = new Map<string, (...args: unknown[]) => unknown>();
 	const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<unknown> }>();
 	const shortcuts = new Map<string, { description: string; handler: (ctx: unknown) => Promise<unknown> }>();
@@ -217,7 +217,7 @@ test("root task returns a receipt before the runner completes and dstack_result 
 			exitCode: 0,
 			stderr: "",
 			messages: [],
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			usage: { input: 10, output: 5, cacheRead: 2, cacheWrite: 1, cost: 0.025, contextTokens: 18, turns: 1 },
 		}),
 	});
 	await commitWorkflowResult(manifest, index);
@@ -229,6 +229,28 @@ test("root task returns a receipt before the runner completes and dstack_result 
 		(completed.details as { package: { results: Array<{ task: string }> } }).package.results.map((item) => item.task),
 		["first", "second"],
 	);
+	assert.deepEqual(completed.usage, {
+		input: 20,
+		output: 10,
+		cacheRead: 4,
+		cacheWrite: 2,
+		totalTokens: 36,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.05 },
+	});
+
+	const repeated = await resultTool.execute("result-repeat", { taskId: receipt.taskId }, undefined, undefined, runtime.ctx);
+	assert.equal(repeated.usage, undefined);
+
+	const reloadedRuntime = testRuntime(events);
+	await reloadedRuntime.handlers.get("session_start")?.({}, reloadedRuntime.ctx);
+	const reloadedResult = await reloadedRuntime.tools.get("dstack_result")?.execute(
+		"result-after-reload",
+		{ taskId: receipt.taskId },
+		undefined,
+		undefined,
+		reloadedRuntime.ctx,
+	);
+	assert.equal(reloadedResult?.usage, undefined);
 
 	const featureResult = await taskTool.execute(
 		"feature-call",

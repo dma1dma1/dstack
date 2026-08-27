@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, rm, writeFile, unlink, rmdir, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { StringEnum } from "@earendil-works/pi-ai";
+import { StringEnum, type Usage } from "@earendil-works/pi-ai";
 import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -55,6 +55,7 @@ import {
 	resolveAgent,
 	spawnableDepth,
 	runChildProcess,
+	sumChildUsage,
 	type ChildContentPart,
 	type ChildMessage,
 	type ChildResult,
@@ -82,7 +83,7 @@ import {
 	type JournalEntry,
 	type SemanticStatus,
 } from "./background/journal.ts";
-import { readDstackResult } from "./background/result.ts";
+import { readDstackResult, type DstackResultView } from "./background/result.ts";
 import { acquireChildSlot } from "./background/scheduler.ts";
 import { DSTACK_ARTIFACT_DIR_ENV, DSTACK_CHILD_INDEX_ENV, ROOT_WORKFLOW_ENV, SCHEDULER_ROOT_ENV } from "./background/workflow.ts";
 import { activityLines, buildTreeSnapshot, latestActivity, parseTreeSnapshot, renderTreeLines, taskPreviewOf, type SpawnChildV1, type SpawnRecordV1, type TreeSnapshot } from "./background/tree.ts";
@@ -184,8 +185,14 @@ function extensionPath(): string {
 	return join(packageRoot(), "extensions/dstack.ts");
 }
 
-function textResult(text: string, details: unknown = {}, isError = false) {
-	return { content: [{ type: "text" as const, text }], details, isError };
+function textResult(text: string, details: unknown = {}, isError = false, usage?: Usage) {
+	return { content: [{ type: "text" as const, text }], details, isError, ...(usage ? { usage } : {}) };
+}
+
+function resultUsage(result: DstackResultView): Usage | undefined {
+	if (result.kind === "complete") return sumChildUsage(result.package.results.map((child) => child.usage));
+	if (result.kind === "artifact") return result.usage;
+	return undefined;
 }
 
 type TaskUsageRow = {
@@ -1195,6 +1202,7 @@ export default function dstack(pi: ExtensionAPI) {
 										spawnChildren[index] = {
 											...existing,
 											activity: latestActivity(partialWithStatus),
+											usage: partial.usage,
 											status: updatedStatus,
 											journal: updatedJournal,
 											updatedAt: now,
@@ -1287,7 +1295,12 @@ export default function dstack(pi: ExtensionAPI) {
 									}
 								}
 								await spawnRecordWriter?.flush();
-								return textResult(`Chain stopped (${spec.agent}): ${ownerResultText(result.text)}`, ownerResultDetails(details), true);
+								return textResult(
+									`Chain stopped (${spec.agent}): ${ownerResultText(result.text)}`,
+									ownerResultDetails(details),
+									true,
+									sumChildUsage(details.results.map((child) => child.usage)),
+								);
 							}
 							previous = result.text;
 						} catch (err) {
@@ -1308,18 +1321,33 @@ export default function dstack(pi: ExtensionAPI) {
 						}
 					}
 					const last = results[results.length - 1];
-					return textResult(ownerResultText(last?.text ?? "(no output)"), ownerResultDetails(details));
+					return textResult(
+						ownerResultText(last?.text ?? "(no output)"),
+						ownerResultDetails(details),
+						false,
+						sumChildUsage(details.results.map((child) => child.usage)),
+					);
 				}
 				const results = await mapWithConcurrency(specs, MAX_CONCURRENCY, (spec, index) => runOne(spec, index));
 				if (request.kind === "single") {
 					const result = results[0];
 					if (!result) return textResult("(no output)");
-					return textResult(ownerResultText(result.text), ownerResultDetails(details), result.exitCode !== 0);
+					return textResult(
+						ownerResultText(result.text),
+						ownerResultDetails(details),
+						result.exitCode !== 0,
+						sumChildUsage(details.results.map((child) => child.usage)),
+					);
 				}
 				const text = results
 					.map((task) => `### [${task.agent}] ${task.exitCode === 0 ? "completed" : "failed"}\n\n${ownerResultText(task.text)}`)
 					.join("\n\n---\n\n");
-				return textResult(text, ownerResultDetails(details));
+				return textResult(
+					text,
+					ownerResultDetails(details),
+					false,
+					sumChildUsage(details.results.map((child) => child.usage)),
+				);
 			} catch (err) {
 				const now = new Date().toISOString();
 				for (let i = 0; i < spawnChildren.length; i++) {
@@ -1372,7 +1400,13 @@ export default function dstack(pi: ExtensionAPI) {
 				persistActiveWorkflow(undefined);
 				stopTreeTimer();
 			}
-			return textResult(JSON.stringify(result), result);
+			let usage: Usage | undefined;
+			const unreportedUsage = resultUsage(result);
+			if (unreportedUsage !== undefined) {
+				const binding = await files.readBinding(params.taskId);
+				if (binding !== undefined && await files.claimUsage(binding)) usage = unreportedUsage;
+			}
+			return textResult(JSON.stringify(result), result, false, usage);
 		},
 	});
 
