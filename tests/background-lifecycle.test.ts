@@ -205,6 +205,14 @@ test("dstack_result projects every companion and committed-result state", async 
 		sha256: toSha256("a".repeat(64)),
 		bytes: 1024,
 		summary: { total: 1, succeeded: 1, failed: 0, cancelled: 0 },
+		usage: {
+			input: 10,
+			output: 5,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 15,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.025 },
+		},
 	};
 	const cancelled: CommittedResult = { kind: "cancelled", message: "Stopped after child 1." };
 	const read = (status: "completed" | "failed" | "killed", committed?: CommittedResult) => readDstackResult({
@@ -231,6 +239,7 @@ test("dstack_result projects every companion and committed-result state", async 
 		sha256: artifact.sha256,
 		bytes: artifact.bytes,
 		summary: artifact.summary,
+		usage: artifact.usage,
 	});
 	assert.deepEqual(await read("failed"), {
 		kind: "runner_failed",
