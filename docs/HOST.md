@@ -18,7 +18,7 @@ Skills in this package talk to Pi through dstack tools. This file is the rewrite
 
 The user-facing mode command is `/dmode`. `/poteto-mode` is an alias of `/dmode`. Skills mention `/poteto-mode` only as that alias.
 
-Structured dmode launches carry `workflow` metadata with `playbook`, `assignment`, `phase`, `completedPhases`, and `artifacts`. Root launches one `poteto-agent` owner for a nontrivial request. Owners may submit repeated worker batches. Workers and reviewers are terminal, and only owners read the selected playbook. The file scheduler caps all root and nested child processes at four per session.
+Structured dmode launches carry `workflow` metadata with `playbook`, `assignment`, `phase`, `completedPhases`, and `artifacts`. Root launches one `poteto-agent` owner for a nontrivial request. Owners may submit repeated worker batches. Workers and reviewers are terminal, and only owners read the selected playbook. The file scheduler caps all root and nested child processes at the session's persisted `scheduler.totalSlots` capacity (default 8).
 
 The active workflow renders a compact one-line ambient widget above the editor while running. Use `/dagents` or `shift+up` to open the interactive agent inspector overlay for live monitoring, hierarchy drill-down, telemetry, and bounded output tails. Use `/dtree` to append a read-only snapshot card to the chat transcript, `/dtree <taskId>` to inspect older workflows, or `/dtree on` and `/dtree off` to toggle the live ambient widget. Durable workflow state lives in `progress.json`, `children/<index>/activity.json`, and `children/<index>/spawns/*.json`.
 
