@@ -15,7 +15,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "test": "node --import ./tests/test-env.mjs --experimental-strip-types --test tests/*.test.ts",
     "check-skills": "node scripts/check-forbidden.mjs && node scripts/check-skill-names.mjs",
     "typecheck": "tsc --noEmit",
     "telemetry": "node --experimental-strip-types scripts/telemetry.ts",
