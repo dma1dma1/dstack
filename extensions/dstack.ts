@@ -77,6 +77,7 @@ import {
 	formatCompletionWakePrompt,
 	formatNestedCompletionPrompt,
 	formatRunnerFailureWakePrompt,
+	claimNestedUsage,
 	formatStaleWakePrompt,
 	launchNestedTask,
 	NestedTaskRegistry,
@@ -1496,10 +1497,7 @@ export default function dstack(pi: ExtensionAPI) {
 					await awaitNestedCompletion(record.completionPromise, signal);
 				}
 				const result = projectNestedResult(record, params.detail);
-				const usage = record.status !== "running" && record.details !== undefined && !record.usageClaimed
-					? sumChildUsage(record.details.results.map((child) => child.usage))
-					: undefined;
-				if (usage !== undefined) record.usageClaimed = true;
+				const usage = claimNestedUsage(record);
 				nestedTaskRegistry.prune();
 				if (record.status !== "running") taskTerminalState = record.status === "completed" ? "completed" : "failed";
 				await publishMachineStatus();
@@ -1559,15 +1557,17 @@ export default function dstack(pi: ExtensionAPI) {
 			if (nestedTaskRegistry.has(params.taskId)) {
 				const record = nestedTaskRegistry.get(params.taskId)!;
 				if (record.status !== "running") {
+					const usage = claimNestedUsage(record);
 					const killRes: DstackKillResult = {
 						taskId: params.taskId,
 						status: "already_terminal",
 						message: "Task is already terminal.",
 					};
-					return textResult(JSON.stringify(killRes), killRes);
+					return textResult(JSON.stringify(killRes), killRes, false, usage);
 				}
 				nestedTaskRegistry.cancel(params.taskId);
 				await record.completionPromise;
+				const usage = claimNestedUsage(record);
 				taskTerminalState = "cancelled";
 				await publishMachineStatus();
 				const killRes: DstackKillResult = {
@@ -1575,7 +1575,7 @@ export default function dstack(pi: ExtensionAPI) {
 					status: "killed",
 					message: "Task cancelled successfully.",
 				};
-				return textResult(JSON.stringify(killRes), killRes);
+				return textResult(JSON.stringify(killRes), killRes, false, usage);
 			}
 
 			let parentDepth: ReturnType<typeof spawnableDepth>;

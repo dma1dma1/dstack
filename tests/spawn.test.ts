@@ -22,6 +22,7 @@ import {
 	type ChildResult,
 } from "../extensions/spawn.ts";
 import { MAX_CONCURRENCY, MAX_PARALLEL_TASKS, NESTING_ENV } from "../extensions/types.ts";
+import { claimNestedUsage, type NestedTaskRecord } from "../extensions/task-registry.ts";
 
 const extensionPath = "/opt/dstack/extensions/dstack.ts";
 
@@ -366,6 +367,50 @@ test("sumChildUsage sums token fields and total cost", () => {
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 1.75 },
 		},
 	);
+});
+
+test("claimNestedUsage transfers terminal cancelled child usage once and repeated claims return none", () => {
+	const record: NestedTaskRecord = {
+		taskId: "nested-task-test",
+		groupId: "g-1",
+		mode: "single",
+		createdAt: new Date().toISOString(),
+		abortController: new AbortController(),
+		children: [],
+		status: "cancelled",
+		readCount: 0,
+		usageClaimed: false,
+		completionPromise: Promise.resolve({ mode: "single", results: [] }),
+		details: {
+			mode: "single",
+			results: [
+				{
+					agent: "general-purpose",
+					cwd: "/tmp",
+					task: "cancelled worker",
+					text: "partial output",
+					exitCode: 1,
+					stderr: "aborted",
+					messages: [],
+					usage: { input: 120, output: 45, cacheRead: 10, cacheWrite: 5, cost: 0.0035, contextTokens: 500, turns: 2 },
+				},
+			],
+		},
+	};
+
+	const firstClaim = claimNestedUsage(record);
+	assert.deepEqual(firstClaim, {
+		input: 120,
+		output: 45,
+		cacheRead: 10,
+		cacheWrite: 5,
+		totalTokens: 180,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.0035 },
+	});
+	assert.equal(record.usageClaimed, true);
+
+	const secondClaim = claimNestedUsage(record);
+	assert.equal(secondClaim, undefined);
 });
 
 test("child usage reports model, tokens, context, turns, and cost", () => {

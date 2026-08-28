@@ -1,3 +1,4 @@
+import type { Usage } from "@earendil-works/pi-ai";
 import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, rm, unlink, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -13,6 +14,7 @@ import {
 	MAX_CONCURRENCY,
 	resolveAgent,
 	runChildProcess,
+	sumChildUsage,
 } from "./spawn.ts";
 import { formatConfigError, resolveModel, resolveNestedLaunchModel } from "./models.ts";
 import { createWorktree } from "./worktree.ts";
@@ -438,6 +440,15 @@ export function projectNestedResult(record: NestedTaskRecord, detail: "summary" 
 		taskId: record.taskId,
 		message: `Nested task ${record.taskId} is in an unexpected state.`,
 	};
+}
+
+export function claimNestedUsage(record: NestedTaskRecord): Usage | undefined {
+	if (record.status === "running" || record.details === undefined || record.usageClaimed) {
+		return undefined;
+	}
+	const usage = sumChildUsage(record.details.results.map((child) => child.usage));
+	if (usage !== undefined) record.usageClaimed = true;
+	return usage;
 }
 
 export function launchNestedTask(options: {
