@@ -10,6 +10,7 @@ Skills in this package talk to Pi through dstack tools. This file is the rewrite
 | `dstack_result` | Nonblocking bounded summary after the normal completion notification. Full detail is opt-in. |
 | `dstack_todo` | First-party todos, or `@juicesharp/rpiv-todo` if that package is already loaded. |
 | `dstack_ask` | Typed options via `ctx.ui.select` / `ctx.ui.confirm`. |
+| `dstack_status` | Child progress with optional phase, note, blocking flag, and typed blocker. |
 | `dstack_sessions` | `SessionManager.list(cwd)`. Do not glob session dirs. |
 | `dstack_config` | Read and write `~/.pi/agent/dstack/models.json`. |
 
@@ -25,6 +26,88 @@ The active workflow renders a compact one-line ambient widget above the editor w
 
 ```bash
 pi -ne -e ./extensions/dstack.ts --session <session-id>
+```
+
+## Machine-readable session status
+
+Each loaded dstack session atomically replaces one JSON file:
+
+```text
+~/.pi/agent/dstack/status/<base64url-encoded-UTF-8-session-id>.json
+```
+
+The filename encoding has no padding. The file mode is `0600`; parent directories use `0700`. `schemaVersion` versions the public contract. All timestamp fields are ISO 8601 strings.
+
+```ts
+type DstackStatusSnapshot = {
+  schemaVersion: "dstack.status.v1";
+  sessionId: string;
+  process: {
+    pid: number;
+    startedAt: string;
+    hostname: string;
+    cwd: string;
+    execPath: string;
+  };
+  heartbeat: {
+    updatedAt: string;
+    intervalMs: number;
+  };
+  rollup:
+    | "working"
+    | "waiting_on_input"
+    | "waiting_on_approval"
+    | "idle"
+    | "completed"
+    | "failed";
+  root: {
+    state: "working" | "idle";
+    status?: {
+      phase?: string;
+      note?: string;
+      blocking?: boolean;
+      blockedOn?: "human" | "approval" | "dependency" | "external";
+      updatedAt: string;
+    };
+  };
+  task?: StatusTask;
+  shutdown?: {
+    clean: true;
+    at: string;
+  };
+};
+
+type StatusTask = {
+  id: string;
+  kind: "workflow" | "agent";
+  state: "queued" | "working" | "completed" | "failed" | "cancelled";
+  summary: string;
+  phase?: string;
+  status?: {
+    phase?: string;
+    note?: string;
+    blocking?: boolean;
+    blockedOn?: "human" | "approval" | "dependency" | "external";
+    updatedAt: string;
+  };
+  children: StatusTask[];
+};
+```
+
+`blockedOn: "human"` maps to `waiting_on_input`. `blockedOn: "approval"` maps to `waiting_on_approval`. The reducer checks the root and every task descendant. Dependency and external blockers remain visible without changing the rollup. Task children include nested agents when the workflow tree has them.
+
+A heartbeat is stale only when `now > updatedAt + (2 * intervalMs)`. A session is crashed only when its heartbeat is stale, no clean `shutdown` marker exists, and the recorded process identity is no longer alive. Readers should treat a reused PID whose process start time does not match `process.startedAt` as a dead recorded identity. `classifyDstackStatus` in `extensions/status.ts` implements this rule after the reader supplies the process-liveness result. A clean shutdown always classifies as `shutdown`; dstack writes a final `idle` snapshot and stops its heartbeat timer.
+
+Set `DSTACK_STATUS_NOTIFY_COMMAND` to an executable path to receive rollup transitions. Dstack executes the path directly with no shell and no arguments. It writes the complete snapshot JSON to stdin. The first snapshot counts as a transition from no prior rollup. Heartbeats and other writes with the same rollup do not invoke the command.
+
+This macOS example prints a compact view whenever any session snapshot changes:
+
+```bash
+status_dir="$HOME/.pi/agent/dstack/status"
+mkdir -p "$status_dir"
+fswatch -0 "$status_dir" | while IFS= read -r -d '' file; do
+  jq '{sessionId, rollup, heartbeat, pid: .process.pid, task}' "$file"
+done
 ```
 
 ## Rewrite map
