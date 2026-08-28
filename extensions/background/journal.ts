@@ -32,6 +32,11 @@ export type SpawnJournalEntry = Readonly<{
 	step?: number;
 }>;
 
+export type ToolJournalResult = Readonly<{
+	status: "succeeded" | "failed";
+	summary?: string;
+}>;
+
 export type ToolJournalEntry = Readonly<{
 	seq: number;
 	timestamp: string;
@@ -39,6 +44,23 @@ export type ToolJournalEntry = Readonly<{
 	name: string;
 	gist: string;
 	durationMs?: number;
+	result?: ToolJournalResult;
+}>;
+
+export type ToolActivityItem = Readonly<{
+	seq: number;
+	timestamp: string;
+	name: string;
+	intent: string;
+	gist: string;
+	durationMs?: number;
+	result?: ToolJournalResult;
+}>;
+
+export type ToolActivityGroup = Readonly<{
+	phase?: string;
+	note?: string;
+	items: readonly ToolActivityItem[];
 }>;
 
 export type TurnJournalEntry = Readonly<{
@@ -246,6 +268,15 @@ export function parseJournalEntry(raw: unknown): JournalEntry | undefined {
 			const durationMs = typeof raw["durationMs"] === "number" && Number.isFinite(raw["durationMs"]) && raw["durationMs"] >= 0
 				? raw["durationMs"]
 				: undefined;
+			const rawResult = isRecord(raw["result"]) ? raw["result"] : undefined;
+			const result: ToolJournalResult | undefined = rawResult !== undefined && (rawResult["status"] === "succeeded" || rawResult["status"] === "failed")
+				? {
+						status: rawResult["status"],
+						...(typeof rawResult["summary"] === "string"
+							? { summary: sanitizeString(rawResult["summary"], 120) }
+							: {}),
+					}
+				: undefined;
 			return {
 				seq,
 				timestamp,
@@ -253,6 +284,7 @@ export function parseJournalEntry(raw: unknown): JournalEntry | undefined {
 				name: raw["name"],
 				gist: raw["gist"],
 				...(durationMs !== undefined ? { durationMs } : {}),
+				...(result !== undefined ? { result } : {}),
 			};
 		}
 		case "turn": {
@@ -420,6 +452,71 @@ export function sanitizeTurnSummary(text: string, maxLen = MAX_TURN_SUMMARY_CHAR
 	return sanitizeString(firstLine, maxLen);
 }
 
+export function toolIntent(name: string, gist: string): string {
+	const normalized = name.toLowerCase();
+	if (normalized === "read") return "Inspect";
+	if (normalized === "grep" || normalized === "rg" || normalized === "find" || normalized === "ls") return "Search";
+	if (normalized === "edit" || normalized === "write") return "Modify";
+	if (normalized === "bash") {
+		if (/\b(test|typecheck|lint|check|validate|build)\b/i.test(gist)) return "Verify";
+		return "Run";
+	}
+	if (normalized === "dstack_task") return "Delegate";
+	if (normalized === "dstack_result") return "Collect";
+	if (normalized === "dstack_status") return "Update status";
+	if (normalized === "mcp" || normalized === "mcpscript" || normalized.startsWith("mcp__")) return "Query service";
+	if (normalized === "dstack_todo") return "Update plan";
+	if (normalized === "dstack_ask") return "Request input";
+	return "Use tool";
+}
+
+export function groupToolActivity(
+	entries: readonly JournalEntry[],
+	initial?: Readonly<{ phase?: string; note?: string }>,
+): readonly ToolActivityGroup[] {
+	let phase = initial?.phase;
+	let note = initial?.note;
+	let current: ToolActivityItem[] = [];
+	let currentPhase = phase;
+	let currentNote = note;
+	const groups: ToolActivityGroup[] = [];
+	const flush = () => {
+		if (current.length === 0) return;
+		groups.push({
+			...(currentPhase !== undefined ? { phase: currentPhase } : {}),
+			...(currentNote !== undefined ? { note: currentNote } : {}),
+			items: current,
+		});
+		current = [];
+	};
+
+	for (const entry of [...entries].sort((a, b) => a.seq - b.seq)) {
+		if (entry.kind === "tool") {
+			if (current.length === 0) {
+				currentPhase = phase;
+				currentNote = note;
+			}
+			current.push({
+				seq: entry.seq,
+				timestamp: entry.timestamp,
+				name: entry.name,
+				intent: toolIntent(entry.name, entry.gist),
+				gist: entry.gist,
+				...(entry.durationMs !== undefined ? { durationMs: entry.durationMs } : {}),
+				...(entry.result !== undefined ? { result: entry.result } : {}),
+			});
+			continue;
+		}
+		flush();
+		if (entry.kind === "phase") {
+			if (entry.phase !== undefined) phase = entry.phase;
+			if (entry.note !== undefined) note = entry.note;
+		}
+	}
+	flush();
+	return groups;
+}
+
 export function recentJournal(entries: readonly JournalEntry[], limit = RECENT_JOURNAL_ENTRIES): readonly JournalEntry[] {
 	const boundedLimit = typeof limit === "number" && Number.isFinite(limit)
 		? Math.min(MAX_JOURNAL_ENTRIES, Math.max(0, Math.floor(limit)))
@@ -463,12 +560,29 @@ export function formatJournalEntry(entry: JournalEntry): string {
 	}
 }
 
+export function formatDuration(durationMs: number): string {
+	if (durationMs < 1_000) return `${Math.round(durationMs)}ms`;
+	if (durationMs < 60_000) return `${(durationMs / 1_000).toFixed(durationMs < 10_000 ? 1 : 0)}s`;
+	const minutes = Math.floor(durationMs / 60_000);
+	const seconds = Math.floor((durationMs % 60_000) / 1_000);
+	return `${minutes}m${String(seconds).padStart(2, "0")}s`;
+}
+
+export function formatToolActivityItem(item: ToolActivityItem): string {
+	const details = [item.gist];
+	if (item.result !== undefined) {
+		details.push(item.result.status === "succeeded" ? "completed" : item.result.summary ?? "failed");
+	}
+	if (item.durationMs !== undefined) details.push(formatDuration(item.durationMs));
+	return `${item.intent} · ${item.name}${details.filter(Boolean).map((detail) => ` · ${detail}`).join("")}`;
+}
+
 export function formatRecentActivity(
 	journal: readonly JournalEntry[] | undefined,
 ): readonly string[] {
 	if (!journal || journal.length === 0) return [];
 	const results: string[] = [];
-	for (const entry of journal) {
+	for (const entry of [...journal].sort((a, b) => a.seq - b.seq)) {
 		switch (entry.kind) {
 			case "turn": {
 				if (entry.summary && entry.summary.trim().length > 0) {
@@ -529,6 +643,7 @@ export class ChildJournalRecorder {
 	private readonly journalPath?: string;
 	private readonly statusPath?: string;
 	private lastToolCallId?: string;
+	private readonly pendingTools = new Map<string, Readonly<{ seq: number; startedAtMs: number }>>();
 	private lastTurn = 0;
 	private lastMessageIndex = 0;
 	private lastTimestampMs = 0;
@@ -543,8 +658,8 @@ export class ChildJournalRecorder {
 		return this.seq;
 	}
 
-	private timestamp(value?: string): string {
-		const candidate = value === undefined ? Date.now() : Date.parse(value);
+	private timestamp(value?: string | number): string {
+		const candidate = value === undefined ? Date.now() : typeof value === "number" ? value : Date.parse(value);
 		const validCandidate = Number.isFinite(candidate) ? candidate : Date.now();
 		this.lastTimestampMs = Math.max(this.lastTimestampMs, validCandidate);
 		return new Date(this.lastTimestampMs).toISOString();
@@ -587,7 +702,7 @@ export class ChildJournalRecorder {
 		name: string;
 		arguments: Record<string, unknown>;
 		callId?: string;
-		timestamp?: string;
+		timestamp?: string | number;
 		durationMs?: number;
 	}): ToolJournalEntry | undefined {
 		if (input.callId && input.callId === this.lastToolCallId) return undefined;
@@ -602,7 +717,34 @@ export class ChildJournalRecorder {
 		};
 		this.entries.push(entry);
 		this.entries = compactJournal(this.entries);
+		if (input.callId !== undefined) {
+			this.pendingTools.set(input.callId, { seq: entry.seq, startedAtMs: Date.parse(entry.timestamp) });
+		}
 		return entry;
+	}
+
+	private recordToolResult(message: ChildMessage): void {
+		if (message.toolCallId === undefined) return;
+		const pending = this.pendingTools.get(message.toolCallId);
+		if (pending === undefined) return;
+		this.pendingTools.delete(message.toolCallId);
+		const index = this.entries.findIndex((entry) => entry.seq === pending.seq && entry.kind === "tool");
+		const existing = this.entries[index];
+		if (existing?.kind !== "tool") return;
+		const summaryText = message.content.find((part) => part.type === "text")?.text;
+		const summary = message.isError === true && summaryText !== undefined
+			? sanitizeTurnSummary(summaryText, 120)
+			: undefined;
+		const endedAtMs = message.timestamp ?? Number.NaN;
+		const observedDuration = Number.isFinite(endedAtMs) ? Math.max(0, endedAtMs - pending.startedAtMs) : undefined;
+		this.entries[index] = {
+			...existing,
+			durationMs: message.durationMs ?? observedDuration,
+			result: {
+				status: message.isError === true ? "failed" : "succeeded",
+				...(summary !== undefined && summary.length > 0 ? { summary } : {}),
+			},
+		};
 	}
 
 	recordMessages(messages: readonly ChildMessage[]): void {
@@ -613,9 +755,16 @@ export class ChildJournalRecorder {
 				if (msg.role === "assistant") {
 					for (const part of msg.content) {
 						if (part.type === "toolCall") {
-							this.recordTool({ name: part.name, arguments: part.arguments });
+							this.recordTool({
+								name: part.name,
+								arguments: part.arguments,
+								callId: part.id,
+								timestamp: msg.timestamp,
+							});
 						}
 					}
+				} else if (msg.role === "toolResult") {
+					this.recordToolResult(msg);
 				}
 			}
 		}

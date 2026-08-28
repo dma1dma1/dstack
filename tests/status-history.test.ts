@@ -139,6 +139,31 @@ test("ChildJournalRecorder enforces monotonic seq and writes atomically", async 
 	);
 });
 
+test("ChildJournalRecorder enriches a flat tool entry with supported outcome and duration", () => {
+	const recorder = new ChildJournalRecorder();
+	const messages = [
+		{
+			role: "assistant",
+			timestamp: Date.parse("2026-02-26T10:00:00.000Z"),
+			content: [{ type: "toolCall" as const, id: "call-1", name: "bash", arguments: { command: "npm test" } }],
+		},
+		{
+			role: "toolResult",
+			toolCallId: "call-1",
+			isError: false,
+			timestamp: Date.parse("2026-02-26T10:00:01.250Z"),
+			content: [{ type: "text" as const, text: "all tests passed" }],
+		},
+	];
+
+	recorder.recordMessages(messages);
+	const tool = recorder.getEntries()[0];
+	assert.ok(tool?.kind === "tool");
+	assert.equal(tool.gist, "npm test");
+	assert.equal(tool.durationMs, 1_250);
+	assert.deepEqual(tool.result, { status: "succeeded" });
+});
+
 test("allowStatusTool ensures dstack_status is available despite tool allowlist", () => {
 	assert.equal(allowStatusTool(undefined), undefined);
 	assert.equal(allowStatusTool("read,grep,find,ls"), "read,grep,find,ls,dstack_status");
