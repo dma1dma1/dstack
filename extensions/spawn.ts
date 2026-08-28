@@ -428,6 +428,40 @@ function lastAssistantText(messages: ChildMessage[]): string {
 	return "";
 }
 
+function nestedTaskReceiptId(text: string): string | undefined {
+	try {
+		const value: unknown = JSON.parse(text);
+		if (!isRecord(value)) return undefined;
+		if (typeof value.taskId !== "string" || value.taskId === "") return undefined;
+		if (value.mode !== "single" && value.mode !== "parallel" && value.mode !== "chain") return undefined;
+		if (!Number.isSafeInteger(value.taskCount) || Number(value.taskCount) < 1) return undefined;
+		return value.taskId;
+	} catch {
+		return undefined;
+	}
+}
+
+function unresolvedNestedTaskIds(messages: readonly ChildMessage[]): string[] {
+	const unresolved = new Set<string>();
+	for (const message of messages) {
+		if (message.role === "assistant") {
+			for (const part of message.content) {
+				if (part.type !== "toolCall" || (part.name !== "dstack_result" && part.name !== "dstack_kill")) continue;
+				const taskId = part.arguments.taskId;
+				if (typeof taskId === "string") unresolved.delete(taskId);
+			}
+			continue;
+		}
+		if (message.role !== "toolResult") continue;
+		for (const part of message.content) {
+			if (part.type !== "text") continue;
+			const taskId = nestedTaskReceiptId(part.text);
+			if (taskId !== undefined) unresolved.add(taskId);
+		}
+	}
+	return [...unresolved];
+}
+
 export function applyJsonEvent(event: unknown, state: { messages: ChildMessage[]; result: ChildResult }): boolean {
 	if (!isRecord(event)) return false;
 	const toolUpdate = parseToolUpdate(event);
@@ -612,6 +646,12 @@ export async function runChildProcess(input: {
 		input.signal?.addEventListener("abort", abortChild, { once: true });
 	});
 
+	const unresolvedTaskIds = unresolvedNestedTaskIds(result.messages);
+	if (result.exitCode === 0 && unresolvedTaskIds.length > 0) {
+		result.exitCode = 1;
+		result.errorMessage = `Child agent exited before collecting launched task ${unresolvedTaskIds.join(", ")}. Call dstack_result or dstack_kill before finishing.`;
+		result.text = result.errorMessage;
+	}
 	if (!result.text) result.text = result.errorMessage || result.stderr || "(no output)";
 	return result;
 }

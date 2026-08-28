@@ -93,6 +93,40 @@ test("root and depth-1 processes produce validated child depths", () => {
 	});
 });
 
+test("a successful child process fails when its final turn abandons a launched nested task", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "dstack-unresolved-child-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const messages = [
+		{
+			role: "assistant",
+			content: [{ type: "toolCall", name: "dstack_task", arguments: { task: "implement" } }],
+			stopReason: "toolUse",
+		},
+		{
+			role: "toolResult",
+			content: [{ type: "text", text: JSON.stringify({ taskId: "nested-repro", mode: "single", taskCount: 1 }) }],
+		},
+		{
+			role: "assistant",
+			content: [{ type: "text", text: "I’m implementing and verifying now." }],
+			stopReason: "stop",
+		},
+	];
+	const script = `for (const message of ${JSON.stringify(messages)}) console.log(JSON.stringify({ type: "message_end", message }));`;
+	const result = await runChildProcess({
+		args: [],
+		cwd: root,
+		env: childEnv(1),
+		invocation: { command: process.execPath, argsPrefix: ["--input-type=module", "-e", script] },
+	});
+
+	assert.equal(result.exitCode, 1);
+	assert.equal(
+		result.text,
+		"Child agent exited before collecting launched task nested-repro. Call dstack_result or dstack_kill before finishing.",
+	);
+});
+
 test("a failed on-spawn boundary kills the child before accepting JSON", async (t) => {
 	const root = await mkdtemp(join(tmpdir(), "dstack-spawn-boundary-"));
 	t.after(() => rm(root, { recursive: true, force: true }));
