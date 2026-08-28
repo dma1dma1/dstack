@@ -50,6 +50,7 @@ if (cycles > 0) {
 				workflowId,
 				childId: `${childId}-cycle-${index}`,
 				work,
+				requestedTotalSlots: 4,
 				signal: new AbortController().signal,
 			});
 			if (holdMs > 0) await sleep(holdMs);
@@ -97,6 +98,7 @@ try {
 		workflowId,
 		childId,
 		work,
+		requestedTotalSlots: 4,
 		signal: controller.signal,
 	});
 	release = lease.release;

@@ -53,6 +53,7 @@ function manifest(input: Readonly<{
 		workflowId: "wf-runner-0123456789",
 		sessionId: "session-test",
 		schedulerRoot: join(input.artifactDir, "scheduler"),
+		schedulerTotalSlots: 4,
 		artifactDir: input.artifactDir,
 		extensionPath,
 		piChildLaunch: { executable: input.executable ?? process.execPath, argvPrefix: input.argvPrefix ?? [] },

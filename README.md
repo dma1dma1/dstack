@@ -76,7 +76,7 @@ The first `/setup-dstack` also writes `~/.pi/agent/extensions/pi-permission-syst
 
 | Tool | Role |
 | --- | --- |
-| `dstack_task` | Launches one background single, parallel, or chain group through `pi-background-tasks`. Each batch accepts 8 tasks. One session-wide scheduler runs at most 4 child processes across root and nested groups. |
+| `dstack_task` | Launches one background single, parallel, or chain group through `pi-background-tasks`. Each batch accepts 8 tasks. One session-wide scheduler limits child processes across root and nested groups. |
 | `dstack_result` | Returns current progress or a bounded completed summary. `detail: "full"` is an explicit escape hatch. |
 | `dstack_todo` | Durable todos under `~/.pi/agent/dstack/todos/`. |
 | `dstack_ask` | Typed questions. |
@@ -84,6 +84,17 @@ The first `/setup-dstack` also writes `~/.pi/agent/extensions/pi-permission-syst
 | `dstack_config` | Get / set / list `models.json`. |
 
 `dstack_task` returns a task ID immediately. Continue with independent work or wait for the normal completion notification, then call `dstack_result` once. Do not poll. The companion task manager owns status, logs, cancellation, and notifications.
+
+Set `scheduler.totalSlots` in `~/.pi/agent/dstack/models.json` to an integer from 3 through 64. It defaults to 8:
+
+```json
+{
+  "scheduler": { "totalSlots": 8 },
+  "roles": {}
+}
+```
+
+The first scheduler process in a session persists the effective capacity for that session. Later config changes apply to new sessions. The scheduler reserves `max(1, floor(totalSlots / 4))` slots for terminal work, so nesting-capable work can use at most `totalSlots - max(1, floor(totalSlots / 4))` slots. The default leaves 2 terminal slots.
 
 Nesting has three depths. An unset `DSTACK_NESTING` or `0` is root depth 0. A structured dmode request names one depth-1 `owner`. That owner may launch as many batches as needed. Each depth-2 `worker` or `reviewer` receives a playbook phase, completed phase names, and artifact paths. Worker and reviewer assignments are terminal even if their process depth is malformed or reused. dstack rejects malformed values instead of guessing. Parallel writers should each set `worktree: true`.
 

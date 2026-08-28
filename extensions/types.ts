@@ -45,6 +45,9 @@ export type WorktreeFrom = "HEAD" | "origin/main";
 
 export type DstackConfig = {
 	roles: Record<string, RoleValue>;
+	scheduler: {
+		totalSlots: number;
+	};
 	worktree: {
 		base: string;
 		from: WorktreeFrom;
@@ -116,7 +119,14 @@ export type TodoState = {
 export const COMMENT_SICKO_TOOLS = "read,grep,find,ls";
 export const EXPLORER_TOOLS = "read,grep,find,ls";
 export const MAX_PARALLEL_TASKS = 8;
-export const MAX_CONCURRENCY = 4;
+export const DEFAULT_TOTAL_SLOTS = 8;
+export const MIN_TOTAL_SLOTS = 3;
+export const MAX_TOTAL_SLOTS = 64;
+export const MAX_CONCURRENCY = DEFAULT_TOTAL_SLOTS;
+
+export function nestingCapableSlotLimit(totalSlots: number): number {
+	return totalSlots - Math.max(1, Math.floor(totalSlots / 4));
+}
 export const PER_TASK_OUTPUT_CAP = 50 * 1024;
 export const NESTING_ENV = "DSTACK_NESTING";
 export const ASSIGNMENT_ENV = "DSTACK_ASSIGNMENT";

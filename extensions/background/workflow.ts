@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { TaskDetails, TaskResult } from "../dstack.ts";
 import { buildChildArgv, capOutput, childEnv, runChildProcess, type ChildInvocation, type ChildResult } from "../spawn.ts";
 import type { WorkflowContext, WorktreeFrom } from "../types.ts";
-import { MAX_CONCURRENCY, NESTING_ENV, SESSION_REF_ENV, STATUS_FILE_ENV } from "../types.ts";
+import { DEFAULT_TOTAL_SLOTS, MAX_CONCURRENCY, NESTING_ENV, SESSION_REF_ENV, STATUS_FILE_ENV } from "../types.ts";
 import { createWorktree } from "../worktree.ts";
 import { atomicWriteFile, readOutputArtifact, toAbsolutePath, writeSealedArtifact, type OutputArtifactSeal } from "./artifacts.ts";
 import { allowStatusTool, ChildJournalRecorder } from "./journal.ts";
@@ -38,6 +38,7 @@ export type WorkflowManifestV1 = Readonly<{
 	workflowId: string;
 	sessionId: string;
 	schedulerRoot: string;
+	schedulerTotalSlots?: number;
 	artifactDir: string;
 	extensionPath: string;
 	piChildLaunch: Readonly<{ executable: string; argvPrefix: readonly string[] }>;
@@ -374,6 +375,7 @@ export async function executeWorkflow(
 					workflowId: manifest.workflowId,
 					childId: String(index),
 					work: { depth: manifest.childDepth, tools: resolvedToolsAllowlist(spec.tools) },
+					requestedTotalSlots: manifest.schedulerTotalSlots ?? DEFAULT_TOTAL_SLOTS,
 					signal,
 				})
 			: await dependencies.slots.acquire({ workflowId: manifest.workflowId, childIndex: index, signal });

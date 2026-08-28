@@ -139,6 +139,7 @@ export async function launchTaskGroup(input: Readonly<{
 		workflowId,
 		sessionId: input.sessionId,
 		schedulerRoot: join(root, "scheduler"),
+		schedulerTotalSlots: input.config.scheduler.totalSlots,
 		artifactDir,
 		extensionPath: await realpath(input.extensionPath),
 		piChildLaunch: { executable: childLaunch.command, argvPrefix: childLaunch.argsPrefix },

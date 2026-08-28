@@ -10,7 +10,7 @@ import type { Readable, Writable } from "node:stream";
 import { toAbsolutePath } from "../extensions/background/artifacts.ts";
 import {
 	acquireChildSlot,
-	MAX_ACTIVE_CHILDREN,
+	snapshotSchedulerCapacity,
 	__schedulerInternalsForTesting as internals,
 	type ChildDepth,
 } from "../extensions/background/scheduler.ts";
@@ -21,6 +21,7 @@ const LOCK_SCHEMA = "dstack.scheduler.lock.v2";
 const CLAIM_SCHEMA = "dstack.scheduler.lockclaim.v1";
 const LEASE_SCHEMA = "dstack.scheduler.lease.v2";
 const TICKET_SCHEMA = "dstack.scheduler.ticket.v2";
+const TEST_TOTAL_SLOTS = 4;
 /** Well-formed but never matching any real process start token. */
 const MISMATCHED_TOKEN = "posix-lstart:proven-dead-token-mismatch";
 
@@ -238,11 +239,38 @@ function acquireTerminal(root: string, childId: string, signal?: AbortSignal) {
 		workflowId: "wf-inproc",
 		childId,
 		work: { depth: 2 },
+		requestedTotalSlots: TEST_TOTAL_SLOTS,
 		signal: signal ?? new AbortController().signal,
 	});
 }
 
 // --- Capacity, FIFO, and reserve -------------------------------------------
+
+test("the first configured capacity persists for the session", async (t) => {
+	const root = await temporaryRoot(t);
+	const first = await acquireChildSlot({
+		schedulerRoot: toAbsolutePath(root),
+		workflowId: "wf-capacity",
+		childId: "first",
+		work: { depth: 2 },
+		requestedTotalSlots: 8,
+		signal: new AbortController().signal,
+	});
+	await first.release();
+	const second = await acquireChildSlot({
+		schedulerRoot: toAbsolutePath(root),
+		workflowId: "wf-capacity",
+		childId: "second",
+		work: { depth: 2 },
+		requestedTotalSlots: 16,
+		signal: new AbortController().signal,
+	});
+	assert.deepEqual(await snapshotSchedulerCapacity(root), {
+		totalActiveSlots: 8,
+		nestingCapableLimit: 6,
+	});
+	await second.release();
+});
 
 test("four slots cap admission; releasing one admits the fifth waiter", async (t) => {
 	const root = await temporaryRoot(t);
@@ -252,13 +280,13 @@ test("four slots cap admission; releasing one admits the fifth waiter", async (t
 		{ root, childId: "w3", depth: 1 },
 		{ root, childId: "w4", depth: 1, nonNesting: true },
 	]);
-	assert.equal((await leaseFiles(root)).length, MAX_ACTIVE_CHILDREN);
+	assert.equal((await leaseFiles(root)).length, TEST_TOTAL_SLOTS);
 
 	const fifth = spawnWorker(t, { root, childId: "w5", depth: 1, nonNesting: true });
 	await waitForState("the fifth waiter to enqueue a ticket", async () =>
 		(await ticketFiles(root)).length === 1 ? true : undefined,
 	);
-	assert.equal((await leaseFiles(root)).length, MAX_ACTIVE_CHILDREN);
+	assert.equal((await leaseFiles(root)).length, TEST_TOTAL_SLOTS);
 	assert.deepEqual(await leaseChildIds(root), ["w1", "w2", "w3", "w4"]);
 
 	const [first, ...rest] = holders;
@@ -546,7 +574,7 @@ test("live owners' leases survive a blocked waiter byte for byte", async (t) => 
 	for (const name of await leaseFiles(root)) {
 		before.set(name, await readFile(join(leaseDir, name), "utf8"));
 	}
-	assert.equal(before.size, MAX_ACTIVE_CHILDREN);
+	assert.equal(before.size, TEST_TOTAL_SLOTS);
 
 	const waiter = spawnWorker(t, { root, childId: "p5", depth: 1, nonNesting: true });
 	const [first] = holders;
@@ -557,7 +585,7 @@ test("live owners' leases survive a blocked waiter byte for byte", async (t) => 
 	await waiter.waitForLine("acquired");
 
 	const after = await leaseFiles(root);
-	assert.equal(after.length, MAX_ACTIVE_CHILDREN);
+	assert.equal(after.length, TEST_TOTAL_SLOTS);
 	for (const name of after) {
 		if (before.has(name)) {
 			assert.equal(await readFile(join(leaseDir, name), "utf8"), before.get(name));
@@ -679,7 +707,7 @@ test("two stale claim observers cannot steal a replacement claim or admit a fift
 		acquireTerminal(root, "held-3"),
 		acquireTerminal(root, "held-4"),
 	]);
-	assert.equal(held.length, MAX_ACTIVE_CHILDREN);
+	assert.equal(held.length, TEST_TOTAL_SLOTS);
 
 	const rootAbs = toAbsolutePath(root);
 	const lockPath = join(root, "scheduler.lock");
@@ -735,7 +763,7 @@ test("two stale claim observers cannot steal a replacement claim or admit a fift
 		acquireTerminal(root, "fifth", AbortSignal.timeout(300)),
 		(error: Error) => error.name === "TimeoutError" || error.name === "AbortError",
 	);
-	assert.equal((await leaseFiles(root)).length, MAX_ACTIVE_CHILDREN);
+	assert.equal((await leaseFiles(root)).length, TEST_TOTAL_SLOTS);
 	assert.deepEqual(await leaseChildIds(root), ["held-1", "held-2", "held-3", "held-4"]);
 });
 

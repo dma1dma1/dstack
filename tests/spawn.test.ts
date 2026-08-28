@@ -396,7 +396,7 @@ test("output cap 50 KiB", () => {
 	assert.ok(Buffer.byteLength(capped.split("\n\n[Output truncated")[0] ?? "", "utf8") <= PER_TASK_OUTPUT_CAP);
 });
 
-test("concurrency 4 for 8 tasks", async () => {
+test("default local concurrency runs all 8 tasks", async () => {
 	let live = 0;
 	let peak = 0;
 	const items = Array.from({ length: MAX_PARALLEL_TASKS }, (_, i) => i);

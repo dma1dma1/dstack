@@ -667,6 +667,7 @@ export function launchNestedTask(options: {
 							depth: childDepth,
 							tools: (resolved.tools ?? agent.tools?.join(","))?.split(","),
 						},
+						requestedTotalSlots: config.scheduler.totalSlots,
 						signal,
 					});
 				}

@@ -16,7 +16,7 @@ import {
 	type JournalEntry,
 	type SemanticStatus,
 } from "./journal.ts";
-import { MAX_ACTIVE_CHILDREN, snapshotActiveLeases, type LeaseSnapshot } from "./scheduler.ts";
+import { MAX_ACTIVE_CHILDREN, snapshotActiveLeases, snapshotSchedulerCapacity, type LeaseSnapshot } from "./scheduler.ts";
 export type { LeaseSnapshot } from "./scheduler.ts";
 import { parseChildSessionRef, readChildSessionRef, type ChildSessionRefV1 } from "./session.ts";
 
@@ -1185,6 +1185,11 @@ export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<
 		}
 	}
 
+	let slotCapacity = MAX_ACTIVE_CHILDREN;
+	try {
+		slotCapacity = (await snapshotSchedulerCapacity(input.schedulerRoot)).totalActiveSlots;
+	} catch {}
+
 	const workflowLeases = allLeases.filter((lease) => lease.workflowId === input.workflowId);
 	const depth1Leases = workflowLeases.filter((lease) => lease.depth === 1);
 	const depth2Leases = workflowLeases.filter((lease) => lease.depth === 2);
@@ -1508,7 +1513,7 @@ export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<
 		counts,
 		slots: {
 			active: allLeases.length,
-			capacity: MAX_ACTIVE_CHILDREN,
+			capacity: slotCapacity,
 		},
 		children,
 		todos: todoState.items,
