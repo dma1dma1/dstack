@@ -24,6 +24,31 @@ dmode starts on by default. Use `/dmode off` to turn it off and `/dmode` to turn
 
 `/poteto-mode` is an alias of `/dmode`. The flag survives `/new` and session reopen.
 
+## Cost status and overlay
+
+The `dstack-cost` extension status is one merged dollar amount. It adds persisted root-session usage, including dstack usage already claimed through a `dstack_result` tool result, to live dstack usage that the root session has not persisted yet. Reconciliation keys claims by task ID, so a task moves from live to persisted without changing the total or counting twice. `/dcost` opens a live breakdown by task and agent. Rows say `claimed`, `claimed/pending`, `pending`, or `approximate`. An approximate row means the child session ledger was unavailable and dstack fell back to workflow telemetry.
+
+Pi Powerline users should make `dstack-cost` the only cost segment. Merge this into `~/.pi/agent/settings.json`, or into `.pi/settings.json` for one project:
+
+```json
+{
+  "powerline": {
+    "preset": "default",
+    "disabledSegments": ["cost"],
+    "customItems": [
+      {
+        "id": "dstack-cost",
+        "statusKey": "dstack-cost",
+        "position": "right",
+        "color": "warning"
+      }
+    ]
+  }
+}
+```
+
+Keep any existing disabled segments and custom items when merging the object. The custom item hides `dstack-cost` from Powerline's aggregate extension-status segment by default. The separate `dstack` mode status remains there. Run `/reload` after editing settings.
+
 For nontrivial work, dmode routes the request to one depth-1 playbook owner. The owner grounds the task, chooses the playbook phases, launches bounded batches of terminal workers, integrates their work, and verifies the result. The root keeps only the task receipt and the owner's final evidence.
 
 ## Full stack
