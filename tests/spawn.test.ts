@@ -11,11 +11,13 @@ import {
 	childEnv,
 	formatUsageStats,
 	mapWithConcurrency,
+	mcpExtensionPaths,
 	NestingError,
 	parseNestingDepth,
 	parseTaskRequest,
 	PER_TASK_OUTPUT_CAP,
 	resolveAgent,
+	requireMcpExtensionPaths,
 	runChildProcess,
 	spawnableDepth,
 	sumChildUsage,
@@ -31,7 +33,12 @@ function childArgv(input: Omit<Parameters<typeof buildChildArgv>[0], "extensionP
 }
 
 test("spawn argv isolates extensions and loads dstack explicitly", () => {
-	const args = childArgv({ task: "look around", model: "acme/fast", tools: "read,grep,find,ls" });
+	const args = childArgv({
+		task: "look around",
+		model: "acme/fast",
+		tools: "read,grep,find,ls",
+		companionExtensionPaths: ["/opt/pi-mcp-adapter/index.ts"],
+	});
 	assert.deepEqual(args.slice(0, 7), [
 		"--mode",
 		"json",
@@ -41,12 +48,25 @@ test("spawn argv isolates extensions and loads dstack explicitly", () => {
 		"-e",
 		extensionPath,
 	]);
-	assert.equal(args.filter((arg) => arg === "-e").length, 1);
+	assert.equal(args.filter((arg) => arg === "-e").length, 2);
+	assert.equal(args[args.lastIndexOf("-e") + 1], "/opt/pi-mcp-adapter/index.ts");
 	assert.ok(args.includes("--model"));
 	assert.equal(args[args.indexOf("--model") + 1], "acme/fast");
 	assert.ok(args.includes("--tools"));
 	assert.equal(args[args.indexOf("--tools") + 1], "read,grep,find,ls");
 	assert.equal(args.at(-1), "Task: look around");
+});
+
+test("MCP extension discovery uses the loaded MCP tool source and fails closed when absent", () => {
+	const sourceInfo = { path: "/opt/pi-mcp-adapter/index.ts", source: "npm:pi-mcp-adapter", scope: "user", origin: "package" } as const;
+	const tools = [
+		{ name: "read", description: "", parameters: {}, sourceInfo },
+		{ name: "mcp", description: "", parameters: {}, sourceInfo },
+		{ name: "mcp__github", description: "", parameters: {}, sourceInfo },
+	] as unknown as Parameters<typeof mcpExtensionPaths>[0];
+	assert.deepEqual(mcpExtensionPaths(tools), ["/opt/pi-mcp-adapter/index.ts"]);
+	assert.deepEqual(requireMcpExtensionPaths(tools), ["/opt/pi-mcp-adapter/index.ts"]);
+	assert.throws(() => requireMcpExtensionPaths([]), /MCP tools are unavailable/);
 });
 
 test("spawn argv uses a contained session dir instead of --no-session when provided", () => {

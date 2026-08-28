@@ -122,6 +122,10 @@ export function parseWorkflowManifest(value: unknown): WorkflowManifestV1 {
 	const first = specs[0];
 	if (first === undefined) throw new Error("manifest.specs must be non-empty");
 	const launch = record(raw["piChildLaunch"], "manifest.piChildLaunch");
+	const companionExtensionPathsValue = raw["companionExtensionPaths"];
+	if (companionExtensionPathsValue !== undefined && (!Array.isArray(companionExtensionPathsValue) || !companionExtensionPathsValue.every((path) => typeof path === "string"))) {
+		throw new Error("manifest.companionExtensionPaths must be a string array");
+	}
 	const argvPrefixValue = launch["argvPrefix"];
 	if (!Array.isArray(argvPrefixValue) || !argvPrefixValue.every((arg) => typeof arg === "string")) {
 		throw new Error("manifest.piChildLaunch.argvPrefix must be a string array");
@@ -136,6 +140,7 @@ export function parseWorkflowManifest(value: unknown): WorkflowManifestV1 {
 		schedulerTotalSlots: typeof schedulerTotalSlots === "number" ? schedulerTotalSlots : undefined,
 		artifactDir: absolutePath(raw["artifactDir"], "manifest.artifactDir"),
 		extensionPath: absolutePath(raw["extensionPath"], "manifest.extensionPath"),
+		companionExtensionPaths: companionExtensionPathsValue?.map((path, index) => absolutePath(path, `manifest.companionExtensionPaths[${index}]`)),
 		piChildLaunch: {
 			executable: absolutePath(launch["executable"], "manifest.piChildLaunch.executable"),
 			argvPrefix: [...argvPrefixValue],
@@ -161,6 +166,9 @@ export async function validateManifestFiles(manifest: WorkflowManifestV1): Promi
 	const entryPoint = manifest.piChildLaunch.argvPrefix[0];
 	if (entryPoint !== undefined && isAbsolute(entryPoint)) await requireRegularFile(entryPoint, "manifest.piChildLaunch.argvPrefix[0]");
 	await requireRegularFile(manifest.extensionPath, "manifest.extensionPath");
+	for (const [index, path] of (manifest.companionExtensionPaths ?? []).entries()) {
+		await requireRegularFile(path, `manifest.companionExtensionPaths[${index}]`);
+	}
 	for (const [index, spec] of manifest.specs.entries()) {
 		const stats = await lstat(spec.cwd);
 		if (!stats.isDirectory() || stats.isSymbolicLink()) throw new Error(`manifest.specs[${index}].cwd must be a directory`);

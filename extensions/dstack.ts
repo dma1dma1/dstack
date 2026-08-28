@@ -45,6 +45,7 @@ import {
 	formatUsageStats,
 	parseNestingDepth,
 	parseTaskRequest,
+	requireMcpExtensionPaths,
 	spawnableDepth,
 	sumChildUsage,
 	type ChildContentPart,
@@ -825,6 +826,7 @@ export default function dstack(pi: ExtensionAPI) {
 					config,
 					agents: discoverAgents(),
 					extensionPath: extensionPath(),
+					companionExtensionPaths: requireMcpExtensionPaths(pi.getAllTools()),
 					skillPath: skillPath(),
 					runnerPath: join(packageRoot(), "extensions/background/runner.ts"),
 					port,
@@ -1385,6 +1387,12 @@ export default function dstack(pi: ExtensionAPI) {
 			if (owners.some((spec) => spec.agent !== "poteto-agent")) {
 				return textResult('dstack_task refused: workflow owners must use agent "poteto-agent".', {}, true);
 			}
+			let companionExtensionPaths: string[];
+			try {
+				companionExtensionPaths = requireMcpExtensionPaths(pi.getAllTools());
+			} catch (error) {
+				return textResult(error instanceof Error ? error.message : String(error), {}, true);
+			}
 			if (parentDepth === 0) {
 				const port = getEventBusPort();
 				const availabilitySignal = signal === undefined
@@ -1403,6 +1411,7 @@ export default function dstack(pi: ExtensionAPI) {
 						config,
 						agents,
 						extensionPath: extensionPath(),
+						companionExtensionPaths,
 						skillPath: skillPath(),
 						runnerPath: join(packageRoot(), "extensions/background/runner.ts"),
 						port,
@@ -1442,6 +1451,7 @@ export default function dstack(pi: ExtensionAPI) {
 				ctxCwd: ctx.cwd,
 				skillPath: skillPath(),
 				extensionPath: extensionPath(),
+				companionExtensionPaths,
 				childDepth,
 				registry: nestedTaskRegistry,
 			});

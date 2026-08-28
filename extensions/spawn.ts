@@ -3,6 +3,7 @@ import { constants, existsSync } from "node:fs";
 import { access, realpath, stat } from "node:fs/promises";
 import { basename, delimiter, join } from "node:path";
 import type { Usage } from "@earendil-works/pi-ai";
+import type { ToolInfo } from "@earendil-works/pi-coding-agent";
 import {
 	ASSIGNMENT_ENV,
 	COMMENT_SICKO_TOOLS,
@@ -55,9 +56,32 @@ export type SpawnArgv = {
 	env: Record<string, string>;
 };
 
+const MCP_TOOL_NAMES = new Set(["mcp", "mcpScript"]);
+
+export function mcpExtensionPaths(tools: readonly ToolInfo[]): string[] {
+	const paths = new Set<string>();
+	for (const tool of tools) {
+		if (!MCP_TOOL_NAMES.has(tool.name) && !tool.name.startsWith("mcp__")) continue;
+		const path = tool.sourceInfo?.path;
+		if (typeof path === "string" && path.length > 0 && !path.startsWith("<")) paths.add(path);
+	}
+	return [...paths];
+}
+
+export function requireMcpExtensionPaths(tools: readonly ToolInfo[]): string[] {
+	const paths = mcpExtensionPaths(tools);
+	if (paths.length === 0) {
+		throw new Error(
+			"MCP tools are unavailable in this session, so dstack_task cannot guarantee MCP access for child agents. Run /setup-dstack (or install and enable npm:pi-mcp-adapter), then reload Pi.",
+		);
+	}
+	return paths;
+}
+
 export function buildChildArgv(input: {
 	task: string;
 	extensionPath: string;
+	companionExtensionPaths?: readonly string[];
 	model?: string;
 	omitModel?: boolean;
 	tools?: string;
@@ -68,6 +92,7 @@ export function buildChildArgv(input: {
 	if (input.sessionDir !== undefined) args.push("--session-dir", input.sessionDir);
 	else args.push("--no-session");
 	args.push("--no-extensions", "-e", input.extensionPath);
+	for (const path of input.companionExtensionPaths ?? []) args.push("-e", path);
 	if (input.model && !input.omitModel) args.push("--model", input.model);
 	if (input.tools) args.push("--tools", input.tools);
 	if (input.systemPromptPath) args.push("--append-system-prompt", input.systemPromptPath);

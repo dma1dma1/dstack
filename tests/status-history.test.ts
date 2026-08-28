@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { createEventBus, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	allowStatusTool,
@@ -21,6 +22,8 @@ import { readDstackResult, type TaskBinding } from "../extensions/background/res
 import dstack, { latestActivity, type TaskResult } from "../extensions/dstack.ts";
 import { NESTING_ENV, STATUS_FILE_ENV } from "../extensions/types.ts";
 import type { WorkflowManifestV1 } from "../extensions/background/workflow.ts";
+
+const testMcpExtensionPath = fileURLToPath(new URL("./fixtures/mcp-extension.ts", import.meta.url));
 
 test("tool gist sanitization removes sensitive blobs and truncates cleanly", () => {
 	const readGist = sanitizeToolGist("read", { path: "src/index.ts", offset: 10, limit: 50 });
@@ -411,12 +414,13 @@ async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs 
 	}
 }
 
-test("nested depth-1 task execution propagates worker journal and semantic status", async (t) => {
+test("depth-2 nested task execution propagates MCP, worker journal, and semantic status", async (t) => {
 	const home = await mkdtemp(join(tmpdir(), "dstack-nested-status-"));
 	t.after(() => rm(home, { recursive: true, force: true }));
 	const fakePi = join(home, "fake-pi.mjs");
 	await writeFile(fakePi, [
 		'import { writeFileSync } from "node:fs";',
+		`if (!process.argv.includes(${JSON.stringify(testMcpExtensionPath)})) throw new Error("missing propagated MCP extension");`,
 		'writeFileSync(process.env.DSTACK_STATUS_FILE, JSON.stringify({ phase: "verification", note: "checking nested path", updatedAt: new Date().toISOString() }));',
 		'const message = { role: "assistant", content: [{ type: "toolCall", name: "read", arguments: { path: "nested.ts" } }, { type: "text", text: "Nested work complete" }], usage: { input: 7, output: 3, totalTokens: 10 } };',
 		'process.stdout.write(JSON.stringify({ type: "message_end", message }) + "\\n");',
@@ -448,7 +452,15 @@ test("nested depth-1 task execution propagates worker journal and semantic statu
 		registerCommand() {},
 		on() {},
 		appendEntry() {},
-		getAllTools() { return [...tools.keys()].map((name) => ({ name })); },
+		getAllTools() {
+			return [
+				...[...tools.keys()].map((name) => ({ name })),
+				{
+					name: "mcp",
+					sourceInfo: { path: testMcpExtensionPath, source: "test", scope: "temporary", origin: "top-level" },
+				},
+			];
+		},
 		sendMessage() {},
 		sendUserMessage() {},
 	} as unknown as ExtensionAPI);

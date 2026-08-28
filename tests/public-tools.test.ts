@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { createEventBus, initTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import dstack from "../extensions/dstack.ts";
 import { commitWorkflowResult, parseWorkflowManifest } from "../extensions/background/runner.ts";
@@ -16,6 +17,7 @@ import { toAbsolutePath } from "../extensions/background/artifacts.ts";
 
 const RESPONSE_CHANNEL = "pi-background-tasks:response:v1";
 const REQUEST_CHANNEL = "pi-background-tasks:request:v1";
+const testMcpExtensionPath = fileURLToPath(new URL("./fixtures/mcp-extension.ts", import.meta.url));
 
 function response(requestId: string, operation: string, result: unknown) {
 	return {
@@ -70,7 +72,15 @@ function testRuntime(events: ReturnType<typeof createEventBus>) {
 		appendEntry(customType: string, data: unknown) {
 			entries.push({ customType, data });
 		},
-		getAllTools() { return [...tools.keys()].map((name) => ({ name })); },
+		getAllTools() {
+			return [
+				...[...tools.keys()].map((name) => ({ name })),
+				{
+					name: "mcp",
+					sourceInfo: { path: testMcpExtensionPath, source: "test", scope: "temporary", origin: "top-level" },
+				},
+			];
+		},
 		sendMessage(message: unknown, options?: unknown) {
 			sentMessages.push({ message, options });
 		},

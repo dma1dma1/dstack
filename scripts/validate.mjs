@@ -25,6 +25,7 @@ if (process.argv.includes("--mode") && process.argv.includes("json")) {
 						const i = process.argv.indexOf("-e");
 						return i === -1 ? null : (process.argv[i + 1] ?? null);
 					})(),
+					explicitExtensions: process.argv.flatMap((arg, index) => arg === "-e" ? [process.argv[index + 1]] : []),
 					tools: (() => {
 						const i = process.argv.indexOf("--tools");
 						return i === -1 ? null : (process.argv[i + 1] ?? null);
@@ -153,7 +154,13 @@ function makePi() {
 			custom.push({ type, data });
 		},
 		getAllTools() {
-			return [...tools.values()].map((t) => ({ name: t.name }));
+			return [
+				...[...tools.values()].map((t) => ({ name: t.name })),
+				{
+					name: "mcp",
+					sourceInfo: { path: join(root, "extensions/dstack.ts"), source: "validate", scope: "temporary", origin: "top-level" },
+				},
+			];
 		},
 		async fire(event, ctx) {
 			const handler = handlers.get(event);
@@ -465,6 +472,7 @@ async function main() {
 	const lastKid = JSON.parse(readFileSync(join(process.env.DSTACK_VALIDATE_DIR, kids.at(-1)), "utf8"));
 	assert("child-no-extensions", lastKid.noExtensions === true);
 	assert("child-explicit-dstack", lastKid.explicitExtension === join(root, "extensions/dstack.ts"), String(lastKid.explicitExtension));
+	assert("child-explicit-mcp", lastKid.explicitExtensions.length === 2, JSON.stringify(lastKid.explicitExtensions));
 	assert("child-nesting-env", lastKid.nesting === "2");
 	assert("child-tools-allowlist", lastKid.tools === "read,grep,find,ls,dstack_status", String(lastKid.tools));
 
@@ -564,10 +572,15 @@ async function main() {
 	const sickoRes = resolveAgent({ agent: "comment-sicko", task: "x" });
 	assert("comment-sicko-cannot-write", sickoRes.tools === "read,grep,find,ls", sickoRes.tools);
 	const childExtension = join(root, "extensions/dstack.ts");
-	const argv = buildChildArgv({ task: "t", extensionPath: childExtension, tools: "read,grep,find,ls" });
+	const argv = buildChildArgv({
+		task: "t",
+		extensionPath: childExtension,
+		companionExtensionPaths: [childExtension],
+		tools: "read,grep,find,ls",
+	});
 	assert(
-		"child-argv-isolated-dstack",
-		argv.includes("--no-extensions") && argv[argv.indexOf("-e") + 1] === childExtension && argv.includes("--tools"),
+		"child-argv-isolated-dstack-and-mcp",
+		argv.includes("--no-extensions") && argv.filter((arg) => arg === "-e").length === 2 && argv[argv.indexOf("-e") + 1] === childExtension && argv.includes("--tools"),
 	);
 
 	try {
