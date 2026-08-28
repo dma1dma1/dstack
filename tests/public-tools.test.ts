@@ -3,8 +3,8 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createEventBus, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { test } from "node:test";
+import { createEventBus, initTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import dstack from "../extensions/dstack.ts";
 import { commitWorkflowResult, parseWorkflowManifest } from "../extensions/background/runner.ts";
 import { createLocalSlotAcquirer, executeWorkflow, DSTACK_ARTIFACT_DIR_ENV, DSTACK_CHILD_INDEX_ENV, ROOT_WORKFLOW_ENV, SCHEDULER_ROOT_ENV } from "../extensions/background/workflow.ts";
@@ -35,7 +35,14 @@ async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs 
 }
 
 function testRuntime(events: ReturnType<typeof createEventBus>) {
-	const tools = new Map<string, { execute: (...args: unknown[]) => Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown; isError?: boolean; usage?: unknown }> }>();
+	const tools = new Map<string, {
+		execute: (...args: unknown[]) => Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown; isError?: boolean; usage?: unknown }>;
+		renderResult?: (
+			result: { content: Array<{ type: string; text?: string }>; isError: boolean; details?: unknown },
+			options: { expanded: boolean; isPartial?: boolean },
+			theme?: unknown,
+		) => { render: (width: number) => string[] };
+	}>();
 	const handlers = new Map<string, (...args: unknown[]) => unknown>();
 	const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<unknown> }>();
 	const shortcuts = new Map<string, { description: string; handler: (ctx: unknown) => Promise<unknown> }>();
@@ -1538,4 +1545,51 @@ test("nested depth-1 task dstack_kill releases scheduler lease and restores capa
 		if (previousArtifactDir === undefined) delete process.env[DSTACK_ARTIFACT_DIR_ENV];
 		else process.env[DSTACK_ARTIFACT_DIR_ENV] = previousArtifactDir;
 	}
+});
+
+test("dstack_result renderResult renders concise collapsed summary with expand hint and full text when expanded", async () => {
+	initTheme();
+	const events = createEventBus();
+	const runtime = testRuntime(events);
+	const resultTool = runtime.tools.get("dstack_result");
+	assert.ok(resultTool);
+	assert.ok(resultTool.renderResult);
+
+	const details = {
+		kind: "complete",
+		taskId: "bg-render-test",
+		detail: "summary",
+		package: {
+			mode: "single",
+			results: [{ agent: "poteto-agent", summary: "done".repeat(30_000), exitCode: 0 }],
+		},
+	};
+	const sampleJson = JSON.stringify(details);
+	const resultPayload = {
+		content: [{ type: "text", text: sampleJson }],
+		isError: false,
+		details,
+	};
+
+	const collapsedComponent = resultTool.renderResult(resultPayload, { expanded: false, isPartial: false }, undefined);
+	const collapsedLines = collapsedComponent.render(80);
+	assert.equal(collapsedLines.length, 1);
+	assert.match(collapsedLines[0] ?? "", /✓ complete bg-render-test/);
+	assert.match(collapsedLines[0] ?? "", /to expand/);
+	assert.ok(!collapsedLines[0]?.includes('"package"'));
+
+	const expandedComponent = resultTool.renderResult(resultPayload, { expanded: true, isPartial: false }, undefined);
+	const expandedLines = expandedComponent.render(80);
+	assert.ok(expandedLines.join("\n").includes('"package"'));
+
+	const malformedPayload = {
+		content: [{ type: "text", text: sampleJson }],
+		isError: false,
+		details: "not-a-valid-details-record",
+	};
+	const malformedCollapsed = resultTool.renderResult(malformedPayload, { expanded: false, isPartial: false }, undefined);
+	const malformedLines = malformedCollapsed.render(80);
+	assert.equal(malformedLines.length, 1);
+	assert.match(malformedLines[0] ?? "", /\(result output\)/);
+	assert.ok(!malformedLines[0]?.includes('"package"'));
 });

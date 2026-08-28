@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { StringEnum, type Usage } from "@earendil-works/pi-ai";
-import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { SessionManager, keyHint, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { discoverAgents, packageRoot } from "./agents.ts";
@@ -285,6 +285,34 @@ function parseTaskDetails(value: unknown): TaskDetails | undefined {
 		results.push(result as TaskResult);
 	}
 	return { mode: value.mode as TaskDetails["mode"], results };
+}
+
+function formatDstackResultSummary(details: unknown): string {
+	if (!isRecord(details) || typeof details.kind !== "string") return "(result output)";
+	const target = typeof details.taskId === "string" ? ` ${details.taskId}` : "";
+
+	if (details.kind === "running" && isRecord(details.progress)) {
+		const complete = details.progress.complete;
+		const total = details.progress.total;
+		const counts = typeof complete === "number" && typeof total === "number" ? `: ${complete}/${total}` : "";
+		return `⏳ running${target}${counts}`;
+	}
+	if (details.kind === "complete" && isRecord(details.package) && Array.isArray(details.package.results)) {
+		const failed = details.package.results.filter(
+			(item) => isRecord(item) && typeof item.exitCode === "number" && item.exitCode !== 0,
+		).length;
+		const succeeded = details.package.results.length - failed;
+		return `${failed > 0 ? "✗" : "✓"} complete${target}: ${succeeded}/${details.package.results.length}${failed > 0 ? `, ${failed} failed` : ""}`;
+	}
+
+	switch (details.kind) {
+		case "artifact": return `${details.outcome === "succeeded" ? "✓" : "✗"} artifact${target}`;
+		case "runner_failed": return `✗ runner failed${target}`;
+		case "cancelled": return `✗ cancelled${target}`;
+		case "unknown_task": return `✗ unknown task${target}`;
+		case "infrastructure_failure": return `✗ infrastructure failure${target}`;
+		default: return `(result output${target})`;
+	}
 }
 
 export { latestActivity };
@@ -976,6 +1004,14 @@ export default function dstack(pi: ExtensionAPI) {
 		description:
 			"Read a bounded summary for a background dstack task. Use detail=full only when the complete child transcript is necessary. Call after receiving a completion notification or a stale wake-up.",
 		parameters: ResultParams,
+		renderResult(result, { expanded, isPartial }) {
+			if (expanded) {
+				const text = result.content.find((part) => part.type === "text")?.text ?? "(no output)";
+				return new Text(text, 0, 0);
+			}
+			const summary = isPartial ? "⏳ (reading...)" : formatDstackResultSummary(result.details);
+			return new Text(`${summary} (${keyHint("app.tools.expand", "to expand")})`, 0, 0);
+		},
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			if (nestedTaskRegistry.has(params.taskId)) {
 				const record = nestedTaskRegistry.get(params.taskId)!;
