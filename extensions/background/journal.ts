@@ -10,10 +10,13 @@ export const MAX_TOOL_GIST_CHARS = 120;
 export const MAX_TURN_SUMMARY_CHARS = 160;
 export const RECENT_JOURNAL_ENTRIES = 20;
 
+export type SemanticStatusBlockedOn = "human" | "approval" | "dependency" | "external";
+
 export type SemanticStatus = Readonly<{
 	phase?: string;
 	note?: string;
 	blocking?: boolean;
+	blockedOn?: SemanticStatusBlockedOn;
 	updatedAt: string;
 }>;
 
@@ -54,6 +57,7 @@ export type PhaseJournalEntry = Readonly<{
 	phase?: string;
 	note?: string;
 	blocking?: boolean;
+	blockedOn?: SemanticStatusBlockedOn;
 }>;
 
 export type ExitJournalEntry = Readonly<{
@@ -141,6 +145,7 @@ export function sanitizeToolGist(name: string, rawArgs: Record<string, unknown>)
 		if (typeof rawArgs["phase"] === "string") parts.push(`phase=${rawArgs["phase"]}`);
 		if (typeof rawArgs["note"] === "string") parts.push(`note=${rawArgs["note"]}`);
 		if (typeof rawArgs["blocking"] === "boolean") parts.push(`blocking=${rawArgs["blocking"]}`);
+		if (typeof rawArgs["blockedOn"] === "string") parts.push(`blockedOn=${rawArgs["blockedOn"]}`);
 		return sanitizeString(parts.join(" ") || "update", MAX_TOOL_GIST_CHARS);
 	}
 	const pairs: string[] = [];
@@ -185,16 +190,22 @@ export function parseChildUsage(raw: unknown): ChildResult["usage"] | undefined 
 	};
 }
 
+function isSemanticStatusBlockedOn(value: unknown): value is SemanticStatusBlockedOn {
+	return value === "human" || value === "approval" || value === "dependency" || value === "external";
+}
+
 export function parseSemanticStatus(raw: unknown): SemanticStatus | undefined {
 	if (!isRecord(raw)) return undefined;
 	if (!isValidTimestamp(raw["updatedAt"])) return undefined;
 	const phase = typeof raw["phase"] === "string" ? sanitizeString(raw["phase"], MAX_STATUS_PHASE_CHARS) : undefined;
 	const note = typeof raw["note"] === "string" ? sanitizeString(raw["note"], MAX_STATUS_NOTE_CHARS) : undefined;
 	const blocking = typeof raw["blocking"] === "boolean" ? raw["blocking"] : undefined;
+	const blockedOn = isSemanticStatusBlockedOn(raw["blockedOn"]) ? raw["blockedOn"] : undefined;
 	return {
 		...(phase !== undefined ? { phase } : {}),
 		...(note !== undefined ? { note } : {}),
 		...(blocking !== undefined ? { blocking } : {}),
+		...(blockedOn !== undefined ? { blockedOn } : {}),
 		updatedAt: raw["updatedAt"],
 	};
 }
@@ -263,6 +274,7 @@ export function parseJournalEntry(raw: unknown): JournalEntry | undefined {
 			const phase = typeof raw["phase"] === "string" ? raw["phase"] : undefined;
 			const note = typeof raw["note"] === "string" ? raw["note"] : undefined;
 			const blocking = typeof raw["blocking"] === "boolean" ? raw["blocking"] : undefined;
+			const blockedOn = isSemanticStatusBlockedOn(raw["blockedOn"]) ? raw["blockedOn"] : undefined;
 			return {
 				seq,
 				timestamp,
@@ -270,6 +282,7 @@ export function parseJournalEntry(raw: unknown): JournalEntry | undefined {
 				...(phase !== undefined ? { phase } : {}),
 				...(note !== undefined ? { note } : {}),
 				...(blocking !== undefined ? { blocking } : {}),
+				...(blockedOn !== undefined ? { blockedOn } : {}),
 			};
 		}
 		case "exit": {
@@ -635,6 +648,7 @@ export class ChildJournalRecorder {
 			...(status.phase !== undefined ? { phase: sanitizeString(status.phase, MAX_STATUS_PHASE_CHARS) } : {}),
 			...(status.note !== undefined ? { note: sanitizeString(status.note, MAX_STATUS_NOTE_CHARS) } : {}),
 			...(status.blocking !== undefined ? { blocking: status.blocking } : {}),
+			...(status.blockedOn !== undefined ? { blockedOn: status.blockedOn } : {}),
 			updatedAt,
 		};
 		this.latestStatus = normalized;
@@ -646,6 +660,7 @@ export class ChildJournalRecorder {
 			phase: normalized.phase,
 			note: normalized.note,
 			blocking: normalized.blocking,
+			blockedOn: normalized.blockedOn,
 		};
 		this.entries.push(entry);
 		this.entries = compactJournal(this.entries);

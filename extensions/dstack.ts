@@ -67,6 +67,7 @@ import {
 	MAX_STATUS_PHASE_CHARS,
 	sanitizeString,
 	type SemanticStatus,
+	type SemanticStatusBlockedOn,
 } from "./background/journal.ts";
 import { readDstackResult, type CommittedResult, type DstackResultView } from "./background/result.ts";
 import { buildChildSessionRef } from "./background/session.ts";
@@ -79,10 +80,12 @@ import {
 	restoreFiredStaleWakes,
 	shouldTriggerStaleWake,
 	type DstackKillResult,
+	type NestedTaskRecord,
 	type TaskDetails,
 	type TaskResult,
 } from "./task-registry.ts";
-import { activityLines, buildTreeSnapshot, latestActivity, parseTreeSnapshot, renderTreeLines, type SessionRefCache } from "./background/tree.ts";
+import { activityLines, buildTreeSnapshot, latestActivity, parseTreeSnapshot, renderTreeLines, type SessionRefCache, type TreeSnapshot } from "./background/tree.ts";
+import { DstackStatusWriter, type DstackRootState, type DstackStatusTask, type DstackTaskState } from "./status.ts";
 import {
 	parseTranscriptProgressEvent,
 	PROGRESS_ENTRY,
@@ -179,6 +182,7 @@ const StatusParams = Type.Object({
 	phase: Type.Optional(Type.String({ description: "Current phase slug or name" })),
 	note: Type.Optional(Type.String({ description: "Brief status note or current focus" })),
 	blocking: Type.Optional(Type.Boolean({ description: "Whether work is currently blocked" })),
+	blockedOn: Type.Optional(StringEnum(["human", "approval", "dependency", "external"] as const)),
 });
 
 function skillPath(): string {
@@ -340,6 +344,13 @@ export default function dstack(pi: ExtensionAPI) {
 	let pendingContinuation: { sessionId: string; tasks: TodoSnapshot[] } | undefined;
 	let eventBusPort: BackgroundTaskPort | undefined;
 	let treeTimer: NodeJS.Timeout | undefined;
+	let statusHeartbeatTimer: NodeJS.Timeout | undefined;
+	let statusWriter: DstackStatusWriter | undefined;
+	let rootState: DstackRootState = "idle";
+	let rootSemanticStatus: SemanticStatus | undefined;
+	let statusTree: TreeSnapshot | undefined;
+	let currentNestedTaskId: string | undefined;
+	let taskTerminalState: "completed" | "failed" | "cancelled" | undefined;
 	let ambientStatus: AmbientStatus | undefined;
 	let inspectorOpen = false;
 	let treeWidgetVisible = true;
@@ -360,6 +371,61 @@ export default function dstack(pi: ExtensionAPI) {
 			clearInterval(treeTimer);
 			treeTimer = undefined;
 		}
+	}
+
+	function stopStatusHeartbeat() {
+		if (statusHeartbeatTimer !== undefined) {
+			clearInterval(statusHeartbeatTimer);
+			statusHeartbeatTimer = undefined;
+		}
+	}
+
+	function nestedStatusTask(record: NestedTaskRecord): DstackStatusTask {
+		const taskState: DstackTaskState = record.status === "running" ? "working" : record.status === "completed" ? "completed" : record.status;
+		return {
+			id: record.taskId,
+			kind: "workflow",
+			state: taskState,
+			summary: `${record.mode} nested task`,
+			children: record.children.map((child, index) => {
+				const stage = child.lifecycle.stage;
+				const state: DstackTaskState = stage === "running" ? "working" : stage === "succeeded" ? "completed" : stage === "skipped" ? "cancelled" : stage;
+				const status = "latestStatus" in child.lifecycle ? child.lifecycle.latestStatus : undefined;
+				return {
+					id: String(index),
+					kind: "agent",
+					state,
+					summary: sanitizeString(child.spec.task, 160),
+					...(status?.phase !== undefined ? { phase: status.phase } : {}),
+					...(status !== undefined ? { status } : {}),
+					children: [],
+				};
+			}),
+		};
+	}
+
+	async function publishMachineStatus(shutdownAt?: string): Promise<void> {
+		if (statusWriter === undefined) return;
+		const nestedRecord = currentNestedTaskId === undefined ? undefined : nestedTaskRegistry.get(currentNestedTaskId);
+		try {
+			await statusWriter.write({
+				heartbeatAt: new Date().toISOString(),
+				rootState,
+				...(rootSemanticStatus !== undefined ? { rootStatus: rootSemanticStatus } : {}),
+				...(statusTree !== undefined ? { tree: statusTree } : {}),
+				...(nestedRecord !== undefined ? { task: nestedStatusTask(nestedRecord) } : {}),
+				...(taskTerminalState !== undefined ? { taskTerminalState } : {}),
+				...(shutdownAt !== undefined ? { shutdownAt } : {}),
+			});
+		} catch {}
+	}
+
+	function startStatusHeartbeat() {
+		stopStatusHeartbeat();
+		statusHeartbeatTimer = setInterval(() => {
+			void publishMachineStatus();
+		}, statusWriter?.heartbeatIntervalMs ?? 5_000);
+		statusHeartbeatTimer.unref();
 	}
 
 	function updateTreeWidget(ctx: ExtensionContext) {
@@ -474,6 +540,8 @@ export default function dstack(pi: ExtensionAPI) {
 				snapshot,
 				activeWorkflowCount,
 			};
+			statusTree = snapshot;
+			await publishMachineStatus();
 			if (lastContext) {
 				updateTreeWidget(lastContext);
 				const control = continuationControlState(lastContext);
@@ -572,20 +640,25 @@ export default function dstack(pi: ExtensionAPI) {
 				const phase = params.phase ? sanitizeString(params.phase, MAX_STATUS_PHASE_CHARS) : undefined;
 				const note = params.note ? sanitizeString(params.note, MAX_STATUS_NOTE_CHARS) : undefined;
 				const blocking = typeof params.blocking === "boolean" ? params.blocking : undefined;
+				const blockedOn: SemanticStatusBlockedOn | undefined = params.blockedOn;
 				const status: SemanticStatus = {
 					...(phase !== undefined ? { phase } : {}),
 					...(note !== undefined ? { note } : {}),
 					...(blocking !== undefined ? { blocking } : {}),
+					...(blockedOn !== undefined ? { blockedOn } : {}),
 					updatedAt: new Date().toISOString(),
 				};
 				const statusFile = process.env[STATUS_FILE_ENV];
 				if (statusFile) {
 					await atomicWriteFile(statusFile, `${JSON.stringify(status, null, 2)}\n`);
 				}
+				rootSemanticStatus = status;
+				await publishMachineStatus();
 				const parts: string[] = [];
 				if (phase) parts.push(`phase: ${phase}`);
 				if (note) parts.push(`note: ${note}`);
 				if (blocking !== undefined) parts.push(`blocking: ${blocking}`);
+				if (blockedOn !== undefined) parts.push(`blockedOn: ${blockedOn}`);
 				const text = parts.length > 0 ? parts.join(", ") : "status cleared";
 				return textResult(`Status updated (${text})`, status);
 			},
@@ -595,6 +668,12 @@ export default function dstack(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		pendingContinuation = undefined;
 		stopTreeTimer();
+		stopStatusHeartbeat();
+		rootState = "idle";
+		rootSemanticStatus = undefined;
+		statusTree = undefined;
+		currentNestedTaskId = undefined;
+		taskTerminalState = undefined;
 		ambientStatus = undefined;
 		treeLastTaskId = undefined;
 		treeLastWorkflowId = undefined;
@@ -609,6 +688,9 @@ export default function dstack(pi: ExtensionAPI) {
 		mode = restoreMode(branchEntries(ctx));
 		activeWorkflow = restoreActiveWorkflow(branchEntries(ctx));
 		sessionId = ctx.sessionManager.getSessionId();
+		statusWriter = new DstackStatusWriter(sessionId);
+		await publishMachineStatus();
+		startStatusHeartbeat();
 		await maybeWriteChildSessionRef(ctx);
 		await refreshTodos();
 		applyStatus(ctx);
@@ -629,6 +711,17 @@ export default function dstack(pi: ExtensionAPI) {
 		mode = restoreMode(branchEntries(ctx));
 		activeWorkflow = restoreActiveWorkflow(branchEntries(ctx));
 		sessionId = ctx.sessionManager.getSessionId();
+		statusTree = undefined;
+		currentNestedTaskId = undefined;
+		taskTerminalState = undefined;
+		rootSemanticStatus = undefined;
+		if (statusWriter?.sessionId !== sessionId) {
+			stopStatusHeartbeat();
+			await publishMachineStatus(new Date().toISOString());
+			statusWriter = new DstackStatusWriter(sessionId);
+			startStatusHeartbeat();
+		}
+		await publishMachineStatus();
 		firedStaleWakes.clear();
 		for (const id of restoreFiredStaleWakes(branchEntries(ctx))) firedStaleWakes.add(id);
 		nestedTaskRegistry.clear();
@@ -650,6 +743,16 @@ export default function dstack(pi: ExtensionAPI) {
 		if (ctx.hasUI && typeof ctx.ui.setWidget === "function") {
 			ctx.ui.setWidget("dstack-tree", undefined);
 		}
+	});
+
+	pi.on("agent_start", async () => {
+		rootState = "working";
+		await publishMachineStatus();
+	});
+
+	pi.on("agent_settled", async () => {
+		rootState = "idle";
+		await publishMachineStatus();
 	});
 
 	pi.on("before_agent_start", async (_event, ctx) => {
@@ -700,6 +803,9 @@ export default function dstack(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		pendingContinuation = undefined;
+		stopStatusHeartbeat();
+		rootState = "idle";
+		await publishMachineStatus(new Date().toISOString());
 		eventBusPort?.close();
 		eventBusPort = undefined;
 		nestedTaskRegistry.clear();
@@ -916,6 +1022,10 @@ export default function dstack(pi: ExtensionAPI) {
 			return new Text(rows.join("\n"), 0, 0);
 		},
 		async execute(_id, params, signal, _onUpdate, ctx) {
+			statusTree = undefined;
+			currentNestedTaskId = undefined;
+			taskTerminalState = undefined;
+			await publishMachineStatus();
 			let parentDepth: ReturnType<typeof spawnableDepth>;
 			try {
 				parentDepth = spawnableDepth();
@@ -970,6 +1080,7 @@ export default function dstack(pi: ExtensionAPI) {
 						});
 					}
 					startTreePolling(receipt.taskId, receipt.workflowId, ctx);
+					await publishMachineStatus();
 					return textResult(JSON.stringify(receipt), receipt);
 				} catch (error) {
 					return textResult(error instanceof Error ? error.message : String(error), {}, true);
@@ -994,6 +1105,8 @@ export default function dstack(pi: ExtensionAPI) {
 				mode: launched.mode,
 				taskCount: launched.taskCount,
 			};
+			currentNestedTaskId = launched.taskId;
+			await publishMachineStatus();
 			return textResult(JSON.stringify(receipt), receipt);
 		},
 	});
@@ -1013,6 +1126,7 @@ export default function dstack(pi: ExtensionAPI) {
 			return new Text(`${summary} (${keyHint("app.tools.expand", "to expand")})`, 0, 0);
 		},
 		async execute(_id, params, signal, _onUpdate, ctx) {
+			await publishMachineStatus();
 			if (nestedTaskRegistry.has(params.taskId)) {
 				const record = nestedTaskRegistry.get(params.taskId)!;
 				const result = projectNestedResult(record, params.detail);
@@ -1021,6 +1135,8 @@ export default function dstack(pi: ExtensionAPI) {
 					: undefined;
 				if (usage !== undefined) record.usageClaimed = true;
 				nestedTaskRegistry.prune();
+				if (record.status !== "running") taskTerminalState = record.status === "completed" ? "completed" : "failed";
+				await publishMachineStatus();
 				return textResult(JSON.stringify(result), result, false, usage);
 			}
 
@@ -1034,6 +1150,9 @@ export default function dstack(pi: ExtensionAPI) {
 				readCommittedResult: files.readCommittedResult,
 			});
 			const terminal = result.kind === "complete" || result.kind === "artifact" || result.kind === "cancelled" || result.kind === "runner_failed";
+			if (terminal) {
+				taskTerminalState = result.kind === "cancelled" ? "cancelled" : result.kind === "runner_failed" ? "failed" : "completed";
+			}
 			if (activeWorkflow?.taskId === params.taskId && terminal) {
 				if (ctx) lastContext = ctx;
 				await pollTreeTick();
@@ -1055,6 +1174,7 @@ export default function dstack(pi: ExtensionAPI) {
 					if (unreportedUsage !== undefined && await files.claimUsage(binding)) usage = unreportedUsage;
 				}
 			}
+			await publishMachineStatus();
 			return textResult(JSON.stringify(result), result, false, usage);
 		},
 	});
@@ -1066,6 +1186,7 @@ export default function dstack(pi: ExtensionAPI) {
 			"Cancel or abort a running dstack task by task id. Idempotent for already-terminal tasks.",
 		parameters: KillParams,
 		async execute(_id, params, signal, _onUpdate, ctx) {
+			await publishMachineStatus();
 			if (nestedTaskRegistry.has(params.taskId)) {
 				const record = nestedTaskRegistry.get(params.taskId)!;
 				if (record.status !== "running") {
@@ -1078,6 +1199,8 @@ export default function dstack(pi: ExtensionAPI) {
 				}
 				nestedTaskRegistry.cancel(params.taskId);
 				await record.completionPromise;
+				taskTerminalState = "cancelled";
+				await publishMachineStatus();
 				const killRes: DstackKillResult = {
 					taskId: params.taskId,
 					status: "killed",
@@ -1132,6 +1255,7 @@ export default function dstack(pi: ExtensionAPI) {
 						status: "killed",
 						message: "Task cancelled successfully.",
 					};
+					taskTerminalState = "cancelled";
 					if (activeWorkflow?.taskId === params.taskId) {
 						if (ctx) lastContext = ctx;
 						ambientStatus = undefined;
@@ -1141,6 +1265,7 @@ export default function dstack(pi: ExtensionAPI) {
 						persistActiveWorkflow(undefined);
 						stopTreeTimer();
 					}
+					await publishMachineStatus();
 					return textResult(JSON.stringify(killRes), killRes);
 				} catch (err) {
 					let latest: CompanionTaskState | undefined;
@@ -1213,18 +1338,26 @@ export default function dstack(pi: ExtensionAPI) {
 					if (!ctx.hasUI) {
 						return textResult("dstack_ask requires UI", {}, true);
 					}
-					if (parsed.confirm || (!parsed.options && !parsed.allowMultiple)) {
-						const yes = await ctx.ui.confirm(parsed.prompt, "");
-						return textResult(yes ? "yes" : "no");
+					const previousStatus = rootSemanticStatus;
+					rootSemanticStatus = { blockedOn: parsed.confirm ? "approval" : "human", updatedAt: new Date().toISOString() };
+					await publishMachineStatus();
+					try {
+						if (parsed.confirm || (!parsed.options && !parsed.allowMultiple)) {
+							const yes = await ctx.ui.confirm(parsed.prompt, "");
+							return textResult(yes ? "yes" : "no");
+						}
+						const labels = (parsed.options ?? []).map((o) => o.label);
+						if (labels.length === 0) {
+							return textResult("options are required unless confirm is true", {}, true);
+						}
+						const picked = await ctx.ui.select(parsed.prompt, labels);
+						if (picked === undefined) return textResult("(cancelled)");
+						const match = parsed.options?.find((o) => o.label === picked) ?? { id: picked, label: picked };
+						return textResult(match.id, match);
+					} finally {
+						rootSemanticStatus = previousStatus;
+						await publishMachineStatus();
 					}
-					const labels = (parsed.options ?? []).map((o) => o.label);
-					if (labels.length === 0) {
-						return textResult("options are required unless confirm is true", {}, true);
-					}
-					const picked = await ctx.ui.select(parsed.prompt, labels);
-					if (picked === undefined) return textResult("(cancelled)");
-					const match = parsed.options?.find((o) => o.label === picked) ?? { id: picked, label: picked };
-					return textResult(match.id, match);
 				},
 			});
 		}
