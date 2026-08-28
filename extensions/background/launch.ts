@@ -80,6 +80,7 @@ export async function launchTaskGroup(input: Readonly<{
 	config: DstackConfig;
 	agents: readonly AgentConfig[];
 	extensionPath: string;
+	companionExtensionPaths: readonly string[];
 	skillPath: string;
 	runnerPath: string;
 	port: BackgroundTaskPort;
@@ -142,6 +143,7 @@ export async function launchTaskGroup(input: Readonly<{
 		schedulerTotalSlots: input.config.scheduler.totalSlots,
 		artifactDir,
 		extensionPath: await realpath(input.extensionPath),
+		companionExtensionPaths: await Promise.all(input.companionExtensionPaths.map((path) => realpath(path))),
 		piChildLaunch: { executable: childLaunch.command, argvPrefix: childLaunch.argsPrefix },
 		mode: input.request.kind,
 		childDepth: 1,

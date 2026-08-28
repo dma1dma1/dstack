@@ -458,10 +458,11 @@ export function launchNestedTask(options: {
 	ctxCwd: string;
 	skillPath: string;
 	extensionPath: string;
+	companionExtensionPaths: readonly string[];
 	childDepth: ChildDepth;
 	registry: NestedTaskRegistry;
 }): { taskId: string; mode: string; taskCount: number; record: NestedTaskRecord } {
-	const { request, config, agents, ctxCwd, skillPath, extensionPath, childDepth, registry } = options;
+	const { request, config, agents, ctxCwd, skillPath, extensionPath, companionExtensionPaths, childDepth, registry } = options;
 	const taskId = `nested-${randomUUID()}`;
 	const groupId = taskId;
 	const specs = request.kind === "single" ? [request.spec] : request.specs;
@@ -706,6 +707,7 @@ export function launchNestedTask(options: {
 				const args = buildChildArgv({
 					task: spec.task,
 					extensionPath,
+					companionExtensionPaths,
 					model: model.value.model,
 					omitModel: model.value.omitModel,
 					tools: childTools,

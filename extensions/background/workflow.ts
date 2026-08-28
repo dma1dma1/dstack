@@ -41,6 +41,7 @@ export type WorkflowManifestV1 = Readonly<{
 	schedulerTotalSlots?: number;
 	artifactDir: string;
 	extensionPath: string;
+	companionExtensionPaths?: readonly string[];
 	piChildLaunch: Readonly<{ executable: string; argvPrefix: readonly string[] }>;
 	mode: WorkflowMode;
 	childDepth: 1;
@@ -421,6 +422,7 @@ export async function executeWorkflow(
 			const args = buildChildArgv({
 				task,
 				extensionPath: manifest.extensionPath,
+				companionExtensionPaths: manifest.companionExtensionPaths,
 				model: spec.model,
 				omitModel: spec.omitModel,
 				tools: allowStatusTool(spec.tools),

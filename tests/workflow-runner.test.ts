@@ -29,6 +29,7 @@ import { buildTreeSnapshot } from "../extensions/background/tree.ts";
 const execFileAsync = promisify(execFile);
 const runnerPath = fileURLToPath(new URL("../extensions/background/runner.ts", import.meta.url));
 const extensionPath = fileURLToPath(new URL("../extensions/dstack.ts", import.meta.url));
+const testMcpExtensionPath = fileURLToPath(new URL("./fixtures/mcp-extension.ts", import.meta.url));
 
 async function temporaryDirectory(t: TestContext): Promise<string> {
 	const path = await mkdtemp(join(tmpdir(), "dstack-runner-test-"));
@@ -87,11 +88,35 @@ test("Pi child launch facts are resolved before the runner starts", async (t) =>
 	assert.deepEqual(frozen.argsPrefix, [await realpath(entry)]);
 });
 
+test("depth-1 workflow execution passes the MCP extension to the child Pi process", async (t) => {
+	const cwd = await temporaryDirectory(t);
+	const workflow = {
+		...manifest({ artifactDir: join(cwd, "artifacts"), cwd, specs: [spec(cwd, "check MCP")] }),
+		companionExtensionPaths: [testMcpExtensionPath],
+	};
+	let argv: string[] | undefined;
+	await executeWorkflow(workflow, "9".repeat(64), new AbortController().signal, {
+		spawnChild: async ({ args }) => {
+			argv = args;
+			return child("ok");
+		},
+	});
+	assert.ok(argv !== undefined);
+	assert.equal(argv.filter((arg) => arg === "-e").length, 2);
+	assert.equal(argv[argv.lastIndexOf("-e") + 1], testMcpExtensionPath);
+});
+
 test("manifest validation rejects malformed launch facts and mode shapes", async (t) => {
 	const cwd = await temporaryDirectory(t);
 	const good = manifest({ artifactDir: join(cwd, "artifacts"), cwd, specs: [spec(cwd, "ok")] });
 	assert.equal(parseWorkflowManifest(good).piChildLaunch.executable, process.execPath);
+	assert.deepEqual(
+		parseWorkflowManifest({ ...good, companionExtensionPaths: [testMcpExtensionPath] }).companionExtensionPaths,
+		[testMcpExtensionPath],
+	);
+	assert.equal(parseWorkflowManifest(good).companionExtensionPaths, undefined);
 	assert.throws(() => parseWorkflowManifest({ ...good, childDepth: 2 }), /childDepth/);
+	assert.throws(() => parseWorkflowManifest({ ...good, companionExtensionPaths: "not-an-array" }), /string array/);
 	assert.throws(() => parseWorkflowManifest({ ...good, piChildLaunch: { executable: "pi", argvPrefix: [] } }), /absolute/);
 	assert.throws(() => parseWorkflowManifest({ ...good, mode: "single", specs: [spec(cwd, "a"), spec(cwd, "b")] }), /one spec/);
 	assert.throws(() => parseWorkflowManifest({ ...good, specs: [spec(cwd, "bad", { tools: "read,,grep" })] }), /empty tool/);

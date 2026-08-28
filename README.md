@@ -104,7 +104,7 @@ Leftover trees stay on disk. From the parent repo: `git worktree remove <path>`,
 
 ## Security
 
-Extensions run with full access to your machine. Review this package before you install it. Child agents launch with `--no-extensions` plus one explicit absolute `-e` path for dstack. dstack sets `DSTACK_NESTING=1` for root children and `2` for their terminal children.
+Extensions run with full access to your machine. Review this package before you install it. Child agents launch with `--no-extensions` plus explicit absolute `-e` paths for dstack and the MCP extension already loaded in the parent session. This propagation happens at both nesting levels. An explicit `tools` allowlist on a task can still restrict MCP intentionally. dstack sets `DSTACK_NESTING=1` for root children and `2` for their terminal children.
 
 ## License
 
