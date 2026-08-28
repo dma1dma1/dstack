@@ -106,24 +106,46 @@ test("progress tracker emits phase and narration changes while deduplicating rep
 	assert.equal(cleared[0]?.kind === "blocker" ? cleared[0].blocked : undefined, false);
 });
 
-test("progress tracker coalesces tool bursts and rate limits routine entries", () => {
+test("progress tracker groups consecutive journal tools under phase with intent, details, outcomes, and duration", () => {
 	const tracker = new TranscriptProgressTracker();
-	tracker.ingest(snapshot([child()]), BASE_TIME);
+	tracker.ingest(snapshot([child({ phase: "implementation" })]), BASE_TIME);
 	const withTools = snapshot([child({
+		phase: "implementation",
 		journal: [
 			{ seq: 1, timestamp: "2025-01-01T00:00:01.000Z", kind: "tool", name: "read", gist: "a.ts" },
 			{ seq: 2, timestamp: "2025-01-01T00:00:02.000Z", kind: "tool", name: "read", gist: "b.ts" },
-			{ seq: 3, timestamp: "2025-01-01T00:00:03.000Z", kind: "tool", name: "bash", gist: "npm test" },
+			{
+				seq: 3,
+				timestamp: "2025-01-01T00:00:03.000Z",
+				kind: "tool",
+				name: "bash",
+				gist: "npm test",
+				durationMs: 1_250,
+				result: { status: "succeeded" },
+			},
 		],
 	})]);
-	assert.deepEqual(tracker.ingest(withTools, BASE_TIME + 3_000), []);
+	const whileRunning = snapshot([child({
+		phase: "implementation",
+		journal: withTools.children[0]?.journal?.map((entry) => entry.kind === "tool" && entry.seq === 3
+			? { seq: entry.seq, timestamp: entry.timestamp, kind: entry.kind, name: entry.name, gist: entry.gist }
+			: entry),
+	})]);
+	assert.deepEqual(tracker.ingest(whileRunning, BASE_TIME + 3_000), []);
 	const emitted = tracker.ingest(withTools, BASE_TIME + 4_000);
-	assert.deepEqual(kinds(emitted), ["tool_burst"]);
-	assert.deepEqual(emitted[0]?.kind === "tool_burst" ? emitted[0].tools : undefined, [
-		{ name: "read", count: 2 },
-		{ name: "bash", count: 1 },
+	assert.deepEqual(kinds(emitted), ["activity_group"]);
+	const activity = emitted[0];
+	assert.ok(activity?.kind === "activity_group");
+	assert.equal(activity.phase, "implementation");
+	assert.deepEqual(activity.items.map(({ name, intent, gist }) => ({ name, intent, gist })), [
+		{ name: "read", intent: "Inspect", gist: "a.ts" },
+		{ name: "read", intent: "Inspect", gist: "b.ts" },
+		{ name: "bash", intent: "Verify", gist: "npm test" },
 	]);
-	assert.equal(emitted[0]?.kind === "tool_burst" ? emitted[0].total : undefined, 3);
+	assert.match(renderTranscriptProgress(activity), /owner 1 · poteto-agent · implementation · Inspect read ×2 · a.ts/);
+	const expanded = renderTranscriptProgress(activity, true);
+	assert.match(expanded, /Verify · bash · npm test · completed · 1.3s/);
+	assert.match(expanded, /child 0 · 2025-01-01T00:00:04.000Z/);
 	assert.deepEqual(tracker.ingest(withTools, BASE_TIME + 8_000), []);
 });
 
@@ -209,9 +231,21 @@ test("progress schema parser and renderer bound data and expose nested failure a
 	assert.ok(parsed !== undefined);
 	assert.equal(parsed.kind === "nested_return" ? parsed.summary : undefined, "password=[redacted] assertion failed");
 	const rendered = renderTranscriptProgress(parsed, true);
-	assert.match(rendered, /✗ worker general-purpose · returned failed/);
+	assert.match(rendered, /✗ worker 3 · general-purpose · returned failed/);
 	assert.match(rendered, /child 0 · nested group-a\/2/);
 	assert.match(rendered, /2025-01-01T00:00:02.000Z/);
+	const legacyToolBurst = parseTranscriptProgressEvent({
+		schemaVersion: PROGRESS_SCHEMA_VERSION,
+		taskId: "task-progress",
+		workflowId: "workflow-progress",
+		at: "2025-01-01T00:00:03.000Z",
+		kind: "tool_burst",
+		actor: { kind: "child", childIndex: 0, agent: "poteto-agent", assignment: "owner" },
+		tools: [{ name: "read", count: 2 }],
+		total: 2,
+	});
+	assert.ok(legacyToolBurst?.kind === "tool_burst");
+	assert.match(renderTranscriptProgress(legacyToolBurst), /read ×2/);
 	assert.equal(parseTranscriptProgressEvent({ ...parsed, schemaVersion: "dstack.progress.v2" }), undefined);
 	assert.equal(parseTranscriptProgressEvent({ ...parsed, actor: { kind: "nested", parentIndex: -1 } }), undefined);
 });

@@ -299,7 +299,7 @@ export async function freezePiChildLaunch(input: Readonly<{
 
 export type ChildContentPart =
 	| { type: "text"; text: string }
-	| { type: "toolCall"; name: string; arguments: Record<string, unknown> }
+	| { type: "toolCall"; id?: string; name: string; arguments: Record<string, unknown> }
 	| {
 			type: "toolUpdate";
 			id: string;
@@ -312,6 +312,9 @@ export type ChildMessage = {
 	role: string;
 	content: ChildContentPart[];
 	toolCallId?: string;
+	isError?: boolean;
+	durationMs?: number;
+	timestamp?: number;
 	stopReason?: string;
 	errorMessage?: string;
 	provider?: string;
@@ -402,7 +405,12 @@ function parseContentPart(value: unknown): ChildContentPart | undefined {
 	if (!isRecord(value)) return undefined;
 	if (value.type === "text" && typeof value.text === "string") return { type: "text", text: value.text };
 	if (value.type === "toolCall" && typeof value.name === "string" && isRecord(value.arguments)) {
-		return { type: "toolCall", name: value.name, arguments: value.arguments };
+		return {
+			type: "toolCall",
+			...(typeof value.id === "string" ? { id: value.id } : {}),
+			name: value.name,
+			arguments: value.arguments,
+		};
 	}
 	return undefined;
 }
@@ -416,6 +424,11 @@ function parseMessage(value: unknown): ChildMessage | undefined {
 		role: value.role,
 		content,
 		toolCallId: optionalString(value.toolCallId),
+		isError: typeof value.isError === "boolean" ? value.isError : undefined,
+		durationMs: typeof value.durationMs === "number" && Number.isFinite(value.durationMs) && value.durationMs >= 0
+			? value.durationMs
+			: undefined,
+		timestamp: optionalNumber(value.timestamp),
 		stopReason: optionalString(value.stopReason),
 		errorMessage: optionalString(value.errorMessage),
 		provider: optionalString(value.provider),

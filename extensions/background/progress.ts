@@ -1,4 +1,14 @@
-import { sanitizeString, type JournalEntry, type SemanticStatus } from "./journal.ts";
+import {
+	formatDuration,
+	formatToolActivityItem,
+	groupToolActivity,
+	sanitizeString,
+	type JournalEntry,
+	type SemanticStatus,
+	type ToolActivityGroup,
+	type ToolActivityItem,
+	type ToolJournalResult,
+} from "./journal.ts";
 import { isLeaseSnapshot, type SpawnNestedChild, type TreeChild, type TreeSnapshot } from "./tree.ts";
 
 export const PROGRESS_ENTRY = "dstack-progress";
@@ -8,12 +18,14 @@ export const ROUTINE_PROGRESS_INTERVAL_MS = 4_000;
 const MAX_PROGRESS_TEXT_CHARS = 240;
 const MAX_PROGRESS_TASK_CHARS = 120;
 const MAX_TOOL_KINDS = 6;
+const MAX_ACTIVITY_ITEMS = 32;
 const MAX_DEDUPE_KEYS = 128;
 
 type ChildActor = Readonly<{
 	kind: "child";
 	childIndex: number;
 	agent: string;
+	role?: string;
 	assignment?: "owner" | "worker" | "reviewer";
 }>;
 
@@ -23,6 +35,7 @@ type NestedActor = Readonly<{
 	groupId: string;
 	nestedIndex: number;
 	agent: string;
+	role?: string;
 	assignment?: "owner" | "worker" | "reviewer";
 }>;
 
@@ -39,6 +52,7 @@ type ProgressCommon = Readonly<{
 type ProgressDetails =
 	| Readonly<{ kind: "phase"; phase: string; note?: string }>
 	| Readonly<{ kind: "narration"; text: string }>
+	| Readonly<{ kind: "activity_group"; phase?: string; note?: string; items: readonly ToolActivityItem[] }>
 	| Readonly<{ kind: "tool_burst"; tools: readonly Readonly<{ name: string; count: number }>[]; total: number }>
 	| Readonly<{ kind: "nested_launch"; task: string }>
 	| Readonly<{ kind: "nested_return"; state: "succeeded" | "failed" | "cancelled" | "skipped"; summary?: string }>
@@ -59,8 +73,9 @@ type PendingNarration = Readonly<{
 
 type ToolBucket = {
 	actor: ProgressActor;
-	counts: Map<string, number>;
-	total: number;
+	phase?: string;
+	note?: string;
+	items: ToolActivityItem[];
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -74,8 +89,9 @@ function isAssignment(value: unknown): value is "owner" | "worker" | "reviewer" 
 function parseActor(value: unknown): ProgressActor | undefined {
 	if (!isRecord(value) || typeof value.kind !== "string" || typeof value.agent !== "string") return undefined;
 	const assignment = isAssignment(value.assignment) ? value.assignment : undefined;
+	const role = typeof value.role === "string" && value.role.length > 0 ? sanitizeString(value.role, 60) : undefined;
 	if (value.kind === "child" && typeof value.childIndex === "number" && Number.isSafeInteger(value.childIndex) && value.childIndex >= 0) {
-		return { kind: "child", childIndex: value.childIndex, agent: sanitizeString(value.agent, 40), assignment };
+		return { kind: "child", childIndex: value.childIndex, agent: sanitizeString(value.agent, 40), role, assignment };
 	}
 	if (
 		value.kind === "nested" &&
@@ -89,10 +105,39 @@ function parseActor(value: unknown): ProgressActor | undefined {
 			groupId: sanitizeString(value.groupId, 80),
 			nestedIndex: value.nestedIndex,
 			agent: sanitizeString(value.agent, 40),
+			role,
 			assignment,
 		};
 	}
 	return undefined;
+}
+
+function parseToolActivityItem(value: unknown): ToolActivityItem | undefined {
+	if (!isRecord(value)) return undefined;
+	if (typeof value.seq !== "number" || !Number.isSafeInteger(value.seq) || value.seq < 0) return undefined;
+	if (typeof value.timestamp !== "string" || !Number.isFinite(Date.parse(value.timestamp))) return undefined;
+	if (typeof value.name !== "string" || typeof value.intent !== "string" || typeof value.gist !== "string") return undefined;
+	const durationMs = typeof value.durationMs === "number" && Number.isFinite(value.durationMs) && value.durationMs >= 0
+		? value.durationMs
+		: undefined;
+	const rawResult = isRecord(value.result) ? value.result : undefined;
+	const result: ToolJournalResult | undefined = rawResult !== undefined && (rawResult.status === "succeeded" || rawResult.status === "failed")
+		? {
+				status: rawResult.status,
+				...(typeof rawResult.summary === "string"
+					? { summary: sanitizeString(rawResult.summary, 120) }
+					: {}),
+			}
+		: undefined;
+	return {
+		seq: value.seq,
+		timestamp: value.timestamp,
+		name: sanitizeString(value.name, 40),
+		intent: sanitizeString(value.intent, 40),
+		gist: sanitizeString(value.gist, 120),
+		...(durationMs !== undefined ? { durationMs } : {}),
+		...(result !== undefined ? { result } : {}),
+	};
 }
 
 export function parseTranscriptProgressEvent(value: unknown): TranscriptProgressEvent | undefined {
@@ -113,6 +158,18 @@ export function parseTranscriptProgressEvent(value: unknown): TranscriptProgress
 	}
 	if (value.kind === "narration" && typeof value.text === "string" && value.text.length > 0) {
 		return { ...common, kind: "narration", text: sanitizeString(value.text, MAX_PROGRESS_TEXT_CHARS) };
+	}
+	if (value.kind === "activity_group" && Array.isArray(value.items)) {
+		const items = value.items.slice(0, MAX_ACTIVITY_ITEMS).map(parseToolActivityItem).filter((item): item is ToolActivityItem => item !== undefined);
+		if (items.length > 0) {
+			return {
+				...common,
+				kind: "activity_group",
+				phase: typeof value.phase === "string" ? sanitizeString(value.phase, 100) : undefined,
+				note: typeof value.note === "string" ? sanitizeString(value.note, MAX_PROGRESS_TEXT_CHARS) : undefined,
+				items,
+			};
+		}
 	}
 	if (value.kind === "tool_burst" && Array.isArray(value.tools) && typeof value.total === "number" && Number.isSafeInteger(value.total) && value.total > 0) {
 		const tools: Array<Readonly<{ name: string; count: number }>> = [];
@@ -144,8 +201,32 @@ function actorKey(actor: ProgressActor): string {
 }
 
 function actorLabel(actor: ProgressActor): string {
-	const role = actor.assignment ?? (actor.kind === "nested" ? "worker" : "agent");
-	return `${role} ${actor.agent}`;
+	const assignment = actor.assignment ?? (actor.kind === "nested" ? "worker" : "agent");
+	const ordinal = actor.kind === "child" ? actor.childIndex + 1 : actor.nestedIndex + 1;
+	const role = actor.role !== undefined && actor.role !== assignment ? ` · ${actor.role}` : "";
+	return `${assignment} ${ordinal}${role} · ${actor.agent}`;
+}
+
+function summarizeActivity(items: readonly ToolActivityItem[]): string {
+	const summaries = new Map<string, Readonly<{ intent: string; name: string; count: number; first: ToolActivityItem }>>();
+	for (const item of items) {
+		const key = `${item.intent}\u0000${item.name}`;
+		const previous = summaries.get(key);
+		summaries.set(key, previous === undefined
+			? { intent: item.intent, name: item.name, count: 1, first: item }
+			: { ...previous, count: previous.count + 1 });
+	}
+	const text = [...summaries.values()].map((summary) => {
+		const count = summary.count > 1 ? ` ×${summary.count}` : "";
+		const outcome = summary.count === 1 && summary.first.result !== undefined
+			? summary.first.result.status === "succeeded" ? " · ✓" : " · ✗"
+			: "";
+		const duration = summary.count === 1 && summary.first.durationMs !== undefined
+			? ` ${formatDuration(summary.first.durationMs)}`
+			: "";
+		return `${summary.intent} ${summary.name}${count} · ${summary.first.gist}${outcome}${duration}`;
+	}).join("; ");
+	return sanitizeString(text, MAX_PROGRESS_TEXT_CHARS);
 }
 
 function color(theme: ProgressTheme | undefined, name: string, text: string): string {
@@ -162,6 +243,11 @@ export function renderTranscriptProgress(event: TranscriptProgressEvent, expande
 		case "narration":
 			line = `${color(theme, "accent", "◐")} ${label} · ${event.text}`;
 			break;
+		case "activity_group": {
+			const heading = event.phase ?? event.note;
+			line = `${color(theme, "dim", "→")} ${label}${heading ? ` · ${heading}` : ""} · ${summarizeActivity(event.items)}`;
+			break;
+		}
 		case "tool_burst": {
 			const tools = event.tools.map((tool) => `${tool.name}${tool.count > 1 ? ` ×${tool.count}` : ""}`).join(", ");
 			line = `${color(theme, "dim", "→")} ${label} · ${tools}`;
@@ -193,11 +279,20 @@ export function renderTranscriptProgress(event: TranscriptProgressEvent, expande
 	const attribution = event.actor.kind === "child"
 		? `child ${event.actor.childIndex}`
 		: `child ${event.actor.parentIndex} · nested ${event.actor.groupId}/${event.actor.nestedIndex}`;
-	return `${line}\n${color(theme, "dim", `${attribution} · ${event.at}`)}`;
+	const details = event.kind === "activity_group"
+		? event.items.map((item) => `  ${formatToolActivityItem(item)}`).join("\n")
+		: "";
+	return `${line}${details ? `\n${details}` : ""}\n${color(theme, "dim", `${attribution} · ${event.at}`)}`;
 }
 
 function childActor(child: TreeChild): ChildActor {
-	return { kind: "child", childIndex: child.index, agent: sanitizeString(child.agent, 40), assignment: child.assignment };
+	return {
+		kind: "child",
+		childIndex: child.index,
+		agent: sanitizeString(child.agent, 40),
+		role: child.role,
+		assignment: child.assignment,
+	};
 }
 
 function nestedActor(parent: TreeChild, nested: SpawnNestedChild): NestedActor {
@@ -207,6 +302,7 @@ function nestedActor(parent: TreeChild, nested: SpawnNestedChild): NestedActor {
 		groupId: sanitizeString(nested.groupId, 80),
 		nestedIndex: nested.nestedIndex,
 		agent: sanitizeString(nested.agent, 40),
+		role: nested.role,
 		assignment: nested.assignment,
 	};
 }
@@ -230,16 +326,20 @@ export class TranscriptProgressTracker {
 	private previous: TreeSnapshot | undefined;
 	private lastRoutineAt = 0;
 	private readonly journalSeq = new Map<string, number>();
+	private readonly toolVersions = new Map<string, string>();
 	private readonly pendingNarration = new Map<string, PendingNarration>();
 	private readonly pendingTools = new Map<string, ToolBucket>();
+	private readonly readyTools: ToolBucket[] = [];
 	private readonly emitted = new Set<string>();
 
 	reset(): void {
 		this.previous = undefined;
 		this.lastRoutineAt = 0;
 		this.journalSeq.clear();
+		this.toolVersions.clear();
 		this.pendingNarration.clear();
 		this.pendingTools.clear();
+		this.readyTools.length = 0;
 		this.emitted.clear();
 	}
 
@@ -260,7 +360,15 @@ export class TranscriptProgressTracker {
 					this.pushImmediate(immediate, this.event(snapshot, actor, nowMs, { kind: "failure", text: sanitizeString(child.outcome ?? "child agent failed", MAX_PROGRESS_TEXT_CHARS) }));
 				}
 			}
-			this.captureJournal(snapshot, actor, child.journal, immediate, nowMs);
+			this.captureJournal(
+				snapshot,
+				actor,
+				child.journal,
+				prior?.status?.phase ?? prior?.phase,
+				prior?.status?.note,
+				immediate,
+				nowMs,
+			);
 			this.captureNested(snapshot, prior, child, immediate, nowMs);
 		}
 
@@ -274,12 +382,25 @@ export class TranscriptProgressTracker {
 		this.previous = snapshot;
 		this.lastRoutineAt = nowMs;
 		for (const child of snapshot.children) {
-			this.journalSeq.set(actorKey(childActor(child)), journalMaxSeq(child.journal));
+			const actor = childActor(child);
+			this.initializeJournal(actor, child.journal);
 			for (const nested of child.nested) {
 				if (isLeaseSnapshot(nested)) continue;
-				this.journalSeq.set(actorKey(nestedActor(child, nested)), journalMaxSeq(nested.journal));
+				this.initializeJournal(nestedActor(child, nested), nested.journal);
 			}
 		}
+	}
+
+	private initializeJournal(actor: ProgressActor, journal: readonly JournalEntry[] | undefined): void {
+		const key = actorKey(actor);
+		this.journalSeq.set(key, journalMaxSeq(journal));
+		for (const entry of journal ?? []) {
+			if (entry.kind === "tool") this.toolVersions.set(`${key}:${entry.seq}`, this.toolVersion(entry));
+		}
+	}
+
+	private toolVersion(entry: Extract<JournalEntry, { kind: "tool" }>): string {
+		return `${entry.durationMs ?? ""}\u0000${entry.result?.status ?? ""}\u0000${entry.result?.summary ?? ""}`;
 	}
 
 	private captureNested(snapshot: TreeSnapshot, priorParent: TreeChild | undefined, parent: TreeChild, output: TranscriptProgressEvent[], nowMs: number): void {
@@ -296,7 +417,15 @@ export class TranscriptProgressTracker {
 				this.pushImmediate(output, this.event(snapshot, actor, nowMs, { kind: "nested_launch", task: sanitizeString(nested.taskPreview || "nested task", MAX_PROGRESS_TASK_CHARS) }));
 			}
 			if (prior) this.captureStatus(snapshot, actor, prior.workflow?.phase, prior.status, nested.workflow?.phase, nested.status, output, nowMs);
-			this.captureJournal(snapshot, actor, nested.journal, output, nowMs);
+			this.captureJournal(
+				snapshot,
+				actor,
+				nested.journal,
+				prior?.status?.phase ?? prior?.workflow?.phase,
+				prior?.status?.note,
+				output,
+				nowMs,
+			);
 			if (isTerminalState(nested.state) && (!prior || !isTerminalState(prior.state))) {
 				const summary = nested.state === "failed"
 					? nested.errorMessage ?? nested.activity
@@ -351,15 +480,36 @@ export class TranscriptProgressTracker {
 		}
 	}
 
-	private captureJournal(snapshot: TreeSnapshot, actor: ProgressActor, journal: readonly JournalEntry[] | undefined, output: TranscriptProgressEvent[], nowMs: number): void {
+	private captureJournal(
+		snapshot: TreeSnapshot,
+		actor: ProgressActor,
+		journal: readonly JournalEntry[] | undefined,
+		initialPhase: string | undefined,
+		initialNote: string | undefined,
+		output: TranscriptProgressEvent[],
+		nowMs: number,
+	): void {
 		const key = actorKey(actor);
 		const seen = this.journalSeq.get(key) ?? 0;
 		let max = seen;
+		const unseen = (journal ?? []).filter((entry) => entry.seq > seen);
+		for (const group of groupToolActivity(unseen, { phase: initialPhase, note: initialNote })) {
+			this.queueToolGroup(actor, group);
+		}
 		for (const entry of journal ?? []) {
+			if (entry.kind !== "tool") continue;
+			const versionKey = `${key}:${entry.seq}`;
+			const version = this.toolVersion(entry);
+			const previousVersion = this.toolVersions.get(versionKey);
+			this.toolVersions.set(versionKey, version);
+			if (previousVersion === undefined || previousVersion === version) continue;
+			const updatedGroup = groupToolActivity([entry], { phase: initialPhase, note: initialNote })[0];
+			if (updatedGroup === undefined || this.refreshPendingTool(key, updatedGroup.items[0]) === true) continue;
+			this.queueToolGroup(actor, updatedGroup);
+		}
+		for (const entry of unseen) {
 			max = Math.max(max, entry.seq);
-			if (entry.seq <= seen) continue;
-			if (entry.kind === "tool") this.queueTool(actor, entry.name);
-			else if (entry.kind === "turn" && entry.summary) this.queueNarration(actor, entry.summary);
+			if (entry.kind === "turn" && entry.summary) this.queueNarration(actor, entry.summary);
 			else if (entry.kind === "phase" && entry.blocking === true) {
 				this.pushImmediate(output, this.event(snapshot, actor, nowMs, { kind: "blocker", blocked: true, text: sanitizeString(entry.note ?? entry.phase ?? "blocked", MAX_PROGRESS_TEXT_CHARS) }));
 			} else if (entry.kind === "phase" && entry.phase) {
@@ -381,16 +531,41 @@ export class TranscriptProgressTracker {
 		this.pendingNarration.set(actorKey(actor), { actor, text: clean });
 	}
 
-	private queueTool(actor: ProgressActor, name: string): void {
-		const key = actorKey(actor);
-		let bucket = this.pendingTools.get(key);
-		if (!bucket) {
-			bucket = { actor, counts: new Map(), total: 0 };
-			this.pendingTools.set(key, bucket);
+	private refreshPendingTool(key: string, item: ToolActivityItem | undefined): boolean {
+		if (item === undefined) return false;
+		const buckets = [this.pendingTools.get(key), ...this.readyTools];
+		for (const bucket of buckets) {
+			if (bucket === undefined || actorKey(bucket.actor) !== key) continue;
+			const index = bucket.items.findIndex((candidate) => candidate.seq === item.seq);
+			if (index === -1) continue;
+			bucket.items[index] = item;
+			return true;
 		}
-		const clean = sanitizeString(name, 40);
-		bucket.total += 1;
-		bucket.counts.set(clean, (bucket.counts.get(clean) ?? 0) + 1);
+		return false;
+	}
+
+	private queueToolGroup(actor: ProgressActor, group: ToolActivityGroup): void {
+		const key = actorKey(actor);
+		const existing = this.pendingTools.get(key);
+		const first = group.items[0];
+		const lastExisting = existing?.items.at(-1);
+		const consecutive = first !== undefined && lastExisting !== undefined && first.seq === lastExisting.seq + 1;
+		if (
+			existing !== undefined &&
+			consecutive &&
+			existing.phase === group.phase &&
+			existing.note === group.note
+		) {
+			existing.items.push(...group.items);
+			return;
+		}
+		if (existing !== undefined) this.readyTools.push(existing);
+		this.pendingTools.set(key, {
+			actor,
+			...(group.phase !== undefined ? { phase: group.phase } : {}),
+			...(group.note !== undefined ? { note: group.note } : {}),
+			items: [...group.items],
+		});
 	}
 
 	private flushRoutine(snapshot: TreeSnapshot, nowMs: number): TranscriptProgressEvent | undefined {
@@ -403,14 +578,19 @@ export class TranscriptProgressTracker {
 			this.lastRoutineAt = nowMs;
 			return event;
 		}
-		const tools = this.pendingTools.entries().next().value;
-		if (!tools) return undefined;
-		this.pendingTools.delete(tools[0]);
-		const rows = [...tools[1].counts.entries()]
-			.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-			.slice(0, MAX_TOOL_KINDS)
-			.map(([name, count]) => ({ name, count }));
-		const event = this.event(snapshot, tools[1].actor, nowMs, { kind: "tool_burst", tools: rows, total: tools[1].total });
+		let tools = this.readyTools.shift();
+		if (tools === undefined) {
+			const active = this.pendingTools.entries().next().value;
+			if (active === undefined) return undefined;
+			this.pendingTools.delete(active[0]);
+			tools = active[1];
+		}
+		const event = this.event(snapshot, tools.actor, nowMs, {
+			kind: "activity_group",
+			...(tools.phase !== undefined ? { phase: tools.phase } : {}),
+			...(tools.note !== undefined ? { note: tools.note } : {}),
+			items: tools.items.slice(0, MAX_ACTIVITY_ITEMS),
+		});
 		this.lastRoutineAt = nowMs;
 		return event;
 	}
@@ -431,6 +611,7 @@ export class TranscriptProgressTracker {
 		switch (details.kind) {
 			case "phase": return { ...common, ...details };
 			case "narration": return { ...common, ...details };
+			case "activity_group": return { ...common, ...details };
 			case "tool_burst": return { ...common, ...details };
 			case "nested_launch": return { ...common, ...details };
 			case "nested_return": return { ...common, ...details };
