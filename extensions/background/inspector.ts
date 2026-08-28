@@ -1207,7 +1207,7 @@ export class AgentInspector implements Component {
 	private listScroll = 0;
 	private visibleItems: NavigableItem[] = [];
 
-	private detailView: DetailViewMode = "conversation";
+	private detailView: DetailViewMode = "summary";
 	private summaryScrollTop = 0;
 	private lastSummaryLineCount = 0;
 	private taskScrollTop = 0;
@@ -1549,7 +1549,7 @@ export class AgentInspector implements Component {
 					workflowId: item.workflowId,
 					childIndex: item.childIndex,
 				});
-				this.detailView = "conversation";
+				this.detailView = "summary";
 				this.conversationScrollTop = 0;
 				this.conversationFollow = true;
 				this.summaryScrollTop = 0;
@@ -1594,7 +1594,7 @@ export class AgentInspector implements Component {
 					nestedGroupId: item.nestedGroupId,
 					nestedIndex: item.nestedIndex,
 				});
-				this.detailView = "conversation";
+				this.detailView = "summary";
 				this.conversationScrollTop = 0;
 				this.conversationFollow = true;
 				this.summaryScrollTop = 0;
@@ -1735,7 +1735,7 @@ export class AgentInspector implements Component {
 						nestedGroupId: firstNested.groupId,
 						nestedIndex: firstNested.nestedIndex,
 					});
-					this.detailView = "conversation";
+					this.detailView = "summary";
 					this.conversationScrollTop = 0;
 					this.conversationFollow = true;
 					this.summaryScrollTop = 0;
