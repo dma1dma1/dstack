@@ -121,10 +121,12 @@ test("a successful child process fails when its final turn abandons a launched n
 	});
 
 	assert.equal(result.exitCode, 1);
-	assert.equal(
-		result.text,
-		"Child agent exited before collecting launched task nested-repro. Call dstack_result or dstack_kill before finishing.",
+	assert.equal(result.text, "I’m implementing and verifying now.");
+	assert.match(
+		result.errorMessage ?? "",
+		/Child agent exited before collecting launched task nested-repro/,
 	);
+	assert.deepEqual(result.unresolvedTaskIds, ["nested-repro"]);
 });
 
 test("a failed on-spawn boundary kills the child before accepting JSON", async (t) => {

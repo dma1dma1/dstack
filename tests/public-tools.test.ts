@@ -9,7 +9,8 @@ import dstack from "../extensions/dstack.ts";
 import { commitWorkflowResult, parseWorkflowManifest } from "../extensions/background/runner.ts";
 import { createLocalSlotAcquirer, executeWorkflow, DSTACK_ARTIFACT_DIR_ENV, DSTACK_CHILD_INDEX_ENV, ROOT_WORKFLOW_ENV, SCHEDULER_ROOT_ENV } from "../extensions/background/workflow.ts";
 import { parseSpawnRecordV1, STALE_ACTIVITY_THRESHOLD_MS } from "../extensions/background/tree.ts";
-import { formatStaleWakePrompt, restoreFiredStaleWakes, shouldTriggerStaleWake } from "../extensions/task-registry.ts";
+import { formatStaleWakePrompt, restoreFiredStaleWakes, shouldTriggerCompletionWake, shouldTriggerStaleWake } from "../extensions/task-registry.ts";
+import { classifyFailure, MAX_OWNER_ATTEMPTS, nextRecoveryAction, type RecoveryLineage } from "../extensions/background/recovery.ts";
 import { acquireChildSlot, snapshotActiveLeases } from "../extensions/background/scheduler.ts";
 import { toAbsolutePath } from "../extensions/background/artifacts.ts";
 
@@ -1325,6 +1326,69 @@ test("shouldTriggerStaleWake pure helper enforces one-shot, staleness, terminal,
 	assert.equal(shouldTriggerStaleWake({ snapshot: nestedStaleSnapshot, firedTaskIds: firedSet, control: safeControl }), true);
 });
 
+test("completion wake and recovery decision helpers enforce dedupe and bounded-retry invariants", () => {
+	const committedSnapshot = {
+		taskId: "task-cw",
+		workflowId: "wf-cw",
+		mode: "single" as const,
+		createdAt: new Date().toISOString(),
+		committed: true,
+		counts: { queued: 0, running: 0, complete: 1, total: 1 },
+		slots: { active: 0, capacity: 4 },
+		children: [],
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		capturedAt: new Date().toISOString(),
+	};
+	const idle = { isIdle: true, hasPendingMessages: false };
+	assert.equal(shouldTriggerCompletionWake({ snapshot: committedSnapshot, collected: false, firedTaskIds: new Set(), control: idle }), true);
+	assert.equal(shouldTriggerCompletionWake({ snapshot: committedSnapshot, collected: true, firedTaskIds: new Set(), control: idle }), false);
+	assert.equal(shouldTriggerCompletionWake({ snapshot: committedSnapshot, collected: false, firedTaskIds: new Set(["task-cw"]), control: idle }), false);
+	assert.equal(shouldTriggerCompletionWake({ snapshot: { ...committedSnapshot, committed: false }, collected: false, firedTaskIds: new Set(), control: idle }), false);
+	assert.equal(shouldTriggerCompletionWake({ snapshot: committedSnapshot, collected: false, firedTaskIds: new Set(), control: { isIdle: true, hasPendingMessages: true } }), false);
+
+	const completeView = (exitCode: number) => ({
+		kind: "complete" as const,
+		taskId: "bg-1",
+		detail: "full" as const,
+		package: {
+			mode: "single" as const,
+			results: [{ agent: "poteto-agent", cwd: "/", task: "t", text: "", exitCode, stderr: "", messages: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 } }],
+		},
+	});
+	assert.equal(classifyFailure(completeView(0)), "success");
+	assert.equal(classifyFailure(completeView(1)), "retryable");
+	assert.equal(classifyFailure({ kind: "runner_failed", taskId: "bg-1", message: "boom", companionOutputPath: "" }), "retryable");
+	assert.equal(classifyFailure({ kind: "cancelled", taskId: "bg-1", message: "user killed" }), "unrecoverable");
+
+	const lineage: RecoveryLineage = {
+		lineageId: "bg-1",
+		request: { kind: "single", spec: { agent: "poteto-agent", task: "do it" } },
+		currentTaskId: "bg-1",
+		attempts: [],
+		status: "active",
+	};
+	assert.deepEqual(nextRecoveryAction(lineage, "bg-1", "retryable"), { kind: "relaunch", attemptNumber: 2 });
+	assert.deepEqual(nextRecoveryAction(lineage, "bg-stale", "retryable"), { kind: "ignore" });
+	assert.deepEqual(nextRecoveryAction({ ...lineage, status: "resolved" }, "bg-1", "retryable"), { kind: "ignore" });
+	assert.deepEqual(
+		nextRecoveryAction({ ...lineage, attempts: [{ taskId: "bg-1", endedAt: "2025-01-01T00:00:00.000Z", reason: "crash" }] }, "bg-1", "retryable"),
+		{ kind: "ignore" },
+	);
+	const exhaustedAttempts = Array.from({ length: MAX_OWNER_ATTEMPTS - 1 }, (_, i) => ({
+		taskId: `bg-old-${i}`,
+		endedAt: "2025-01-01T00:00:00.000Z",
+		reason: "crash",
+	}));
+	const exhausted = nextRecoveryAction({ ...lineage, attempts: exhaustedAttempts }, "bg-1", "retryable");
+	assert.equal(exhausted.kind, "stop");
+	assert.equal(exhausted.kind === "stop" ? exhausted.status : undefined, "exhausted");
+	const resolved = nextRecoveryAction(lineage, "bg-1", "success");
+	assert.equal(resolved.kind === "stop" ? resolved.status : undefined, "resolved");
+	const unrecoverable = nextRecoveryAction(lineage, "bg-1", "unrecoverable");
+	assert.equal(unrecoverable.kind === "stop" ? unrecoverable.status : undefined, "unrecoverable");
+});
+
 test("stale-parent wake-up triggers one hidden follow-up and survives session reload without duplicate", async (t) => {
 	const home = await mkdtemp(join(tmpdir(), "dstack-stale-wake-"));
 	t.after(() => rm(home, { recursive: true, force: true }));
@@ -1446,7 +1510,8 @@ test("nested depth-1 task supports immediate receipt, running inspection, dstack
 		const receipt = launch.details as { taskId: string; mode: string };
 		assert.ok(receipt?.taskId);
 
-		const runningRes = await resultTool.execute("r-run", { taskId: receipt.taskId }, undefined, undefined, runtime.ctx);
+		// dstack_result now blocks on running nested tasks; an aborted signal projects the running state immediately
+		const runningRes = await resultTool.execute("r-run", { taskId: receipt.taskId }, AbortSignal.abort(), undefined, runtime.ctx);
 		const runningDetails = runningRes.details as { kind: string };
 		assert.ok(runningDetails.kind === "running" || runningDetails.kind === "complete");
 

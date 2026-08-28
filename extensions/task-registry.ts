@@ -268,6 +268,43 @@ export function restoreFiredStaleWakes(entries: readonly SessionEntryLike[]): Se
 	return fired;
 }
 
+export function restoreFiredCompletionWakes(entries: readonly SessionEntryLike[]): Set<string> {
+	const fired = new Set<string>();
+	for (const entry of entries) {
+		if (entry.type !== "custom" || entry.customType !== "dstack-completion-wake") continue;
+		if (isRecord(entry.data) && typeof entry.data.taskId === "string") {
+			fired.add(entry.data.taskId);
+		}
+	}
+	return fired;
+}
+
+export function shouldTriggerCompletionWake(input: {
+	snapshot?: TreeSnapshot;
+	collected: boolean;
+	firedTaskIds: ReadonlySet<string>;
+	control: { isIdle: boolean; hasPendingMessages: boolean };
+}): boolean {
+	if (!input.snapshot) return false;
+	if (!input.snapshot.committed) return false;
+	if (input.collected) return false;
+	if (input.firedTaskIds.has(input.snapshot.taskId)) return false;
+	if (!input.control.isIdle || input.control.hasPendingMessages) return false;
+	return true;
+}
+
+export function formatCompletionWakePrompt(taskId: string): string {
+	return `Task "${taskId}" has committed its result (success or failure). Call dstack_result with taskId "${taskId}" now to collect it.`;
+}
+
+export function formatRunnerFailureWakePrompt(taskId: string, status: string): string {
+	return `The background runner for task "${taskId}" is ${status} and no result was committed. Call dstack_result with taskId "${taskId}" to inspect the failure.`;
+}
+
+export function formatNestedCompletionPrompt(taskId: string, status: string): string {
+	return `Nested task "${taskId}" reached terminal status ${status}. Call dstack_result once with taskId "${taskId}" to collect its success or failure.`;
+}
+
 export class NestedTaskRegistry {
 	private readonly tasks = new Map<string, NestedTaskRecord>();
 

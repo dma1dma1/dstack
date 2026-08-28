@@ -214,6 +214,7 @@ export type TaskSummaryResult = Readonly<{
 	exitCode: number;
 	step?: number;
 	errorMessage?: string;
+	unresolvedTaskIds?: readonly string[];
 }>;
 
 export type TaskSummaryDetails = Readonly<{
@@ -240,6 +241,7 @@ export function summaryPackage(committed: Extract<CommittedResult, { kind: "comp
 			exitCode: result.exitCode,
 			...(result.step !== undefined ? { step: result.step } : {}),
 			...(result.errorMessage ? { errorMessage: bounded(result.errorMessage, ERROR_CAP) } : {}),
+			...(result.unresolvedTaskIds !== undefined ? { unresolvedTaskIds: result.unresolvedTaskIds } : {}),
 		})),
 	};
 }
