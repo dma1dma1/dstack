@@ -724,10 +724,15 @@ async function collectLeases(root: AbsolutePath, cache: LivenessCache): Promise<
 
 export async function snapshotSchedulerCapacity(root: string | AbsolutePath): Promise<SchedulerCapacity> {
 	const read = await readJsonFile(join(root, "capacity.json"));
-	if (read.kind === "missing") return capacityFor(DEFAULT_TOTAL_SLOTS);
-	if (read.kind !== "value") throw corruptStateError("capacity.json is unreadable");
-	const capacity = parseCapacity(read.value);
-	if (capacity === undefined) throw corruptStateError("capacity.json does not parse as a capacity record");
+	let capacity: CapacityRecord;
+	if (read.kind === "missing") {
+		capacity = capacityFor(DEFAULT_TOTAL_SLOTS);
+	} else {
+		if (read.kind !== "value") throw corruptStateError("capacity.json is unreadable");
+		const parsed = parseCapacity(read.value);
+		if (parsed === undefined) throw corruptStateError("capacity.json does not parse as a capacity record");
+		capacity = parsed;
+	}
 	return {
 		totalActiveSlots: capacity.totalActiveSlots,
 		nestingCapableLimit: capacity.nestingCapableLimit,
