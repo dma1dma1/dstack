@@ -47,7 +47,17 @@ export function formatReportHumanReadable(report: TelemetryReportV1): string {
 	lines.push(`   Limitation: ${report.ownerDelegationCohorts.causalityLimitation}`);
 	lines.push("");
 
-	lines.push("5. Role & Model Associations (Observational):");
+	lines.push("5. Provenance and Launch Failures:");
+	lines.push(`   Included Workflows: ${report.provenance.includedWorkflows}`);
+	lines.push(`   Excluded Test Workflows: ${report.provenance.excludedTestWorkflows}`);
+	lines.push(`   Included by Provenance: ${JSON.stringify(report.provenance.byProvenance)}`);
+	lines.push(`   Pre-Launch Configuration Failures: ${report.launchFailures.preLaunchConfiguration}`);
+	lines.push(`   Other Pre-Launch Failures: ${report.launchFailures.preLaunchOther}`);
+	lines.push(`   Execution Failures: ${report.launchFailures.execution}`);
+	lines.push(`   Unknown Failure Stage: ${report.launchFailures.unknown}`);
+	lines.push("");
+
+	lines.push("6. Role & Model Associations (Launched Executions Only):");
 	for (const rm of report.roleModelReliability) {
 		lines.push(
 			`   ${rm.role} (${rm.resolvedModel}): ${rm.totalInvocations} runs | ${rm.succeededCount} succeeded | ${rm.failedCount} failed | ${rm.abandonedCount} abandoned | repeatedDelegations=${rm.observableRepeatedDelegationCount} | failureRate=${(rm.failureRate * 100).toFixed(1)}%`,
@@ -55,7 +65,7 @@ export function formatReportHumanReadable(report: TelemetryReportV1): string {
 	}
 	lines.push("");
 
-	lines.push("6. Worker Economics (Direct Cost Comparison):");
+	lines.push("7. Worker Economics (Direct Cost Comparison):");
 	lines.push(`   Lightweight Worker Runs: ${report.workerEconomics.lightweightWorkerRuns}`);
 	lines.push(`   Worker Runs With Cost: ${report.workerEconomics.lightweightWorkerRunsWithCost}`);
 	lines.push(`   Worker Direct Cost: $${report.workerEconomics.lightweightWorkerDirectCost.toFixed(4)}`);
@@ -76,7 +86,7 @@ export function formatReportHumanReadable(report: TelemetryReportV1): string {
 	lines.push(`   Note: ${report.workerEconomics.evaluationNote}`);
 	lines.push("");
 
-	lines.push("7. Durable Queue Events:");
+	lines.push("8. Durable Queue Events:");
 	const queue = report.queueEvents;
 	lines.push(`   Tickets Created: ${queue.ticketCreated}`);
 	lines.push(`   Slots Acquired: ${queue.slotAcquired}`);
@@ -89,7 +99,7 @@ export function formatReportHumanReadable(report: TelemetryReportV1): string {
 	lines.push(`   By Capacity Class: ${JSON.stringify(queue.byCapacityClass)}`);
 	lines.push("");
 
-	lines.push("8. Data Join Reliability:");
+	lines.push("9. Data Join Reliability:");
 	const dj = report.dataJoinReliability;
 	const fmtJoin = (joined: number, total: number, rate: number | null) =>
 		`${joined}/${total}${rate !== null ? ` (${(rate * 100).toFixed(1)}%)` : " (n/a)"}`;
@@ -101,7 +111,7 @@ export function formatReportHumanReadable(report: TelemetryReportV1): string {
 	lines.push(`   Overall Data Join Rate: ${fmtJoin(dj.totalJoinsSuccessful, dj.totalJoinsAttempted, dj.overallJoinRate)}`);
 	lines.push("");
 
-	lines.push("9. Workflow Outcome Reliability:");
+	lines.push("10. Workflow Outcome Reliability:");
 	const outcomes = report.workflowOutcomeReliability;
 	lines.push(`   Total: ${outcomes.totalWorkflows}`);
 	lines.push(`   Succeeded: ${outcomes.succeeded}`);
@@ -112,7 +122,7 @@ export function formatReportHumanReadable(report: TelemetryReportV1): string {
 	lines.push(`   By Mode: ${JSON.stringify(outcomes.byMode)}`);
 	lines.push("");
 
-	lines.push("10. Data Completeness & Limitations:");
+	lines.push("11. Data Completeness & Limitations:");
 	lines.push(`   Scanned Sessions: ${report.recoverableAndMissingMetrics.scannedSessions}`);
 	lines.push(`   Scanned Workflows: ${report.recoverableAndMissingMetrics.scannedWorkflows}`);
 	lines.push(`   Scanned Children: ${report.recoverableAndMissingMetrics.scannedChildren}`);
@@ -132,6 +142,7 @@ export async function runTelemetryCli(argv: readonly string[]): Promise<number> 
 	let sessionsDir: string | undefined;
 	let from: string | undefined;
 	let to: string | undefined;
+	let includeTests = false;
 
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
@@ -148,6 +159,8 @@ export async function runTelemetryCli(argv: readonly string[]): Promise<number> 
 			from = argv[++i];
 		} else if (arg === "--to" && i + 1 < argv.length) {
 			to = argv[++i];
+		} else if (arg === "--include-tests") {
+			includeTests = true;
 		} else if (arg === "--help" || arg === "-h") {
 			process.stdout.write(`Usage: telemetry [options]\n\n`);
 			process.stdout.write(`Options:\n`);
@@ -157,6 +170,7 @@ export async function runTelemetryCli(argv: readonly string[]): Promise<number> 
 			process.stdout.write(`  --sessions-dir <dir>    Path to Pi sessions directory\n`);
 			process.stdout.write(`  --from <timestamp>      Include workflows at or after this ISO timestamp\n`);
 			process.stdout.write(`  --to <timestamp>        Include workflows at or before this ISO timestamp\n`);
+			process.stdout.write(`  --include-tests         Include workflows marked or inferred as tests\n`);
 			process.stdout.write(`  --help, -h              Show this help message\n`);
 			return 0;
 		}
@@ -172,6 +186,7 @@ export async function runTelemetryCli(argv: readonly string[]): Promise<number> 
 		backgroundRoot,
 		sessionsDir,
 		timeWindow: { from, to },
+		includeTests,
 	});
 
 	if (jsonOutput) {

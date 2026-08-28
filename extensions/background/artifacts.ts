@@ -12,6 +12,12 @@ export type OutputArtifactSeal = Readonly<{
 	bytes: number;
 }>;
 
+export type DeclaredArtifact = Readonly<{
+	name: string;
+	path: string;
+	sha256?: string;
+}>;
+
 export function toAbsolutePath(value: string): AbsolutePath {
 	if (!isAbsolute(value) || normalize(value) !== value) throw new Error("path must be absolute and normalized");
 	return value as AbsolutePath;
@@ -70,6 +76,33 @@ export async function writeSealedArtifact(path: string, bytes: string | Buffer):
 	const buffer = typeof bytes === "string" ? Buffer.from(bytes) : bytes;
 	await atomicWriteFile(path, buffer);
 	return sealBytes(path, buffer);
+}
+
+export async function verifyDeclaredArtifacts(artifacts: readonly DeclaredArtifact[]): Promise<void> {
+	const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+	for (const artifact of artifacts) {
+		if (!isAbsolute(artifact.path) || normalize(artifact.path) !== artifact.path) {
+			throw new Error(`declared artifact ${artifact.name} has an invalid path`);
+		}
+		const handle = await open(artifact.path, constants.O_RDONLY | noFollow);
+		try {
+			const opened = await handle.stat();
+			const linked = await lstat(artifact.path);
+			if (!opened.isFile() || !linked.isFile() || linked.isSymbolicLink()) {
+				throw new Error(`declared artifact ${artifact.name} is not a regular file`);
+			}
+			if (opened.dev !== linked.dev || opened.ino !== linked.ino) {
+				throw new Error(`declared artifact ${artifact.name} changed identity while reading`);
+			}
+			if (artifact.sha256 !== undefined) {
+				if (!/^[a-f0-9]{64}$/u.test(artifact.sha256)) throw new Error(`declared artifact ${artifact.name} has an invalid sha256`);
+				const digest = createHash("sha256").update(await handle.readFile()).digest("hex");
+				if (digest !== artifact.sha256) throw new Error(`declared artifact ${artifact.name} sha256 mismatch`);
+			}
+		} finally {
+			await handle.close();
+		}
+	}
 }
 
 export async function readOutputArtifact(seal: OutputArtifactSeal): Promise<Buffer> {

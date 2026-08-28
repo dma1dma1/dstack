@@ -1,6 +1,6 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, rm, unlink, rmdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, unlink, rmdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChildDepth, DstackConfig, TaskRequest, TaskSpec, WorkflowAssignment } from "./types.ts";
@@ -40,6 +40,7 @@ import {
 	STALE_ACTIVITY_THRESHOLD_MS,
 	taskPreviewOf,
 	type SpawnChildV1,
+	parseSpawnRecordV1,
 	type SpawnRecordV1,
 	type TreeSnapshot,
 } from "./background/tree.ts";
@@ -91,11 +92,14 @@ export type FailedChildLifecycle = Readonly<{
 	model?: string;
 }>;
 
+export type CancellationReason = "user_requested" | "parent_cancelled" | "registry_cleared";
+
 export type CancelledChildLifecycle = Readonly<{
 	stage: "cancelled";
 	startedAt?: string;
 	endedAt: string;
 	message?: string;
+	cancellationReason: CancellationReason;
 	usage?: ChildResult["usage"];
 	latestStatus?: SemanticStatus;
 	journal?: readonly JournalEntry[];
@@ -144,6 +148,7 @@ export type TaskResult = ChildResult & {
 	cwd: string;
 	task: string;
 	step?: number;
+	cancellationReason?: CancellationReason;
 	status?: SemanticStatus;
 	journal?: readonly JournalEntry[];
 };
@@ -178,6 +183,8 @@ export type NestedTaskRecord = {
 	details?: TaskDetails;
 	errorMessage?: string;
 	cancelledMessage?: string;
+	cancellationReason?: CancellationReason;
+	markCollected?: () => Promise<void>;
 	readCount: number;
 	usageClaimed: boolean;
 	completionPromise: Promise<TaskDetails>;
@@ -322,13 +329,14 @@ export class NestedTaskRegistry {
 		return this.tasks.has(taskId);
 	}
 
-	cancel(taskId: string): boolean {
+	cancel(taskId: string, reason: CancellationReason = "user_requested"): boolean {
 		const record = this.tasks.get(taskId);
 		if (!record) return false;
 		if (record.status !== "running") return false;
-		record.abortController.abort(new Error("Task was killed"));
+		record.abortController.abort(new Error(`Task cancelled: ${reason}`));
 		record.status = "cancelled";
-		record.cancelledMessage = "The task was cancelled.";
+		record.cancelledMessage = `The task was cancelled (${reason}).`;
+		record.cancellationReason = reason;
 		record.endedAt = new Date().toISOString();
 		return true;
 	}
@@ -349,10 +357,8 @@ export class NestedTaskRegistry {
 	}
 
 	clear(): void {
-		for (const record of this.tasks.values()) {
-			if (record.status === "running") {
-				record.abortController.abort(new Error("Registry cleared"));
-			}
+		for (const [taskId, record] of this.tasks.entries()) {
+			if (record.status === "running") this.cancel(taskId, "registry_cleared");
 		}
 		this.tasks.clear();
 	}
@@ -442,6 +448,81 @@ export function projectNestedResult(record: NestedTaskRecord, detail: "summary" 
 	};
 }
 
+export async function markNestedTaskCollected(record: NestedTaskRecord): Promise<void> {
+	if (record.status === "running") return;
+	await record.markCollected?.();
+}
+
+function persistedNestedDetails(record: SpawnRecordV1): TaskDetails {
+	return {
+		mode: record.mode,
+		results: record.children.map((child, index) => ({
+			agent: child.agent,
+			cwd: child.cwd ?? process.cwd(),
+			task: child.taskFull ?? child.taskPreview,
+			text: child.finalResponse ?? "",
+			exitCode: child.exitCode ?? (child.state === "succeeded" ? 0 : 1),
+			stderr: child.stderr ?? "",
+			messages: [],
+			usage: child.usage ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			...(record.mode === "chain" ? { step: index + 1 } : {}),
+			...(child.model !== undefined ? { model: child.model } : {}),
+			...(child.errorMessage !== undefined ? { errorMessage: child.errorMessage } : {}),
+			...(child.stopReason !== undefined ? { stopReason: child.stopReason } : {}),
+			...(child.status !== undefined ? { status: child.status } : {}),
+			...(child.journal !== undefined ? { journal: child.journal } : {}),
+			...(child.cancellationReason !== undefined ? { cancellationReason: child.cancellationReason } : {}),
+		})),
+	};
+}
+
+export async function readPersistedNestedResult(input: Readonly<{
+	artifactDir: string;
+	parentIndex: number;
+	taskId: string;
+	detail?: "summary" | "full";
+}>): Promise<DstackResultView | undefined> {
+	if (!/^nested-[a-f0-9-]{36}$/u.test(input.taskId)) return undefined;
+	const path = join(input.artifactDir, "children", String(input.parentIndex), "spawns", `${input.taskId}.json`);
+	let rawText: string;
+	try {
+		rawText = await readFile(path, "utf8");
+	} catch (error) {
+		if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return undefined;
+		throw error;
+	}
+	const raw: unknown = JSON.parse(rawText);
+	const persisted = parseSpawnRecordV1(raw);
+	if (persisted === undefined || persisted.groupId !== input.taskId || persisted.parentIndex !== input.parentIndex) {
+		throw new Error("persisted nested task record is invalid");
+	}
+	const live = persisted.children.some((child) => child.state === "queued" || child.state === "running");
+	if (live) {
+		const children: ChildStateView[] = persisted.children.map((child) => ({
+			index: child.nestedIndex,
+			state: child.state,
+			agent: child.agent,
+			...(child.activity !== undefined ? { latestActivity: child.activity } : {}),
+			...(child.status !== undefined ? { latestStatus: child.status } : {}),
+		}));
+		return projectRunning(input.taskId, {
+			queued: children.filter((child) => child.state === "queued").length,
+			running: children.filter((child) => child.state === "running").length,
+			complete: children.filter((child) => child.state !== "queued" && child.state !== "running").length,
+			total: children.length,
+			children,
+		}, input.detail);
+	}
+	if (!isRecord(raw)) throw new Error("persisted nested task record is invalid");
+	if (persisted.collectedAt === undefined) {
+		await atomicWriteFile(path, `${JSON.stringify({ ...raw, collectedAt: new Date().toISOString() }, null, 2)}\n`);
+	}
+	const details = persistedNestedDetails(persisted);
+	return input.detail === "full"
+		? { kind: "complete", taskId: input.taskId, detail: "full", package: details }
+		: { kind: "complete", taskId: input.taskId, detail: "summary", package: summaryPackage({ kind: "complete", package: details }) };
+}
+
 export function claimNestedUsage(record: NestedTaskRecord): Usage | undefined {
 	if (record.status === "running" || record.details === undefined || record.usageClaimed) {
 		return undefined;
@@ -478,10 +559,10 @@ export function launchNestedTask(options: {
 			candidateIndex: request.kind === "parallel" ? idx : 0,
 			overrideReason: spec.overrideReason,
 		});
-		const launchModel = resolveNestedLaunchModel({
-			resolution: modelRes.ok ? modelRes.value : undefined,
-			env: process.env,
-		});
+		const agentExists = agents.some((candidate) => candidate.name === resolved.agent);
+		const launchModel = agentExists && modelRes.ok
+			? resolveNestedLaunchModel({ resolution: modelRes.value, env: process.env })
+			: undefined;
 		return {
 			spec,
 			agent: resolved.agent,
@@ -517,6 +598,7 @@ export function launchNestedTask(options: {
 	const spawnsDir = canPersistSpawns ? join(artifactDirEnv, "children", String(parentIndex), "spawns") : undefined;
 	const spawnRecordPath = spawnsDir !== undefined ? join(spawnsDir, `${groupId}.json`) : undefined;
 	const spawnPhase = specs.map((s) => s.workflow?.phase).find((p): p is string => typeof p === "string" && p.length > 0);
+	let collectedAt: string | undefined;
 
 	const spawnChildren: SpawnChildV1[] = specs.map((spec, idx) => {
 		const childInfo = initialChildren[idx]!;
@@ -542,7 +624,7 @@ export function launchNestedTask(options: {
 		let lastWriteTime = 0;
 		let timer: NodeJS.Timeout | undefined;
 		let writeChain: Promise<void> = Promise.resolve();
-		let disposed = false;
+		let lastError: Error | undefined;
 
 		const doWrite = async () => {
 			const record: SpawnRecordV1 = {
@@ -553,17 +635,20 @@ export function launchNestedTask(options: {
 				mode: request.kind,
 				phase: spawnPhase,
 				createdAt: initialCreatedAt,
+				collectedAt,
 				children: spawnChildren.map((c) => ({ ...c })),
 			};
 			try {
 				await mkdir(spawnsDir, { recursive: true, mode: 0o700 });
 				await atomicWriteFile(spawnRecordPath, `${JSON.stringify(record, null, 2)}\n`);
 				lastWriteTime = Date.now();
-			} catch {}
+				lastError = undefined;
+			} catch (error) {
+				lastError = error instanceof Error ? error : new Error(String(error));
+			}
 		};
 
 		const scheduleWrite = (): Promise<void> => {
-			if (disposed) return Promise.resolve();
 			if (timer !== undefined) {
 				clearTimeout(timer);
 				timer = undefined;
@@ -574,7 +659,6 @@ export function launchNestedTask(options: {
 
 		return {
 			writeThrottled() {
-				if (disposed) return;
 				const elapsed = Date.now() - lastWriteTime;
 				if (elapsed >= minIntervalMs && timer === undefined) {
 					void scheduleWrite();
@@ -588,19 +672,19 @@ export function launchNestedTask(options: {
 				}
 			},
 			async flush() {
-				if (disposed) return;
 				if (timer !== undefined) {
 					clearTimeout(timer);
 					timer = undefined;
 				}
 				await scheduleWrite();
+				if (lastError !== undefined) throw new Error(`nested task artifact write failed: ${lastError.message}`);
 			},
-			dispose() {
-				disposed = true;
+			async dispose() {
 				if (timer !== undefined) {
 					clearTimeout(timer);
 					timer = undefined;
 				}
+				await writeChain;
 			},
 		};
 	}
@@ -610,6 +694,7 @@ export function launchNestedTask(options: {
 	const runOne = async (spec: TaskSpec, index: number, signal: AbortSignal): Promise<TaskResult> => {
 		let childTmpDir: string | undefined;
 		let recorder: ChildJournalRecorder | undefined;
+		const launch = { stage: "configuration" as "configuration" | "pre_launch" | "execution" };
 		try {
 			const resolved = resolveAgent(spec);
 			const agent = agents.find((candidate) => candidate.name === resolved.agent);
@@ -629,6 +714,7 @@ export function launchNestedTask(options: {
 				resolution: model.value,
 				env: process.env,
 			});
+			launch.stage = "pre_launch";
 			let cwd = spec.cwd ?? ctxCwd;
 			if (spec.worktree) {
 				cwd = await createWorktree({
@@ -724,6 +810,12 @@ export function launchNestedTask(options: {
 					env,
 					signal,
 					onSpawn: (pid) => {
+						launch.stage = "execution";
+						const spawned = spawnChildren[index];
+						if (spawned !== undefined) {
+							spawnChildren[index] = { ...spawned, launchState: "started" };
+							spawnRecordWriter?.writeThrottled();
+						}
 						void lease?.bindChild(pid).catch(() => {});
 						const cur = initialChildren[index]!.lifecycle;
 						if (cur.stage === "running") {
@@ -783,6 +875,7 @@ export function launchNestedTask(options: {
 				const session = await readChildSessionRef({ refPath: sessionRefPath, sessionDir });
 				const completed: TaskResult = {
 					...child,
+					...(signal.aborted ? { cancellationReason: record.cancellationReason ?? "parent_cancelled" } : {}),
 					agent: resolved.agent,
 					cwd,
 					task: spec.task,
@@ -799,6 +892,7 @@ export function launchNestedTask(options: {
 						startedAt,
 						endedAt: now,
 						message: "Child agent was aborted",
+						cancellationReason: record.cancellationReason ?? "parent_cancelled",
 						usage: completed.usage,
 						latestStatus: completed.status,
 						journal: completed.journal,
@@ -836,6 +930,9 @@ export function launchNestedTask(options: {
 					spawnChildren[index] = {
 						...existingSpawn,
 						state: signal.aborted ? "cancelled" : completed.exitCode === 0 ? "succeeded" : "failed",
+						launchState: "started",
+						failureKind: completed.exitCode === 0 || signal.aborted ? undefined : "execution",
+						cancellationReason: signal.aborted ? record.cancellationReason ?? "parent_cancelled" : undefined,
 						exitCode: completed.exitCode,
 						finalResponse: completed.text,
 						errorMessage: completed.errorMessage,
@@ -868,6 +965,7 @@ export function launchNestedTask(options: {
 						stage: "cancelled",
 						endedAt: now,
 						message: errorMsg,
+						cancellationReason: record.cancellationReason ?? "parent_cancelled",
 					};
 				} else {
 					childInfo.lifecycle = {
@@ -888,9 +986,18 @@ export function launchNestedTask(options: {
 			}
 			const existingSpawn = spawnChildren[index];
 			if (existingSpawn !== undefined && existingSpawn.state !== "succeeded" && existingSpawn.state !== "failed" && existingSpawn.state !== "cancelled") {
+				const failureKind = launch.stage === "configuration"
+					? "pre_launch_configuration"
+					: launch.stage === "execution"
+						? "execution"
+						: "pre_launch_other";
 				spawnChildren[index] = {
 					...existingSpawn,
 					state: signal.aborted ? "cancelled" : "failed",
+					launchState: launch.stage === "execution" ? "started" : "not_started",
+					failureKind: signal.aborted ? undefined : failureKind,
+					cancellationReason: signal.aborted ? record.cancellationReason ?? "parent_cancelled" : undefined,
+					model: launch.stage === "configuration" ? undefined : existingSpawn.model,
 					errorMessage: err instanceof Error ? err.message : String(err),
 					updatedAt: now,
 					endedAt: now,
@@ -917,12 +1024,22 @@ export function launchNestedTask(options: {
 		readCount: 0,
 		usageClaimed: false,
 		completionPromise,
+		markCollected: spawnRecordWriter === undefined ? undefined : async () => {
+			if (collectedAt !== undefined) return;
+			collectedAt = new Date().toISOString();
+			try {
+				await spawnRecordWriter.flush();
+			} catch (error) {
+				collectedAt = undefined;
+				throw error;
+			}
+		},
 	};
 
 	void (async () => {
-		await spawnRecordWriter?.flush();
 		const signal = abortController.signal;
 		try {
+			await spawnRecordWriter?.flush();
 			if (request.kind === "chain") {
 				const results: TaskResult[] = [];
 				let previous = "";
@@ -954,7 +1071,7 @@ export function launchNestedTask(options: {
 							}
 							await spawnRecordWriter?.flush();
 							record.status = signal.aborted ? "cancelled" : "completed";
-							if (signal.aborted) record.cancelledMessage = "The task was cancelled.";
+							if (signal.aborted) record.cancelledMessage = `The task was cancelled (${record.cancellationReason ?? "parent_cancelled"}).`;
 							record.endedAt = now;
 							record.details = details;
 							resolveCompletion(details);
@@ -982,7 +1099,7 @@ export function launchNestedTask(options: {
 						await spawnRecordWriter?.flush();
 						if (signal.aborted) {
 							record.status = "cancelled";
-							record.cancelledMessage = "The task was cancelled.";
+							record.cancelledMessage = `The task was cancelled (${record.cancellationReason ?? "parent_cancelled"}).`;
 						} else {
 							record.status = "failed";
 							record.errorMessage = err instanceof Error ? err.message : String(err);
@@ -996,7 +1113,7 @@ export function launchNestedTask(options: {
 				const now = new Date().toISOString();
 				if (signal.aborted) {
 					record.status = "cancelled";
-					record.cancelledMessage = "The task was cancelled.";
+					record.cancelledMessage = `The task was cancelled (${record.cancellationReason ?? "parent_cancelled"}).`;
 				} else {
 					record.status = "completed";
 				}
@@ -1010,7 +1127,7 @@ export function launchNestedTask(options: {
 			const now = new Date().toISOString();
 			if (signal.aborted) {
 				record.status = "cancelled";
-				record.cancelledMessage = "The task was cancelled.";
+				record.cancelledMessage = `The task was cancelled (${record.cancellationReason ?? "parent_cancelled"}).`;
 			} else {
 				record.status = "completed";
 			}
@@ -1019,30 +1136,42 @@ export function launchNestedTask(options: {
 			resolveCompletion(details);
 		} catch (err) {
 			const now = new Date().toISOString();
+			const errorMessage = err instanceof Error ? err.message : String(err);
 			for (let i = 0; i < specs.length; i++) {
 				const c = spawnChildren[i];
 				if (c !== undefined && (c.state === "queued" || c.state === "running")) {
 					spawnChildren[i] = {
 						...c,
 						state: signal.aborted ? "cancelled" : "failed",
+						cancellationReason: signal.aborted ? record.cancellationReason ?? "parent_cancelled" : undefined,
+						errorMessage: signal.aborted ? undefined : errorMessage,
 						updatedAt: now,
 						endedAt: now,
 					};
 				}
+				const result = details.results[i];
+				if (result !== undefined && result.exitCode === -1) {
+					details.results[i] = {
+						...result,
+						exitCode: 1,
+						errorMessage,
+						...(signal.aborted ? { cancellationReason: record.cancellationReason ?? "parent_cancelled" } : {}),
+					};
+				}
 			}
-			await spawnRecordWriter?.flush();
+			await spawnRecordWriter?.flush().catch(() => undefined);
 			if (signal.aborted) {
 				record.status = "cancelled";
-				record.cancelledMessage = "The task was cancelled.";
+				record.cancelledMessage = `The task was cancelled (${record.cancellationReason ?? "parent_cancelled"}).`;
 			} else {
 				record.status = "failed";
-				record.errorMessage = err instanceof Error ? err.message : String(err);
+				record.errorMessage = errorMessage;
 			}
 			record.endedAt = now;
 			record.details = details;
 			resolveCompletion(details);
 		} finally {
-			spawnRecordWriter?.dispose();
+			await spawnRecordWriter?.dispose().catch(() => undefined);
 		}
 	})();
 

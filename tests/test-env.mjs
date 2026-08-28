@@ -1,1 +1,18 @@
-delete process.env.DSTACK_ARTIFACT_DIR;
+const executionContextNames = [
+	"DSTACK_ARTIFACT_DIR",
+	"DSTACK_ASSIGNMENT",
+	"DSTACK_CHILD_INDEX",
+	"DSTACK_NESTING",
+	"DSTACK_ROOT_WORKFLOW",
+	"DSTACK_SCHEDULER_ROOT",
+	"DSTACK_SESSION_REF_FILE",
+	"DSTACK_STATUS_FILE",
+	"PI_CODING_AGENT",
+	"PI_MODEL",
+	"PI_PROVIDER",
+	"PI_REASONING_LEVEL",
+	"PI_SESSION_FILE",
+	"PI_SESSION_ID",
+];
+for (const name of executionContextNames) delete process.env[name];
+process.env.DSTACK_PROVENANCE = "test";

@@ -1,7 +1,7 @@
 import { readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { WorkflowAssignment } from "./types.ts";
+import type { ExecutionProvenance, WorkflowAssignment } from "./types.ts";
 import type { WorkflowMode } from "./background/workflow.ts";
 
 export const TELEMETRY_SCHEMA_VERSION = "dstack.telemetry-report.v1" as const;
@@ -49,6 +49,19 @@ export type OwnerDelegationCohorts = Readonly<{
 		runtime: QuantileDistribution;
 	}>;
 	causalityLimitation: string;
+}>;
+
+export type TelemetryProvenanceSummary = Readonly<{
+	includedWorkflows: number;
+	excludedTestWorkflows: number;
+	byProvenance: Readonly<Record<ExecutionProvenance, number>>;
+}>;
+
+export type LaunchFailureSummary = Readonly<{
+	preLaunchConfiguration: number;
+	preLaunchOther: number;
+	execution: number;
+	unknown: number;
 }>;
 
 export type RoleModelAssociation = Readonly<{
@@ -181,6 +194,8 @@ export type TelemetryReportV1 = Readonly<{
 	rolesAndModels: RolesAndModelsByPlaybook;
 	runtimeDistributions: RuntimeDistributions;
 	ownerDelegationCohorts: OwnerDelegationCohorts;
+	provenance: TelemetryProvenanceSummary;
+	launchFailures: LaunchFailureSummary;
 	roleModelReliability: readonly RoleModelAssociation[];
 	workerEconomics: WorkerEconomics;
 	queueEvents: QueueEventSummary;
@@ -218,6 +233,8 @@ export type NormalizedNestedSpawnTelemetry = Readonly<{
 	runtimeMs?: number;
 	interval?: TimeInterval;
 	usage?: UsageMetrics;
+	launchState: "not_started" | "started" | "unknown";
+	failureKind?: "pre_launch_configuration" | "pre_launch_other" | "execution";
 }>;
 
 export type NormalizedChildTelemetry = Readonly<{
@@ -235,6 +252,8 @@ export type NormalizedChildTelemetry = Readonly<{
 	runtimeMs?: number;
 	interval?: TimeInterval;
 	usage?: UsageMetrics;
+	launchState: "not_started" | "started" | "unknown";
+	failureKind?: "pre_launch_configuration" | "pre_launch_other" | "execution";
 	hasChildResult: boolean;
 	spawns: readonly NormalizedNestedSpawnTelemetry[];
 	spawnGroupCount: number;
@@ -246,6 +265,7 @@ export type NormalizedWorkflowTelemetry = Readonly<{
 	mode: WorkflowMode | "unknown";
 	playbook: string;
 	createdAt?: string;
+	provenance: ExecutionProvenance;
 	isTopLevelOwnerWorkflow: boolean;
 	outcome: "succeeded" | "failed" | "cancelled" | "uncommitted" | "abandoned";
 	hasManifest: boolean;
@@ -301,6 +321,7 @@ export type RawTelemetryData = Readonly<{
 	bindings: readonly NormalizedBindingTelemetry[];
 	queueEvents?: readonly NormalizedQueueEventTelemetry[];
 	duplicateQueueEventIds?: number;
+	excludedTestWorkflows?: number;
 	corruptCounts: Readonly<{
 		sessionFiles: number;
 		manifestFiles: number;
@@ -319,6 +340,7 @@ export type TelemetryCollectOptions = Readonly<{
 		from?: string;
 		to?: string;
 	}>;
+	includeTests?: boolean;
 }>;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -337,6 +359,28 @@ function parseDateMs(value: unknown): number | undefined {
 	if (typeof value !== "string" || value.trim().length === 0) return undefined;
 	const parsed = Date.parse(value);
 	return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function isFixtureModel(model: string): boolean {
+	const provider = model.split("/", 1)[0]?.toLowerCase();
+	return provider === "test" || provider === "fake" || provider === "fake-router" || provider === "acme";
+}
+
+function isPreLaunchConfigurationError(errorMessage: string | undefined): boolean {
+	return errorMessage !== undefined && (
+		errorMessage.startsWith("Unknown agent ") ||
+		errorMessage.includes(" is not configured") ||
+		errorMessage.includes("requires overrideReason") ||
+		errorMessage.includes("model override")
+	);
+}
+
+function parseLaunchState(value: unknown): "not_started" | "started" | undefined {
+	return value === "not_started" || value === "started" ? value : undefined;
+}
+
+function parseFailureKind(value: unknown): "pre_launch_configuration" | "pre_launch_other" | "execution" | undefined {
+	return value === "pre_launch_configuration" || value === "pre_launch_other" || value === "execution" ? value : undefined;
 }
 
 export function mergeTimeIntervals(intervals: readonly TimeInterval[]): readonly TimeInterval[] {
@@ -747,6 +791,9 @@ async function parseWorkflowDirectory(
 	const modeRaw = manifestData ? parseOptionalString(manifestData["mode"]) : undefined;
 	const mode: WorkflowMode | "unknown" =
 		modeRaw === "single" || modeRaw === "parallel" || modeRaw === "chain" ? modeRaw : "unknown";
+	const provenanceRaw = manifestData ? parseOptionalString(manifestData["provenance"]) : undefined;
+	const explicitProvenance: ExecutionProvenance | undefined =
+		provenanceRaw === "production" || provenanceRaw === "test" || provenanceRaw === "unknown" ? provenanceRaw : undefined;
 
 	const rawSpecs = manifestData && Array.isArray(manifestData["specs"]) ? manifestData["specs"] : [];
 
@@ -823,12 +870,18 @@ async function parseWorkflowDirectory(
 		outcome = "abandoned";
 	}
 
+	const fixtureProviderFound = children.some((child) =>
+		isFixtureModel(child.model) || child.spawns.some((spawn) => isFixtureModel(spawn.model)),
+	);
+	const provenance: ExecutionProvenance = explicitProvenance ?? (fixtureProviderFound ? "test" : "unknown");
+
 	return {
 		workflowId,
 		sessionId,
 		mode,
 		playbook: workflowPlaybook,
 		createdAt,
+		provenance,
 		isTopLevelOwnerWorkflow,
 		outcome,
 		hasManifest,
@@ -901,6 +954,7 @@ async function parseChildDirectory(input: {
 	let state: NormalizedChildTelemetry["state"] = "unknown";
 	let exitCode: number | undefined;
 	let usage: UsageMetrics | undefined;
+	let errorMessage: string | undefined;
 	let startedAtIso: string | undefined;
 	let endedAtIso: string | undefined;
 
@@ -932,6 +986,7 @@ async function parseChildDirectory(input: {
 			if (isRecord(innerResult["usage"])) {
 				usage = parseUsage(innerResult["usage"]);
 			}
+			errorMessage = parseOptionalString(innerResult["errorMessage"]);
 		}
 
 		if (state === "unknown" && exitCode !== undefined) {
@@ -944,6 +999,18 @@ async function parseChildDirectory(input: {
 	let interval: TimeInterval | undefined;
 	const startMs = parseDateMs(startedAtIso);
 	const endMs = parseDateMs(endedAtIso);
+	const launchState: NormalizedChildTelemetry["launchState"] = startMs !== undefined
+		? "started"
+		: isPreLaunchConfigurationError(errorMessage)
+			? "not_started"
+			: "unknown";
+	const failureKind: NormalizedChildTelemetry["failureKind"] = state !== "failed"
+		? undefined
+		: launchState === "started"
+			? "execution"
+			: isPreLaunchConfigurationError(errorMessage)
+				? "pre_launch_configuration"
+				: undefined;
 	if (startMs !== undefined && endMs !== undefined && endMs >= startMs) {
 		runtimeMs = endMs - startMs;
 		interval = { startMs, endMs };
@@ -995,6 +1062,7 @@ async function parseChildDirectory(input: {
 
 				const nestedExitCode = parseOptionalNumber(rawNested["exitCode"]);
 				const nestedUsage = parseUsage(rawNested["usage"]);
+				const nestedErrorMessage = parseOptionalString(rawNested["errorMessage"]);
 
 				const nestedRole =
 					parseOptionalString(rawNested["role"]) ??
@@ -1016,6 +1084,23 @@ async function parseChildDirectory(input: {
 
 				const nestedStartMs = parseDateMs(rawNested["startedAt"]);
 				const nestedEndMs = parseDateMs(rawNested["endedAt"]) ?? parseDateMs(rawNested["updatedAt"]);
+				const explicitLaunchState = parseLaunchState(rawNested["launchState"]);
+				const nestedLaunchState: NormalizedNestedSpawnTelemetry["launchState"] = explicitLaunchState ?? (
+					nestedStartMs !== undefined
+						? "started"
+						: isPreLaunchConfigurationError(nestedErrorMessage)
+							? "not_started"
+							: "unknown"
+				);
+				const nestedFailureKind: NormalizedNestedSpawnTelemetry["failureKind"] = parseFailureKind(rawNested["failureKind"]) ?? (
+					nestedState !== "failed"
+						? undefined
+						: nestedLaunchState === "started"
+							? "execution"
+							: isPreLaunchConfigurationError(nestedErrorMessage)
+								? "pre_launch_configuration"
+								: undefined
+				);
 				let nestedRuntimeMs: number | undefined;
 				let nestedInterval: TimeInterval | undefined;
 				if (nestedStartMs !== undefined && nestedEndMs !== undefined && nestedEndMs >= nestedStartMs) {
@@ -1029,7 +1114,7 @@ async function parseChildDirectory(input: {
 					nestedIndex,
 					agent: nestedAgent,
 					role: nestedRole,
-					model: nestedModel,
+					model: nestedFailureKind === "pre_launch_configuration" ? "unknown" : nestedModel,
 					assignment: nestedAssignment,
 					phase: nestedPhase,
 					state: nestedState,
@@ -1037,6 +1122,8 @@ async function parseChildDirectory(input: {
 					runtimeMs: nestedRuntimeMs,
 					interval: nestedInterval,
 					usage: nestedUsage,
+					launchState: nestedLaunchState,
+					failureKind: nestedFailureKind,
 				});
 			}
 		}
@@ -1057,6 +1144,8 @@ async function parseChildDirectory(input: {
 		runtimeMs,
 		interval,
 		usage,
+		launchState,
+		failureKind,
 		hasChildResult,
 		spawns,
 		spawnGroupCount,
@@ -1070,6 +1159,13 @@ export function aggregateTelemetry(data: RawTelemetryData): TelemetryReportV1 {
 		queueEventFiles: data.corruptCounts.queueEventFiles ?? 0,
 	};
 	const queueEvents = data.queueEvents ?? [];
+	const provenanceCounts: Record<ExecutionProvenance, number> = { production: 0, test: 0, unknown: 0 };
+	const launchFailures = {
+		preLaunchConfiguration: 0,
+		preLaunchOther: 0,
+		execution: 0,
+		unknown: 0,
+	};
 
 	let earliestTimestamp: string | undefined;
 	let latestTimestamp: string | undefined;
@@ -1255,6 +1351,7 @@ export function aggregateTelemetry(data: RawTelemetryData): TelemetryReportV1 {
 
 	for (const wf of workflows) {
 		considerTimestamp(wf.createdAt);
+		provenanceCounts[wf.provenance] += 1;
 		totalAllWorkflows += 1;
 
 		// Outcome tracking by mode
@@ -1310,6 +1407,12 @@ export function aggregateTelemetry(data: RawTelemetryData): TelemetryReportV1 {
 
 		for (const child of wf.children) {
 			totalScannedChildrenCount += 1;
+			if (child.state === "failed") {
+				if (child.failureKind === "pre_launch_configuration") launchFailures.preLaunchConfiguration += 1;
+				else if (child.failureKind === "pre_launch_other") launchFailures.preLaunchOther += 1;
+				else if (child.failureKind === "execution") launchFailures.execution += 1;
+				else launchFailures.unknown += 1;
+			}
 
 			// Join tracking: manifest -> child result
 			totalExpectedChildren += 1;
@@ -1370,14 +1473,21 @@ export function aggregateTelemetry(data: RawTelemetryData): TelemetryReportV1 {
 				}
 			}
 
-			// Role & Model reliability for top-level child
-			recordRoleModel(child.role, child.model, child.state, wf.committed, 0);
+			if (child.launchState === "started" && child.model !== "unknown" && child.model !== "unresolved") {
+				recordRoleModel(child.role, child.model, child.state, wf.committed, 0);
+			}
 
 			// Process nested spawns
 			// Conservative observable repeated delegation: count if owner issued repeated nested delegation batches
 			const isRepeatedBatch = child.spawnGroupCount > 1;
 			for (const spawn of child.spawns) {
 				totalScannedChildrenCount += 1;
+				if (spawn.state === "failed") {
+					if (spawn.failureKind === "pre_launch_configuration") launchFailures.preLaunchConfiguration += 1;
+					else if (spawn.failureKind === "pre_launch_other") launchFailures.preLaunchOther += 1;
+					else if (spawn.failureKind === "execution") launchFailures.execution += 1;
+					else launchFailures.unknown += 1;
+				}
 
 				if (spawn.interval) {
 					considerTimestamp(new Date(spawn.interval.startMs).toISOString());
@@ -1417,8 +1527,9 @@ export function aggregateTelemetry(data: RawTelemetryData): TelemetryReportV1 {
 					}
 				}
 
-				// Role & Model reliability for nested spawn
-				recordRoleModel(spawn.role, spawn.model, spawn.state, wf.committed, isRepeatedBatch ? 1 : 0);
+				if (spawn.launchState === "started" && spawn.model !== "unknown" && spawn.model !== "unresolved") {
+					recordRoleModel(spawn.role, spawn.model, spawn.state, wf.committed, isRepeatedBatch ? 1 : 0);
+				}
 			}
 		}
 	}
@@ -1560,6 +1671,8 @@ export function aggregateTelemetry(data: RawTelemetryData): TelemetryReportV1 {
 		"Direct worker economics comparing lightweight worker direct cost against owner direct cost",
 		"Data join reliability between workflow manifests, committed results, child results, bindings, queue events, and Pi session IDs",
 		"Durable scheduler ticket creation, slot acquisition, and queue wait distributions",
+		"Production, test, and unknown workflow provenance with test runs excluded by default",
+		"Pre-launch configuration, other pre-launch, execution, and unknown failure classification",
 	];
 
 	const missingOrUnsupportedMetrics: MetricLimitation[] = [
@@ -1590,10 +1703,15 @@ export function aggregateTelemetry(data: RawTelemetryData): TelemetryReportV1 {
 			explicitLimitation: "Economic evaluation flags 'unsupported_due_to_missing_cost_data' when cost metrics are absent.",
 		},
 		{
-			metric: "production_vs_test_runs",
-			reason: "Historical workflow records do not identify test, development, and ordinary interactive runs.",
+			metric: "legacy_provenance",
+			reason: "Older workflow manifests lack explicit provenance. Known fixture model providers are classified as tests; all other legacy records remain unknown.",
 			explicitLimitation:
-				"Role, model, runtime, outcome, and cost aggregates may include local test or development runs. Filter by time when the relevant operating window is known.",
+				"Unknown legacy records remain included by default because excluding them would hide real historical production runs.",
+		},
+		{
+			metric: "top_level_pre_launch_failures",
+			reason: "Top-level role and agent configuration errors occur before a workflow manifest is sealed.",
+			explicitLimitation: "Only persisted nested pre-launch failures can be counted from historical artifacts.",
 		},
 	];
 
@@ -1633,6 +1751,12 @@ export function aggregateTelemetry(data: RawTelemetryData): TelemetryReportV1 {
 			causalityLimitation:
 				"Observational runtime comparison between delegated and non-delegated owners cannot establish delegation causality because tasks differ in complexity and scope.",
 		},
+		provenance: {
+			includedWorkflows: workflows.length,
+			excludedTestWorkflows: data.excludedTestWorkflows ?? 0,
+			byProvenance: provenanceCounts,
+		},
+		launchFailures,
 		roleModelReliability,
 		workerEconomics: {
 			lightweightWorkerRuns,
@@ -1716,12 +1840,21 @@ export async function collectTelemetryData(options?: TelemetryCollectOptions): P
 		filteredBindings = bindings.filter((binding) => filteredWorkflowIds.has(binding.workflowId));
 	}
 
+	const excludedTestWorkflows = options?.includeTests ? 0 : filteredWorkflows.filter((workflow) => workflow.provenance === "test").length;
+	if (!options?.includeTests) {
+		filteredWorkflows = filteredWorkflows.filter((workflow) => workflow.provenance !== "test");
+		const includedWorkflowIds = new Set(filteredWorkflows.map((workflow) => workflow.workflowId));
+		filteredBindings = filteredBindings.filter((binding) => includedWorkflowIds.has(binding.workflowId));
+		filteredQueueEvents = filteredQueueEvents.filter((event) => includedWorkflowIds.has(event.workflowId));
+	}
+
 	return aggregateTelemetry({
 		sessions: filteredSessions,
 		workflows: filteredWorkflows,
 		bindings: filteredBindings,
 		queueEvents: filteredQueueEvents,
 		duplicateQueueEventIds,
+		excludedTestWorkflows,
 		corruptCounts,
 	});
 }

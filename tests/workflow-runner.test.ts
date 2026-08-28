@@ -169,6 +169,58 @@ test("parallel mixed failure is a committed domain failure", async (t) => {
 	assert.equal((await readCommittedWorkflowResult(workflow.artifactDir, "b".repeat(64), workflow.workflowId)).outcome, "failed");
 });
 
+test("owner success is rejected when a persisted nested task was not collected", async (t) => {
+	const cwd = await temporaryDirectory(t);
+	const artifactDir = join(cwd, "artifacts");
+	const childDir = join(artifactDir, "children", "0");
+	await mkdir(join(childDir, "spawns"), { recursive: true });
+	await writeFile(join(childDir, "spawns", "nested-11111111-1111-1111-1111-111111111111.json"), JSON.stringify({
+		schemaVersion: "dstack.spawn-record.v1",
+		workflowId: "wf-runner-0123456789",
+		parentIndex: 0,
+		groupId: "nested-11111111-1111-1111-1111-111111111111",
+		mode: "single",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		children: [{
+			nestedIndex: 0,
+			agent: "general-purpose",
+			taskPreview: "nested work",
+			state: "succeeded",
+			updatedAt: "2025-01-01T00:00:01.000Z",
+		}],
+	}));
+	const owner = spec(cwd, "owner", {
+		workflow: { playbook: "feature", assignment: "owner", phase: "run", completedPhases: [], artifacts: [] },
+	});
+	const index = await executeWorkflow(manifest({ artifactDir, cwd, specs: [owner] }), "1".repeat(64), new AbortController().signal, {
+		spawnChild: async () => child("claimed success"),
+	});
+
+	assert.equal(index.outcome, "failed");
+	assert.match(index.package.results[0]?.errorMessage ?? "", /has not been collected/);
+});
+
+test("owner success verifies declared artifact hashes", async (t) => {
+	const cwd = await temporaryDirectory(t);
+	const artifactPath = join(cwd, "design.md");
+	await writeFile(artifactPath, "tampered");
+	const owner = spec(cwd, "owner", {
+		workflow: {
+			playbook: "feature",
+			assignment: "owner",
+			phase: "run",
+			completedPhases: [],
+			artifacts: [{ name: "design", path: artifactPath, sha256: createHash("sha256").update("expected").digest("hex") }],
+		},
+	});
+	const index = await executeWorkflow(manifest({ artifactDir: join(cwd, "artifacts"), cwd, specs: [owner] }), "2".repeat(64), new AbortController().signal, {
+		spawnChild: async () => child("claimed success"),
+	});
+
+	assert.equal(index.outcome, "failed");
+	assert.match(index.package.results[0]?.errorMessage ?? "", /design sha256 mismatch/);
+});
+
 test("chain substitutes every previous token with full output and seals later skips", async (t) => {
 	const cwd = await temporaryDirectory(t);
 	const full = "x".repeat(60 * 1024);
@@ -294,6 +346,7 @@ test("cancellation aborts active work, rejects queued slots, and commits cancell
 	const index = await running;
 	assert.equal(index.outcome, "cancelled");
 	assert.deepEqual(index.children.map((entry) => entry.state), ["cancelled", "cancelled"]);
+	assert.deepEqual(index.package.results.map((result) => result.cancellationReason), ["parent_cancelled", "parent_cancelled"]);
 	assert.equal(releases, 1);
 	assert.equal(active, 0);
 	await commitWorkflowResult(workflow, index);
