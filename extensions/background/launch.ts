@@ -3,7 +3,7 @@ import { mkdir, readFile, readdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { AgentConfig } from "../agents.ts";
-import type { DstackConfig } from "../types.ts";
+import { executionProvenance, type DstackConfig } from "../types.ts";
 import type { TaskRequest } from "../types.ts";
 import { dmodeReminder } from "../mode.ts";
 import { freezePiChildLaunch, resolveAgent } from "../spawn.ts";
@@ -147,6 +147,7 @@ export async function launchTaskGroup(input: Readonly<{
 		piChildLaunch: { executable: childLaunch.command, argvPrefix: childLaunch.argsPrefix },
 		mode: input.request.kind,
 		childDepth: 1,
+		provenance: executionProvenance(),
 		specs: [first, ...resolvedSpecs.slice(1)],
 		createdAt: new Date().toISOString(),
 	};

@@ -45,7 +45,7 @@ The right decomposition depends on the question. Use your judgment. Narrow quest
 Spawn all explorers in one parallel `dstack_task` call:
 
 - `agent`: `general-purpose`
-- `model`: your configured how-explorer model (or inherit-parent if unset)
+- `role`: `how-explorer`
 - `dmode: false`
 - `tools: "read,grep,find,ls"`
 
@@ -67,7 +67,7 @@ Then proceed to Step 3.
 Spawn a single `dstack_task` subagent that explores and explains in one pass:
 
 - `agent`: `general-purpose`
-- `model`: your configured how-explainer model (or inherit-parent if unset)
+- `role`: `how-explainer`
 - `dmode: false`
 - `tools: "read,grep,find,ls"`
 
@@ -82,7 +82,7 @@ Proceed to Step 4.
 Wait for the background completion notification from Step 2a without polling, then call `dstack_result` once with `taskId`. Spawn a single `dstack_task` subagent to synthesize their findings into one coherent explanation:
 
 - `agent`: `general-purpose`
-- `model`: your configured how-explainer model (or inherit-parent if unset)
+- `role`: `how-explainer`
 - `dmode: false`
 - `tools: "read,grep,find,ls"`
 
@@ -122,7 +122,7 @@ After the explanation is complete, spawn one architectural critic per model in y
 
 For each critic:
 - `agent`: `general-purpose`
-- `model`: one model from the configured how-critics list. These are minimum reasoning levels. The lead should escalate any model when the architecture warrants deeper analysis.
+- `role`: `how-critics`. Launch one entry per configured list index so role resolution selects the matching model. These are minimum reasoning levels. The lead should escalate with an explicit model and override reason when the architecture warrants deeper analysis.
 - `dmode: false`
 - `tools: "read,grep,find,ls"`
 

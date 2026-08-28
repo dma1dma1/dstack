@@ -6,6 +6,7 @@ const REQUEST_SCHEMA = "pi-background-tasks.extension-request.v1";
 const RESPONSE_SCHEMA = "pi-background-tasks.extension-response.v1";
 
 const TASK_STATUSES = ["running", "completed", "failed", "killed"] as const;
+export const DEFAULT_EVENT_BUS_REQUEST_TIMEOUT_MS = 5_000;
 
 export type DstackTaskId = string & { readonly __brand: "DstackTaskId" };
 export type CompanionStatus = (typeof TASK_STATUSES)[number];
@@ -125,7 +126,10 @@ function parseKill(value: unknown): CompanionTaskState {
 export function createEventBusV1Port(options: Readonly<{
 	events: EventBus;
 	makeRequestId: () => string;
+	requestTimeoutMs?: number;
 }>): BackgroundTaskPort {
+	const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_EVENT_BUS_REQUEST_TIMEOUT_MS;
+	if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1) throw new Error("requestTimeoutMs must be a positive integer");
 	let closed = false;
 	const pendingStops = new Set<() => void>();
 
@@ -136,9 +140,11 @@ export function createEventBusV1Port(options: Readonly<{
 
 		return new Promise<T>((resolve, reject) => {
 			let settled = false;
+			let timer: NodeJS.Timeout | undefined;
 			const finish = (outcome: Readonly<{ kind: "resolve"; value: T }> | Readonly<{ kind: "reject"; error: unknown }>) => {
 				if (settled) return;
 				settled = true;
+				if (timer !== undefined) clearTimeout(timer);
 				offResponse();
 				signal?.removeEventListener("abort", onAbort);
 				pendingStops.delete(stop);
@@ -163,6 +169,10 @@ export function createEventBusV1Port(options: Readonly<{
 			});
 			pendingStops.add(stop);
 			signal?.addEventListener("abort", onAbort, { once: true });
+			timer = setTimeout(() => {
+				finish({ kind: "reject", error: new Error(`background task ${operation} request timed out after ${requestTimeoutMs}ms`) });
+			}, requestTimeoutMs);
+			timer.unref?.();
 			try {
 				options.events.emit(REQUEST_CHANNEL, { schema_version: REQUEST_SCHEMA, request_id: requestId, operation, payload });
 			} catch (error) {

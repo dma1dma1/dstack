@@ -1,15 +1,15 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { TaskDetails, TaskResult } from "../dstack.ts";
 import { buildChildArgv, capOutput, childEnv, runChildProcess, type ChildInvocation, type ChildResult } from "../spawn.ts";
-import type { WorkflowContext, WorktreeFrom } from "../types.ts";
+import type { ExecutionProvenance, WorkflowContext, WorktreeFrom } from "../types.ts";
 import { DEFAULT_TOTAL_SLOTS, MAX_CONCURRENCY, NESTING_ENV, SESSION_REF_ENV, STATUS_FILE_ENV } from "../types.ts";
 import { createWorktree } from "../worktree.ts";
-import { atomicWriteFile, readOutputArtifact, toAbsolutePath, writeSealedArtifact, type OutputArtifactSeal } from "./artifacts.ts";
+import { atomicWriteFile, readOutputArtifact, toAbsolutePath, verifyDeclaredArtifacts, writeSealedArtifact, type OutputArtifactSeal } from "./artifacts.ts";
 import { allowStatusTool, ChildJournalRecorder } from "./journal.ts";
 import { readChildSessionRef, type ChildSessionRefV1 } from "./session.ts";
 import { acquireChildSlot } from "./scheduler.ts";
-import { latestActivity, type ChildActivityV1, type ProgressChildV1, type WorkflowProgressV2 } from "./tree.ts";
+import { latestActivity, parseSpawnRecordV1, type ChildActivityV1, type ProgressChildV1, type WorkflowProgressV2 } from "./tree.ts";
 
 export const ROOT_WORKFLOW_ENV = "DSTACK_ROOT_WORKFLOW";
 export const SCHEDULER_ROOT_ENV = "DSTACK_SCHEDULER_ROOT";
@@ -45,6 +45,7 @@ export type WorkflowManifestV1 = Readonly<{
 	piChildLaunch: Readonly<{ executable: string; argvPrefix: readonly string[] }>;
 	mode: WorkflowMode;
 	childDepth: 1;
+	provenance?: ExecutionProvenance;
 	specs: readonly [ResolvedChildSpec, ...ResolvedChildSpec[]];
 	createdAt: string;
 }>;
@@ -224,6 +225,7 @@ function syntheticResult(input: Readonly<{ spec: ResolvedChildSpec; cwd: string;
 		usage: emptyUsage(),
 		stopReason: input.state,
 		errorMessage: input.message,
+		...(input.state === "cancelled" ? { cancellationReason: "parent_cancelled" as const } : {}),
 		step: input.step,
 	};
 }
@@ -278,6 +280,30 @@ async function sealChild(input: Readonly<{
 
 function abortError(signal: AbortSignal): Error {
 	return signal.reason instanceof Error ? signal.reason : new Error("Workflow cancelled");
+}
+
+function isMissingFile(error: unknown): boolean {
+	return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
+export async function verifyNestedJoinBarrier(childDirectory: string): Promise<void> {
+	const spawnsDirectory = join(childDirectory, "spawns");
+	let entries;
+	try {
+		entries = await readdir(spawnsDirectory, { withFileTypes: true });
+	} catch (error) {
+		if (isMissingFile(error)) return;
+		throw error;
+	}
+	for (const entry of entries) {
+		if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+		const raw: unknown = JSON.parse(await readFile(join(spawnsDirectory, entry.name), "utf8"));
+		const record = parseSpawnRecordV1(raw);
+		if (record === undefined) throw new Error(`nested join record ${entry.name} is invalid`);
+		const live = record.children.filter((child) => child.state === "queued" || child.state === "running");
+		if (live.length > 0) throw new Error(`nested join barrier rejected success: task ${record.groupId} still has ${live.length} live child process(es)`);
+		if (record.collectedAt === undefined) throw new Error(`nested join barrier rejected success: task ${record.groupId} has not been collected with dstack_result`);
+	}
 }
 
 function resolvedToolsAllowlist(tools: string | undefined): readonly string[] | undefined {
@@ -475,6 +501,15 @@ export async function executeWorkflow(
 					},
 				});
 				await journalUpdates;
+				if (child.exitCode === 0 && spec.workflow?.assignment === "owner") {
+					try {
+						await verifyNestedJoinBarrier(childDirectory);
+						await verifyDeclaredArtifacts(spec.workflow.artifacts);
+					} catch (error) {
+						const message = error instanceof Error ? error.message : String(error);
+						child = { ...child, exitCode: 1, errorMessage: message, stopReason: "reliability_barrier" };
+					}
+				}
 			} catch (error) {
 				await journalUpdates.catch(() => undefined);
 				recorder.recordFailure({ error: error instanceof Error ? error.message : String(error) });
@@ -489,7 +524,10 @@ export async function executeWorkflow(
 			if (signal.aborted) recorder.recordFailure({ error: "Workflow cancelled" });
 			else recorder.recordExit({ exitCode: child.exitCode, text: child.text });
 			await recorder.persist();
-			const completed = taskResult(child, spec, cwd, task, manifest.mode === "chain" ? index + 1 : undefined);
+			const completed = {
+				...taskResult(child, spec, cwd, task, manifest.mode === "chain" ? index + 1 : undefined),
+				...(signal.aborted ? { cancellationReason: "parent_cancelled" as const } : {}),
+			};
 			completed.journal = recorder.getEntries();
 			completed.status = recorder.getLatestStatus();
 			results[index] = completed;

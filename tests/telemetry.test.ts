@@ -83,6 +83,7 @@ test("aggregateTelemetry produces TelemetryReportV1 with top-level owner selecti
 				mode: "single",
 				playbook: "feature",
 				createdAt: "2026-08-25T10:05:00.000Z",
+				provenance: "production",
 				isTopLevelOwnerWorkflow: true,
 				outcome: "succeeded",
 				hasManifest: true,
@@ -111,6 +112,7 @@ test("aggregateTelemetry produces TelemetryReportV1 with top-level owner selecti
 							endMs: Date.parse("2026-08-25T10:10:00.000Z"),
 						},
 						usage: { input: 1000, output: 200, cost: 0.058, turns: 3 },
+						launchState: "started",
 						hasChildResult: true,
 						spawnGroupCount: 2,
 						spawns: [
@@ -131,6 +133,7 @@ test("aggregateTelemetry produces TelemetryReportV1 with top-level owner selecti
 									endMs: Date.parse("2026-08-25T10:07:00.000Z"),
 								},
 								usage: { input: 500, output: 100, cost: 0.005, turns: 2 },
+								launchState: "started",
 							},
 							{
 								spawnKey: "group-2:0",
@@ -149,6 +152,7 @@ test("aggregateTelemetry produces TelemetryReportV1 with top-level owner selecti
 									endMs: Date.parse("2026-08-25T10:09:00.000Z"),
 								},
 								usage: { input: 300, output: 80, cost: 0.003, turns: 1 },
+								launchState: "started",
 							},
 						],
 					},
@@ -161,6 +165,7 @@ test("aggregateTelemetry produces TelemetryReportV1 with top-level owner selecti
 				mode: "single",
 				playbook: "bug-fix",
 				createdAt: "2026-08-25T10:15:00.000Z",
+				provenance: "production",
 				isTopLevelOwnerWorkflow: true,
 				outcome: "succeeded",
 				hasManifest: true,
@@ -189,6 +194,7 @@ test("aggregateTelemetry produces TelemetryReportV1 with top-level owner selecti
 							endMs: Date.parse("2026-08-25T10:20:00.000Z"),
 						},
 						usage: { input: 800, output: 150, cost: 0.03, turns: 2 },
+						launchState: "started",
 						hasChildResult: true,
 						spawnGroupCount: 0,
 						spawns: [],
@@ -202,6 +208,7 @@ test("aggregateTelemetry produces TelemetryReportV1 with top-level owner selecti
 				mode: "single",
 				playbook: "feature",
 				createdAt: "2026-08-25T10:22:00.000Z",
+				provenance: "production",
 				isTopLevelOwnerWorkflow: false,
 				outcome: "failed",
 				hasManifest: true,
@@ -230,6 +237,8 @@ test("aggregateTelemetry produces TelemetryReportV1 with top-level owner selecti
 							endMs: Date.parse("2026-08-25T10:23:00.000Z"),
 						},
 						usage: { input: 200, output: 40, cost: 0.002, turns: 1 },
+						launchState: "started",
+						failureKind: "execution",
 						hasChildResult: true,
 						spawnGroupCount: 0,
 						spawns: [],
@@ -687,6 +696,74 @@ test("time filtering bounds session and workflow telemetry", async (t) => {
 	assert.equal(reportFiltered.workflowSelections.byPlaybook["feature"], undefined);
 });
 
+test("collector excludes explicit and historical fixture tests while separating legacy pre-launch configuration failures", async (t) => {
+	const dir = await temporaryDirectory(t);
+	const bgRoot = join(dir, "background");
+	const sessRoot = join(dir, "sessions");
+	const workflowsRoot = join(bgRoot, "session", "workflows");
+
+	async function writeWorkflow(input: Readonly<{
+		id: string;
+		provenance?: "production" | "test";
+		model?: string;
+		spawn?: Record<string, unknown>;
+	}>): Promise<void> {
+		const workflowDir = join(workflowsRoot, input.id);
+		const childDir = join(workflowDir, "children", "0");
+		await mkdir(join(childDir, "spawns"), { recursive: true });
+		await writeFile(join(workflowDir, "manifest.json"), JSON.stringify({
+			schemaVersion: "dstack.workflow.v1",
+			workflowId: input.id,
+			sessionId: "session",
+			mode: "single",
+			provenance: input.provenance,
+			specs: [{
+				agent: "poteto-agent",
+				model: input.model,
+				requestedRole: "feature",
+				workflow: { playbook: "feature", assignment: "owner" },
+			}],
+		}));
+		if (input.spawn !== undefined) {
+			await writeFile(join(childDir, "spawns", "legacy.json"), JSON.stringify({
+				schemaVersion: "dstack.spawn-record.v1",
+				workflowId: input.id,
+				parentIndex: 0,
+				groupId: "legacy",
+				mode: "single",
+				children: [input.spawn],
+			}));
+		}
+	}
+
+	await writeWorkflow({
+		id: "production",
+		provenance: "production",
+		model: "provider/owner",
+		spawn: {
+			nestedIndex: 0,
+			agent: "missing-agent",
+			role: "implementation-worker",
+			model: "provider/inherited-but-never-launched",
+			state: "failed",
+			errorMessage: "Unknown agent \"missing-agent\". Available: general-purpose.",
+		},
+	});
+	await writeWorkflow({ id: "explicit-test", provenance: "test", model: "provider/owner" });
+	await writeWorkflow({ id: "historical-fixture", model: "fake-router/concrete-child" });
+
+	const productionReport = await collectTelemetryData({ backgroundRoot: bgRoot, sessionsDir: sessRoot });
+	assert.equal(productionReport.provenance.includedWorkflows, 1);
+	assert.equal(productionReport.provenance.excludedTestWorkflows, 2);
+	assert.equal(productionReport.launchFailures.preLaunchConfiguration, 1);
+	assert.ok(!productionReport.roleModelReliability.some((entry) => entry.resolvedModel.includes("never-launched")));
+	assert.equal(productionReport.rolesAndModels.byRole["implementation-worker"]?.["unknown"], 1);
+
+	const allReport = await collectTelemetryData({ backgroundRoot: bgRoot, sessionsDir: sessRoot, includeTests: true });
+	assert.equal(allReport.provenance.includedWorkflows, 3);
+	assert.deepEqual(allReport.provenance.byProvenance, { production: 1, test: 2, unknown: 0 });
+});
+
 test("CLI handles --help, human-readable formatting, and JSON output", async () => {
 	const report: TelemetryReportV1 = {
 		schemaVersion: "dstack.telemetry-report.v1",
@@ -723,6 +800,12 @@ test("CLI handles --help, human-readable formatting, and JSON output", async () 
 			},
 			causalityLimitation: "cannot establish delegation causality",
 		},
+		provenance: {
+			includedWorkflows: 1,
+			excludedTestWorkflows: 0,
+			byProvenance: { production: 1, test: 0, unknown: 0 },
+		},
+		launchFailures: { preLaunchConfiguration: 0, preLaunchOther: 0, execution: 0, unknown: 0 },
 		roleModelReliability: [
 			{
 				role: "feature-owner",
@@ -801,9 +884,10 @@ test("CLI handles --help, human-readable formatting, and JSON output", async () 
 	assert.ok(formatted.includes("dstack Telemetry Report"));
 	assert.ok(formatted.includes("1. Workflow Selections (Top-Level Owner Workflows):"));
 	assert.ok(formatted.includes("4. Owner Delegation Cohorts (Observational):"));
-	assert.ok(formatted.includes("6. Worker Economics (Direct Cost Comparison):"));
-	assert.ok(formatted.includes("7. Durable Queue Events:"));
-	assert.ok(formatted.includes("8. Data Join Reliability:"));
+	assert.ok(formatted.includes("5. Provenance and Launch Failures:"));
+	assert.ok(formatted.includes("7. Worker Economics (Direct Cost Comparison):"));
+	assert.ok(formatted.includes("8. Durable Queue Events:"));
+	assert.ok(formatted.includes("9. Data Join Reliability:"));
 
 	const code = await runTelemetryCli(["--help"]);
 	assert.equal(code, 0);

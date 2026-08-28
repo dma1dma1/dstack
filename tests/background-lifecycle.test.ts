@@ -11,6 +11,7 @@ import { test, type TestContext } from "node:test";
 import { readOutputArtifact, toAbsolutePath, toSha256, writeSealedArtifact } from "../extensions/background/artifacts.ts";
 import { createEventBusV1Port } from "../extensions/background/eventbus-v1.ts";
 import { createTaskResultFiles } from "../extensions/background/launch.ts";
+import { readPersistedNestedResult } from "../extensions/task-registry.ts";
 import { commitWorkflowResult } from "../extensions/background/runner.ts";
 import {
 	readDstackResult,
@@ -65,6 +66,14 @@ test("EventBus v1 launch emits only the documented closed run schema", async () 
 
 	port.close();
 	uninstall();
+});
+
+test("EventBus v1 requests reject when the companion never responds", async () => {
+	const events = createEventBus();
+	const port = createEventBusV1Port({ events, makeRequestId: () => "request-timeout", requestTimeoutMs: 10 });
+
+	await assert.rejects(port.capabilities(), /capabilities request timed out after 10ms/);
+	port.close();
 });
 
 test("EventBus v1 kill emits kill request schema and parses response", async () => {
@@ -393,6 +402,39 @@ test("dstack_result recovers committed result from durable bindings across prior
 		assert.equal(result.taskId, crossTaskId);
 		assert.equal(result.package.results[0]?.summary, "Cross session result text completed successfully.");
 	}
+});
+
+test("nested result lookup recovers from a spawn record and persists collection", async (t) => {
+	const artifactDir = await temporaryDirectory(t);
+	const taskId = "nested-22222222-2222-2222-2222-222222222222";
+	const spawnsDir = join(artifactDir, "children", "0", "spawns");
+	await mkdir(spawnsDir, { recursive: true });
+	const path = join(spawnsDir, `${taskId}.json`);
+	await writeFile(path, JSON.stringify({
+		schemaVersion: "dstack.spawn-record.v1",
+		workflowId: "wf-disk-fallback",
+		parentIndex: 0,
+		groupId: taskId,
+		mode: "single",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		children: [{
+			nestedIndex: 0,
+			agent: "general-purpose",
+			taskPreview: "recover me",
+			taskFull: "recover me from disk",
+			cwd: "/workspace",
+			state: "succeeded",
+			exitCode: 0,
+			finalResponse: "persisted result",
+			updatedAt: "2025-01-01T00:00:01.000Z",
+		}],
+	}));
+
+	const result = await readPersistedNestedResult({ artifactDir, parentIndex: 0, taskId });
+	assert.equal(result?.kind, "complete");
+	if (result?.kind === "complete" && result.detail === "summary") assert.equal(result.package.results[0]?.summary, "persisted result");
+	const persisted = JSON.parse(await readFile(path, "utf8")) as { collectedAt?: string };
+	assert.ok(typeof persisted.collectedAt === "string");
 });
 
 test("dstack_result returns infrastructure failure when binding exists but no committed result or live status exists", async () => {

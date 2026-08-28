@@ -117,7 +117,7 @@ Launch all matching investigators in a single message so they run concurrently. 
 
 Subagent config (each):
 - `agent`: `general-purpose`
-- `model`: your configured why-investigators model (or inherit-parent if unset)
+- `role`: `why-investigators`
 - `dmode: false`. Investigators should not write files. If MCP is missing for a category, skip that source and report the gap. Do not fake Slack, Linear, or Sentry.
 
 Each investigator gets:
@@ -163,7 +163,7 @@ If your scope assessment suggests a single-commit trivial target where the PR de
 Spawn one synthesizer subagent:
 
 - `agent`: `general-purpose`
-- `model`: your configured why-synthesizer model (or inherit-parent if unset)
+- `role`: `why-synthesizer`
 - `dmode: false` (agent mode). The synthesizer's quality check spot-verifies citations, which can require MCP access. Readonly/Ask mode strips MCPs and defeats that.
 
 The synthesizer gets:

@@ -81,8 +81,10 @@ import {
 	claimNestedUsage,
 	formatStaleWakePrompt,
 	launchNestedTask,
+	markNestedTaskCollected,
 	NestedTaskRegistry,
 	projectNestedResult,
+	readPersistedNestedResult,
 	restoreFiredCompletionWakes,
 	restoreFiredStaleWakes,
 	shouldTriggerCompletionWake,
@@ -100,11 +102,13 @@ import {
 	MAX_OWNER_ATTEMPTS,
 	nextRecoveryAction,
 	RECOVERY_ENTRY,
+	recoveryFailureSignature,
 	restoreRecoveryLineages,
 	summarizeFailure,
 	type RecoveryLineage,
 } from "./background/recovery.ts";
 import { activityLines, buildTreeSnapshot, latestActivity, parseTreeSnapshot, renderTreeLines, type SessionRefCache, type TreeSnapshot } from "./background/tree.ts";
+import { DSTACK_ARTIFACT_DIR_ENV, DSTACK_CHILD_INDEX_ENV } from "./background/workflow.ts";
 import { DstackStatusWriter, type DstackRootState, type DstackStatusTask, type DstackTaskState } from "./status.ts";
 import {
 	parseTranscriptProgressEvent,
@@ -779,7 +783,8 @@ export default function dstack(pi: ExtensionAPI) {
 		if (lineageId === undefined) return;
 		const lineage = recoveryLineages.get(lineageId);
 		if (lineage === undefined) return;
-		const action = nextRecoveryAction(lineage, taskId, classifyFailure(view));
+		const failureSignature = recoveryFailureSignature(view);
+		const action = nextRecoveryAction(lineage, taskId, classifyFailure(view), failureSignature);
 		if (action.kind === "ignore") return;
 		if (recoveryInFlight.has(lineageId)) return;
 		recoveryInFlight.add(lineageId);
@@ -790,7 +795,7 @@ export default function dstack(pi: ExtensionAPI) {
 			}
 			const reason = summarizeFailure(view);
 			const endedAt = new Date().toISOString();
-			const attempts = [...lineage.attempts, { taskId, endedAt, reason }];
+			const attempts = [...lineage.attempts, { taskId, endedAt, reason, failureSignature }];
 			const evidenceDir = await evidenceDirFor(taskId);
 			if (action.kind === "stop") {
 				persistLineage({ ...lineage, attempts, status: action.status });
@@ -852,7 +857,7 @@ export default function dstack(pi: ExtensionAPI) {
 				);
 			} catch (error) {
 				const launchFailure = `recovery relaunch failed: ${error instanceof Error ? error.message : String(error)}`;
-				const failedAttempts = [...attempts.slice(0, -1), { taskId, endedAt, reason: `${reason}; ${launchFailure}` }];
+				const failedAttempts = [...attempts.slice(0, -1), { taskId, endedAt, reason: `${reason}; ${launchFailure}`, failureSignature }];
 				persistLineage({ ...lineage, attempts: failedAttempts, status: "unrecoverable" });
 				pi.sendMessage(
 					{
@@ -1518,11 +1523,40 @@ export default function dstack(pi: ExtensionAPI) {
 					await awaitNestedCompletion(record.completionPromise, signal);
 				}
 				const result = projectNestedResult(record, params.detail);
+				try {
+					await markNestedTaskCollected(record);
+				} catch (error) {
+					const failure: DstackResultView = {
+						kind: "infrastructure_failure",
+						taskId: params.taskId,
+						message: error instanceof Error ? error.message : String(error),
+						companionOutputPath: null,
+					};
+					return textResult(JSON.stringify(failure), failure, true);
+				}
 				const usage = claimNestedUsage(record);
 				nestedTaskRegistry.prune();
 				if (record.status !== "running") taskTerminalState = record.status === "completed" ? "completed" : "failed";
 				await publishMachineStatus();
 				return textResult(JSON.stringify(result), result, false, usage);
+			}
+
+			const artifactDir = process.env[DSTACK_ARTIFACT_DIR_ENV];
+			const parentIndexRaw = process.env[DSTACK_CHILD_INDEX_ENV];
+			const parentIndex = parentIndexRaw === undefined ? Number.NaN : Number.parseInt(parentIndexRaw, 10);
+			if (artifactDir !== undefined && Number.isSafeInteger(parentIndex) && parentIndex >= 0) {
+				try {
+					const persisted = await readPersistedNestedResult({ artifactDir, parentIndex, taskId: params.taskId, detail: params.detail });
+					if (persisted !== undefined) return textResult(JSON.stringify(persisted), persisted);
+				} catch (error) {
+					const failure: DstackResultView = {
+						kind: "infrastructure_failure",
+						taskId: params.taskId,
+						message: `persisted nested result read failed: ${error instanceof Error ? error.message : String(error)}`,
+						companionOutputPath: null,
+					};
+					return textResult(JSON.stringify(failure), failure, true);
+				}
 			}
 
 			const files = createTaskResultFiles(sessionId);

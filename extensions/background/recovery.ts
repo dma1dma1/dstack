@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { SessionEntryLike } from "../mode.ts";
 import type { TaskRequest, TaskSpec } from "../types.ts";
 import type { DstackResultView } from "./result.ts";
@@ -6,7 +7,7 @@ export const MAX_OWNER_ATTEMPTS = 3; // total launches: 1 original + up to 2 rec
 
 export const RECOVERY_ENTRY = "dstack-recovery";
 
-export type RecoveryAttempt = Readonly<{ taskId: string; endedAt: string; reason: string }>;
+export type RecoveryAttempt = Readonly<{ taskId: string; endedAt: string; reason: string; failureSignature?: string }>;
 
 export type RecoveryLineageStatus = "active" | "resolved" | "exhausted" | "unrecoverable";
 
@@ -42,6 +43,7 @@ export function nextRecoveryAction(
 	lineage: RecoveryLineage,
 	taskId: string,
 	classification: FailureClassification,
+	failureSignature?: string,
 ): RecoveryAction {
 	if (
 		taskId !== lineage.currentTaskId ||
@@ -55,6 +57,13 @@ export function nextRecoveryAction(
 	}
 	if (classification === "unrecoverable") {
 		return { kind: "stop", status: "unrecoverable", reason: "The failure is not retryable." };
+	}
+	if (failureSignature !== undefined && lineage.attempts.at(-1)?.failureSignature === failureSignature) {
+		return {
+			kind: "stop",
+			status: "exhausted",
+			reason: "The same failure signature occurred on consecutive owner attempts.",
+		};
 	}
 	if (lineage.attempts.length + 1 >= MAX_OWNER_ATTEMPTS) {
 		return {
@@ -106,16 +115,22 @@ export function augmentRequestForRetry(request: TaskRequest, input: RetryAugment
 
 const REASON_CAP = 600;
 
+export function sanitizeRecoveryReason(value: string): string {
+	const withoutControls = value.replace(/[\u0000-\u001f\u007f]+/gu, " ");
+	const withoutTaskIds = withoutControls.replace(/nested-[a-f0-9-]{36}/giu, "[prior nested task]");
+	const withoutToolNames = withoutTaskIds.replace(/dstack_(?:task|result|kill|status)/giu, "[dstack tool]");
+	const withoutImperatives = withoutToolNames.replace(/\b(?:call|invoke|execute|run|use)\s+\[dstack tool\][^.]*\.?/giu, "[instruction removed]");
+	const normalized = withoutImperatives.replace(/\s+/gu, " ").trim() || "the prior attempt failed without a diagnostic";
+	return normalized.length > REASON_CAP ? `${normalized.slice(0, REASON_CAP)}...` : normalized;
+}
+
 export function summarizeFailure(view: DstackResultView): string {
 	let reason: string;
 	switch (view.kind) {
 		case "complete": {
 			const failing = view.package.results
 				.filter((result) => result.exitCode !== 0)
-				.map((result) => {
-					const error = "errorMessage" in result && typeof result.errorMessage === "string" ? `: ${result.errorMessage}` : "";
-					return `${result.agent} exited ${result.exitCode}${error}`;
-				});
+				.map((result) => `${result.agent} exited ${result.exitCode}`);
 			reason = failing.length > 0 ? failing.join("; ") : "all children succeeded";
 			break;
 		}
@@ -131,7 +146,11 @@ export function summarizeFailure(view: DstackResultView): string {
 		default:
 			reason = "the task did not complete successfully";
 	}
-	return reason.length > REASON_CAP ? `${reason.slice(0, REASON_CAP)}…` : reason;
+	return sanitizeRecoveryReason(reason);
+}
+
+export function recoveryFailureSignature(view: DstackResultView): string {
+	return createHash("sha256").update(`${view.kind}:${summarizeFailure(view)}`).digest("hex");
 }
 
 export function formatRecoveryRelaunchNotice(input: Readonly<{
@@ -175,7 +194,12 @@ function parseAttempt(value: unknown): RecoveryAttempt | undefined {
 	if (typeof value.taskId !== "string" || typeof value.endedAt !== "string" || typeof value.reason !== "string") {
 		return undefined;
 	}
-	return { taskId: value.taskId, endedAt: value.endedAt, reason: value.reason };
+	return {
+		taskId: value.taskId,
+		endedAt: value.endedAt,
+		reason: value.reason,
+		failureSignature: typeof value.failureSignature === "string" ? value.failureSignature : undefined,
+	};
 }
 
 function parseSpec(value: unknown): TaskSpec | undefined {

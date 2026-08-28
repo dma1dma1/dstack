@@ -62,6 +62,9 @@ export type SpawnChildV1 = Readonly<{
 	assignment?: "owner" | "worker" | "reviewer";
 	taskPreview: string;
 	state: "queued" | "running" | "succeeded" | "failed" | "cancelled" | "skipped";
+	launchState?: "not_started" | "started";
+	failureKind?: "pre_launch_configuration" | "pre_launch_other" | "execution";
+	cancellationReason?: "user_requested" | "parent_cancelled" | "registry_cleared";
 	activity?: string;
 	status?: SemanticStatus;
 	journal?: readonly JournalEntry[];
@@ -90,6 +93,7 @@ export type SpawnRecordV1 = Readonly<{
 	mode: "single" | "parallel" | "chain";
 	phase?: string;
 	createdAt: string;
+	collectedAt?: string;
 	children: readonly SpawnChildV1[];
 }>;
 
@@ -101,6 +105,9 @@ export type SpawnNestedChild = Readonly<{
 	assignment?: "owner" | "worker" | "reviewer";
 	taskPreview: string;
 	state: "queued" | "running" | "succeeded" | "failed" | "cancelled" | "skipped";
+	launchState?: "not_started" | "started";
+	failureKind?: "pre_launch_configuration" | "pre_launch_other" | "execution";
+	cancellationReason?: "user_requested" | "parent_cancelled" | "registry_cleared";
 	activity?: string;
 	status?: SemanticStatus;
 	journal?: readonly JournalEntry[];
@@ -341,7 +348,7 @@ export function parseWorkflowContext(raw: unknown): WorkflowContext | undefined 
 
 export function parseSpawnRecordV1(raw: unknown): SpawnRecordV1 | undefined {
 	if (!isRecord(raw)) return undefined;
-	const { schemaVersion, workflowId, parentIndex, groupId, mode, phase, createdAt, children: rawChildren } = raw;
+	const { schemaVersion, workflowId, parentIndex, groupId, mode, phase, createdAt, collectedAt, children: rawChildren } = raw;
 	if (schemaVersion !== "dstack.spawn-record.v1") return undefined;
 	if (typeof workflowId !== "string" || workflowId === "") return undefined;
 	if (typeof parentIndex !== "number" || !Number.isSafeInteger(parentIndex) || parentIndex < 0) return undefined;
@@ -360,6 +367,9 @@ export function parseSpawnRecordV1(raw: unknown): SpawnRecordV1 | undefined {
 			assignment,
 			taskPreview,
 			state,
+			launchState,
+			failureKind,
+			cancellationReason,
 			activity,
 			status,
 			journal,
@@ -392,6 +402,15 @@ export function parseSpawnRecordV1(raw: unknown): SpawnRecordV1 | undefined {
 			assignment: isWorkflowAssignment(assignment) ? assignment : undefined,
 			taskPreview,
 			state,
+			launchState: launchState === "not_started" || launchState === "started" ? launchState : undefined,
+			failureKind:
+				failureKind === "pre_launch_configuration" || failureKind === "pre_launch_other" || failureKind === "execution"
+					? failureKind
+					: undefined,
+			cancellationReason:
+				cancellationReason === "user_requested" || cancellationReason === "parent_cancelled" || cancellationReason === "registry_cleared"
+					? cancellationReason
+					: undefined,
 			activity: typeof activity === "string" && activity !== "" ? activity : undefined,
 			status: parseSemanticStatus(status),
 			journal: parseJournalEntries(journal),
@@ -421,6 +440,7 @@ export function parseSpawnRecordV1(raw: unknown): SpawnRecordV1 | undefined {
 		mode,
 		phase: typeof phase === "string" && phase !== "" ? phase : undefined,
 		createdAt,
+		collectedAt: typeof collectedAt === "string" && collectedAt !== "" ? collectedAt : undefined,
 		children,
 	};
 }
@@ -816,6 +836,15 @@ export function parseNestedChild(item: unknown): NestedChild | undefined {
 			assignment: isWorkflowAssignment(item.assignment) ? item.assignment : undefined,
 			taskPreview: typeof item.taskPreview === "string" ? item.taskPreview : "",
 			state,
+			launchState: item.launchState === "not_started" || item.launchState === "started" ? item.launchState : undefined,
+			failureKind:
+				item.failureKind === "pre_launch_configuration" || item.failureKind === "pre_launch_other" || item.failureKind === "execution"
+					? item.failureKind
+					: undefined,
+			cancellationReason:
+				item.cancellationReason === "user_requested" || item.cancellationReason === "parent_cancelled" || item.cancellationReason === "registry_cleared"
+					? item.cancellationReason
+					: undefined,
 			activity: typeof item.activity === "string" ? item.activity : undefined,
 			status: parseSemanticStatus(item.status),
 			journal: parseJournalEntries(item.journal),

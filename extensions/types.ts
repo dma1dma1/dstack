@@ -63,6 +63,14 @@ export type ChildDepth = 1 | 2;
 export const WORKFLOW_ASSIGNMENTS = ["owner", "worker", "reviewer"] as const;
 export type WorkflowAssignment = (typeof WORKFLOW_ASSIGNMENTS)[number];
 
+export const EXECUTION_PROVENANCES = ["production", "test", "unknown"] as const;
+export type ExecutionProvenance = (typeof EXECUTION_PROVENANCES)[number];
+export const PROVENANCE_ENV = "DSTACK_PROVENANCE";
+
+export function executionProvenance(env: NodeJS.Dict<string> = process.env): Exclude<ExecutionProvenance, "unknown"> {
+	return env[PROVENANCE_ENV] === "test" ? "test" : "production";
+}
+
 export type WorkflowArtifact = Readonly<{
 	name: string;
 	path: string;

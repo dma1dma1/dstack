@@ -115,6 +115,10 @@ export function parseWorkflowManifest(value: unknown): WorkflowManifestV1 {
 	}
 	const mode = raw["mode"];
 	if (mode !== "single" && mode !== "parallel" && mode !== "chain") throw new Error("manifest.mode is invalid");
+	const provenance = raw["provenance"];
+	if (provenance !== undefined && provenance !== "production" && provenance !== "test" && provenance !== "unknown") {
+		throw new Error("manifest.provenance is invalid");
+	}
 	const rawSpecs = raw["specs"];
 	if (!Array.isArray(rawSpecs) || rawSpecs.length === 0) throw new Error("manifest.specs must be non-empty");
 	if (mode === "single" && rawSpecs.length !== 1) throw new Error("single manifests must contain one spec");
@@ -147,6 +151,7 @@ export function parseWorkflowManifest(value: unknown): WorkflowManifestV1 {
 		},
 		mode,
 		childDepth: 1,
+		provenance,
 		specs: [first, ...specs.slice(1)],
 		createdAt,
 	};
