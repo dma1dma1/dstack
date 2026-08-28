@@ -42,6 +42,7 @@ test("structured prompts give owners the playbook and workers only phase state",
 	assert.match(owner, /depth-1 task owner/);
 	assert.match(owner, /\/plugin\/skills\/dmode\/playbooks\/feature\.md/);
 	assert.match(owner, /as many bounded batches/);
+	assert.match(owner, /Never return a final response with an uncollected child task/);
 
 	const worker = workflowSystemPrompt("/plugin/skills/dmode/SKILL.md", 2, workflow);
 	assert.match(worker, /terminal depth-2 worker/);

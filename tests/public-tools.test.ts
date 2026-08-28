@@ -441,6 +441,8 @@ test("depth 1 returns immediate receipt and inspection via dstack_result", async
 		const details = res.details as { kind: string; package?: { results: Array<{ exitCode: number; errorMessage?: string }> } };
 		assert.equal(details.kind, "complete");
 		assert.match(details.package?.results[0]?.errorMessage ?? "", /Unknown agent/);
+		await runtime.handlers.get("agent_end")?.({ messages: [] }, runtime.ctx);
+		assert.equal(runtime.sentMessages.length, 0, "dstack_result must discharge the nested collection obligation");
 	} finally {
 		stop();
 		if (previousDepth === undefined) delete process.env.DSTACK_NESTING;
@@ -458,7 +460,7 @@ test("depth 1 returns immediate receipt and inspection via dstack_result", async
 	}
 });
 
-test("nested completion wake respects registry teardown and contains rejected delivery", async (t) => {
+test("nested collection wake prevents owner exit, respects teardown, and contains rejected delivery", async (t) => {
 	const previousDepth = process.env.DSTACK_NESTING;
 	const previousAssignment = process.env.DSTACK_ASSIGNMENT;
 	process.env.DSTACK_NESTING = "1";
@@ -493,20 +495,21 @@ test("nested completion wake respects registry teardown and contains rejected de
 	rejectWake = true;
 	const rejectedWake = await taskTool.execute(
 		"nested-rejected-wake",
-		{ agent: "missing-agent", task: "fail before rejected wake" },
+		{ agent: "general-purpose", task: "remain running until collection wake", model: "inherit-parent" },
 		undefined,
 		undefined,
 		runtime.ctx,
 	);
-	await waitUntil(() => runtime.sentMessages.length === 1);
+	await runtime.handlers.get("agent_end")?.({ messages: [] }, runtime.ctx);
 	await new Promise<void>((resolve) => setImmediate(resolve));
 	const rejectedTaskId = (rejectedWake.details as { taskId: string }).taskId;
 	assert.deepEqual(runtime.sentMessages[0]?.message, {
-		customType: "dstack-nested-complete",
-		content: `Nested task "${rejectedTaskId}" reached terminal status failed. Call dstack_result once with taskId "${rejectedTaskId}" to collect its success or failure.`,
+		customType: "dstack-nested-collect",
+		content: `Nested task "${rejectedTaskId}" is still running and has not been collected. Call dstack_result now with taskId "${rejectedTaskId}"; it waits for completion. Do not finish before collecting the result.`,
 		display: false,
-		details: { taskId: rejectedTaskId },
+		details: { taskId: rejectedTaskId, status: "running" },
 	});
+	assert.deepEqual(runtime.sentMessages[0]?.options, { deliverAs: "followUp", triggerTurn: true });
 	await runtime.handlers.get("session_shutdown")?.({}, runtime.ctx);
 });
 
@@ -1652,6 +1655,8 @@ test("nested depth-1 task supports immediate receipt, running inspection, dstack
 		const killDetails = killRes.details as { taskId: string; status: string };
 		assert.equal(killDetails.taskId, receipt.taskId);
 		assert.ok(killDetails.status === "killed" || killDetails.status === "already_terminal");
+		await runtime.handlers.get("agent_end")?.({ messages: [] }, runtime.ctx);
+		assert.equal(runtime.sentMessages.length, 0, "dstack_kill must discharge the nested collection obligation");
 
 		const afterKillRes = await resultTool.execute("r-cancelled", { taskId: receipt.taskId }, undefined, undefined, runtime.ctx);
 		const afterKillDetails = afterKillRes.details as { kind: string; taskId: string; message?: string };

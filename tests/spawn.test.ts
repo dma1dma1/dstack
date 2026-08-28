@@ -398,6 +398,7 @@ test("claimNestedUsage transfers terminal cancelled child usage once and repeate
 		abortController: new AbortController(),
 		children: [],
 		status: "cancelled",
+		collected: false,
 		readCount: 0,
 		usageClaimed: false,
 		completionPromise: Promise.resolve({ mode: "single", results: [] }),
