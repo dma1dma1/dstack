@@ -125,6 +125,20 @@ export function capOutput(output: string, cap = PER_TASK_OUTPUT_CAP): string {
 	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
 }
 
+function utf8Tail(output: string, maxBytes: number): string {
+	if (maxBytes <= 0) return "";
+	const bytes = Buffer.from(output, "utf8");
+	let offset = Math.max(0, bytes.length - maxBytes);
+	while (offset < bytes.length && (bytes[offset]! & 0xc0) === 0x80) offset += 1;
+	return bytes.subarray(offset).toString("utf8");
+}
+
+function capStderrFallback(stderr: string): string {
+	if (Buffer.byteLength(stderr, "utf8") <= PER_TASK_OUTPUT_CAP) return stderr;
+	const marker = "[Output truncated from start. Full output preserved in tool details.]\n\n";
+	return `${marker}${utf8Tail(stderr, PER_TASK_OUTPUT_CAP - Buffer.byteLength(marker, "utf8"))}`;
+}
+
 export async function mapWithConcurrency<TIn, TOut>(
 	items: readonly TIn[],
 	concurrency: number,
@@ -678,7 +692,7 @@ export async function runChildProcess(input: {
 		result.errorMessage = `Child agent exited before collecting launched task ${unresolvedTaskIds.join(", ")}. Call dstack_result or dstack_kill before finishing.`;
 		result.unresolvedTaskIds = unresolvedTaskIds;
 	}
-	if (!result.text) result.text = result.errorMessage || result.stderr || "(no output)";
+	if (!result.text) result.text = result.errorMessage || (result.stderr ? capStderrFallback(result.stderr) : "(no output)");
 	return result;
 }
 

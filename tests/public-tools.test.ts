@@ -37,7 +37,10 @@ async function waitUntil(predicate: () => boolean | Promise<boolean>, timeoutMs 
 	}
 }
 
-function testRuntime(events: ReturnType<typeof createEventBus>) {
+function testRuntime(
+	events: ReturnType<typeof createEventBus>,
+	sendMessageImpl?: (message: unknown, options?: unknown) => unknown,
+) {
 	const tools = new Map<string, {
 		execute: (...args: unknown[]) => Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown; isError?: boolean; usage?: unknown }>;
 		renderResult?: (
@@ -83,6 +86,7 @@ function testRuntime(events: ReturnType<typeof createEventBus>) {
 		},
 		sendMessage(message: unknown, options?: unknown) {
 			sentMessages.push({ message, options });
+			return sendMessageImpl?.(message, options);
 		},
 		sendUserMessage() {},
 	} as unknown as ExtensionAPI;
@@ -450,6 +454,58 @@ test("depth 1 returns immediate receipt and inspection via dstack_result", async
 		if (previousSchedulerRoot === undefined) delete process.env[SCHEDULER_ROOT_ENV];
 		else process.env[SCHEDULER_ROOT_ENV] = previousSchedulerRoot;
 	}
+});
+
+test("nested completion wake respects registry teardown and contains rejected delivery", async (t) => {
+	const previousDepth = process.env.DSTACK_NESTING;
+	const previousAssignment = process.env.DSTACK_ASSIGNMENT;
+	process.env.DSTACK_NESTING = "1";
+	delete process.env.DSTACK_ASSIGNMENT;
+	t.after(() => {
+		if (previousDepth === undefined) delete process.env.DSTACK_NESTING;
+		else process.env.DSTACK_NESTING = previousDepth;
+		if (previousAssignment === undefined) delete process.env.DSTACK_ASSIGNMENT;
+		else process.env.DSTACK_ASSIGNMENT = previousAssignment;
+	});
+
+	let rejectWake = false;
+	const runtime = testRuntime(createEventBus(), () => {
+		if (rejectWake) return Promise.reject(new Error("delivery failed"));
+	});
+	await runtime.handlers.get("session_start")?.({}, runtime.ctx);
+	const taskTool = runtime.tools.get("dstack_task");
+	assert.ok(taskTool);
+
+	await taskTool.execute(
+		"nested-before-shutdown",
+		{ agent: "general-purpose", task: "remain running until teardown", model: "inherit-parent" },
+		undefined,
+		undefined,
+		runtime.ctx,
+	);
+	await runtime.handlers.get("session_shutdown")?.({}, runtime.ctx);
+	await new Promise((resolve) => setTimeout(resolve, 250));
+	assert.equal(runtime.sentMessages.length, 0, JSON.stringify(runtime.sentMessages));
+
+	await runtime.handlers.get("session_start")?.({}, runtime.ctx);
+	rejectWake = true;
+	const rejectedWake = await taskTool.execute(
+		"nested-rejected-wake",
+		{ agent: "missing-agent", task: "fail before rejected wake" },
+		undefined,
+		undefined,
+		runtime.ctx,
+	);
+	await waitUntil(() => runtime.sentMessages.length === 1);
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	const rejectedTaskId = (rejectedWake.details as { taskId: string }).taskId;
+	assert.deepEqual(runtime.sentMessages[0]?.message, {
+		customType: "dstack-nested-complete",
+		content: `Nested task "${rejectedTaskId}" reached terminal status failed. Call dstack_result once with taskId "${rejectedTaskId}" to collect its success or failure.`,
+		display: false,
+		details: { taskId: rejectedTaskId },
+	});
+	await runtime.handlers.get("session_shutdown")?.({}, runtime.ctx);
 });
 
 test("depth-1 nested dstack_task writes spawn record with parentage and phase when env vars are present", async (t) => {

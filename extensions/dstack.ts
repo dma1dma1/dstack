@@ -416,6 +416,7 @@ export default function dstack(pi: ExtensionAPI) {
 	let treeSchedulerRoot: string | undefined;
 	let lastContext: ExtensionContext | undefined;
 	const nestedTaskRegistry = new NestedTaskRegistry();
+	let extensionContextGeneration = 0;
 	const firedStaleWakes = new Set<string>();
 	const firedCompletionWakes = new Set<string>();
 	let lastCompanionCheck = 0;
@@ -950,6 +951,7 @@ export default function dstack(pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
+		extensionContextGeneration += 1;
 		pendingContinuation = undefined;
 		stopTreeTimer();
 		stopStatusHeartbeat();
@@ -997,6 +999,7 @@ export default function dstack(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_tree", async (_event, ctx) => {
+		extensionContextGeneration += 1;
 		mode = restoreMode(branchEntries(ctx));
 		activeWorkflow = restoreActiveWorkflow(branchEntries(ctx));
 		sessionId = ctx.sessionManager.getSessionId();
@@ -1095,6 +1098,7 @@ export default function dstack(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		extensionContextGeneration += 1;
 		pendingContinuation = undefined;
 		stopStatusHeartbeat();
 		rootState = "idle";
@@ -1456,22 +1460,29 @@ export default function dstack(pi: ExtensionAPI) {
 				registry: nestedTaskRegistry,
 			});
 			let completionWakeSent = false;
+			const completionWakeGeneration = extensionContextGeneration;
 			void launched.record.completionPromise.then(() => {
 				// reads before resolution only peeked at running state; suppress the wake
 				// only when a read lands after terminal (an in-flight blocking collect)
 				const readsAtResolve = launched.record.readCount;
 				setImmediate(() => {
-					if (completionWakeSent || launched.record.readCount > readsAtResolve) return;
+					if (
+						completionWakeSent ||
+						completionWakeGeneration !== extensionContextGeneration ||
+						launched.record.readCount > readsAtResolve
+					) return;
 					completionWakeSent = true;
-					pi.sendMessage(
-						{
-							customType: "dstack-nested-complete",
-							content: formatNestedCompletionPrompt(launched.taskId, launched.record.status),
-							display: false,
-							details: { taskId: launched.taskId },
-						},
-						{ deliverAs: "followUp", triggerTurn: true },
-					);
+					try {
+						void Promise.resolve(pi.sendMessage(
+							{
+								customType: "dstack-nested-complete",
+								content: formatNestedCompletionPrompt(launched.taskId, launched.record.status),
+								display: false,
+								details: { taskId: launched.taskId },
+							},
+							{ deliverAs: "followUp", triggerTurn: true },
+						)).catch(() => undefined);
+					} catch {}
 				});
 			});
 			const receipt = {
