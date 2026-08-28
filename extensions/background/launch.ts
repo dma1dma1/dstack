@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, realpath } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { AgentConfig } from "../agents.ts";
@@ -182,8 +182,10 @@ function hasErrorCode(error: unknown, code: string): boolean {
 
 export function createTaskResultFiles(sessionId: string): Readonly<{
 	readBinding: (taskId: string) => Promise<TaskBinding | undefined>;
+	listBindings: () => Promise<readonly TaskBinding[]>;
 	readProgress: (binding: TaskBinding) => Promise<WorkflowProgress>;
 	readCommittedResult: (binding: TaskBinding) => Promise<CommittedResult | undefined>;
+	isUsageClaimed: (binding: TaskBinding) => Promise<boolean>;
 	claimUsage: (binding: TaskBinding) => Promise<boolean>;
 }> {
 	const currentRoot = sessionRoot(sessionId);
@@ -228,6 +230,26 @@ export function createTaskResultFiles(sessionId: string): Readonly<{
 			}
 
 			return undefined;
+		},
+		async listBindings() {
+			let entries;
+			try {
+				entries = await readdir(join(currentRoot, "bindings"), { withFileTypes: true });
+			} catch (error) {
+				if (hasErrorCode(error, "ENOENT")) return [];
+				throw error;
+			}
+			const bindings: TaskBinding[] = [];
+			for (const entry of entries) {
+				if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+				try {
+					const value: unknown = JSON.parse(await readFile(join(currentRoot, "bindings", entry.name), "utf8"));
+					if (typeof value !== "object" || value === null || !("taskId" in value) || !("workflowId" in value)) continue;
+					if (typeof value.taskId !== "string" || typeof value.workflowId !== "string") continue;
+					bindings.push({ taskId: value.taskId, workflowId: value.workflowId, root: currentRoot });
+				} catch {}
+			}
+			return bindings;
 		},
 		async readProgress(binding) {
 			const dir = workflowDir(binding);
@@ -318,6 +340,15 @@ export function createTaskResultFiles(sessionId: string): Readonly<{
 				...base,
 				...(children && children.length > 0 ? { children } : {}),
 			};
+		},
+		async isUsageClaimed(binding) {
+			try {
+				const marker = await stat(join(workflowDir(binding), "USAGE_REPORTED"));
+				return marker.isDirectory();
+			} catch (error) {
+				if (hasErrorCode(error, "ENOENT")) return false;
+				throw error;
+			}
 		},
 		async claimUsage(binding) {
 			try {

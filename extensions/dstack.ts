@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { StringEnum, type Usage } from "@earendil-works/pi-ai";
 import { SessionManager, keyHint, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { discoverAgents, packageRoot } from "./agents.ts";
 import { richerAskPresent, parseAskParams } from "./ask.ts";
@@ -25,6 +25,7 @@ import {
 	validateRoles,
 } from "./models.ts";
 import { dmodeReminder, modeStatusText, restoreMode, toggleMode, type SessionEntryLike } from "./mode.ts";
+import { buildCostSnapshot, formatCostOverlay, formatMergedCost, type CostSnapshot } from "./cost.ts";
 import { formatSessions } from "./sessions.ts";
 import {
 	companionStatus,
@@ -351,6 +352,9 @@ export default function dstack(pi: ExtensionAPI) {
 	let statusTree: TreeSnapshot | undefined;
 	let currentNestedTaskId: string | undefined;
 	let taskTerminalState: "completed" | "failed" | "cancelled" | undefined;
+	let costTimer: NodeJS.Timeout | undefined;
+	let costPollGeneration = 0;
+	let latestCostSnapshot: CostSnapshot | undefined;
 	let ambientStatus: AmbientStatus | undefined;
 	let inspectorOpen = false;
 	let treeWidgetVisible = true;
@@ -426,6 +430,41 @@ export default function dstack(pi: ExtensionAPI) {
 			void publishMachineStatus();
 		}, statusWriter?.heartbeatIntervalMs ?? 5_000);
 		statusHeartbeatTimer.unref();
+	}
+
+	function stopCostTimer() {
+		costPollGeneration += 1;
+		if (costTimer !== undefined) {
+			clearInterval(costTimer);
+			costTimer = undefined;
+		}
+	}
+
+	async function refreshCost(ctx: ExtensionContext, generation = costPollGeneration): Promise<CostSnapshot | undefined> {
+		try {
+			const snapshot = await buildCostSnapshot({
+				entries: ctx.sessionManager.getEntries(),
+				sessionId,
+				files: createTaskResultFiles(sessionId),
+				todoPath: todoFilePath(sessionId),
+			});
+			if (generation !== costPollGeneration) return undefined;
+			latestCostSnapshot = snapshot;
+			ctx.ui.setStatus("dstack-cost", formatMergedCost(snapshot.total));
+			return snapshot;
+		} catch {
+			return undefined;
+		}
+	}
+
+	function startCostPolling(ctx: ExtensionContext) {
+		stopCostTimer();
+		const generation = costPollGeneration;
+		void refreshCost(ctx, generation);
+		costTimer = setInterval(() => {
+			void refreshCost(ctx, generation);
+		}, 1000);
+		costTimer.unref();
 	}
 
 	function updateTreeWidget(ctx: ExtensionContext) {
@@ -674,6 +713,7 @@ export default function dstack(pi: ExtensionAPI) {
 		statusTree = undefined;
 		currentNestedTaskId = undefined;
 		taskTerminalState = undefined;
+		stopCostTimer();
 		ambientStatus = undefined;
 		treeLastTaskId = undefined;
 		treeLastWorkflowId = undefined;
@@ -694,6 +734,7 @@ export default function dstack(pi: ExtensionAPI) {
 		await maybeWriteChildSessionRef(ctx);
 		await refreshTodos();
 		applyStatus(ctx);
+		if (!isChild) startCostPolling(ctx);
 		if (activeWorkflow) {
 			const files = createTaskResultFiles(sessionId);
 			const binding = await files.readBinding(activeWorkflow.taskId);
@@ -726,6 +767,7 @@ export default function dstack(pi: ExtensionAPI) {
 		for (const id of restoreFiredStaleWakes(branchEntries(ctx))) firedStaleWakes.add(id);
 		nestedTaskRegistry.clear();
 		applyStatus(ctx);
+		if (!isChild) void refreshCost(ctx);
 		if (activeWorkflow) {
 			const files = createTaskResultFiles(sessionId);
 			const binding = await files.readBinding(activeWorkflow.taskId);
@@ -806,6 +848,8 @@ export default function dstack(pi: ExtensionAPI) {
 		stopStatusHeartbeat();
 		rootState = "idle";
 		await publishMachineStatus(new Date().toISOString());
+		stopCostTimer();
+		latestCostSnapshot = undefined;
 		eventBusPort?.close();
 		eventBusPort = undefined;
 		nestedTaskRegistry.clear();
@@ -813,6 +857,7 @@ export default function dstack(pi: ExtensionAPI) {
 		ambientStatus = undefined;
 		if (ctx?.hasUI && typeof ctx.ui.setWidget === "function") {
 			ctx.ui.setWidget("dstack-tree", undefined);
+			ctx.ui.setStatus("dstack-cost", undefined);
 		}
 	});
 
@@ -914,6 +959,47 @@ export default function dstack(pi: ExtensionAPI) {
 			expanded,
 		});
 		return new Text(lines.join("\n"), 0, 0);
+	});
+
+	pi.registerCommand("dcost", {
+		description: "Open the dstack persisted and live cost breakdown.",
+		handler: async (_args, ctx) => {
+			if (ctx.mode !== "tui") {
+				ctx.ui.notify("/dcost requires the interactive Pi UI", "error");
+				return;
+			}
+			await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+				let snapshot = latestCostSnapshot;
+				let disposed = false;
+				const refresh = async () => {
+					const next = await refreshCost(ctx);
+					if (next !== undefined && !disposed) {
+						snapshot = next;
+						tui.requestRender();
+					}
+				};
+				void refresh();
+				const timer = setInterval(() => void refresh(), 1000);
+				timer.unref();
+				return {
+					render(width: number) {
+						const lines = snapshot === undefined ? ["dstack cost", "Loading..."] : formatCostOverlay(snapshot);
+						return lines.map((line, index) => truncateToWidth(index === 0 ? theme.bold(theme.fg("accent", line)) : line, width));
+					},
+					handleInput(data: string) {
+						if (matchesKey(data, "escape")) done();
+					},
+					invalidate() {},
+					dispose() {
+						disposed = true;
+						clearInterval(timer);
+					},
+				};
+			}, {
+				overlay: true,
+				overlayOptions: { anchor: "center", width: "80%", minWidth: 56, maxHeight: "80%", margin: 1 },
+			});
+		},
 	});
 
 	pi.registerCommand("dagents", {
