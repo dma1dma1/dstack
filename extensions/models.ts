@@ -2,8 +2,11 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
+	DEFAULT_TOTAL_SLOTS,
 	DEFAULT_WORKTREE_BASE,
 	LIST_ROLES,
+	MAX_TOTAL_SLOTS,
+	MIN_TOTAL_SLOTS,
 	MODEL_ALIASES,
 	type DstackConfig,
 	type ModelRef,
@@ -56,6 +59,7 @@ function parseFrom(value: unknown): WorktreeFrom {
 export function emptyConfig(): DstackConfig {
 	return {
 		roles: {},
+		scheduler: { totalSlots: DEFAULT_TOTAL_SLOTS },
 		worktree: { base: DEFAULT_WORKTREE_BASE, from: "HEAD" },
 	};
 }
@@ -79,6 +83,24 @@ export function parseConfig(raw: unknown): ConfigResult<DstackConfig> {
 			roles[name] = parsed;
 		}
 	}
+	const schedulerIn = obj.scheduler;
+	let scheduler = emptyConfig().scheduler;
+	if (schedulerIn !== undefined) {
+		if (schedulerIn === null || typeof schedulerIn !== "object" || Array.isArray(schedulerIn)) {
+			return { ok: false, error: { kind: "invalid-shape", message: "scheduler must be an object" } };
+		}
+		const totalSlots = (schedulerIn as Record<string, unknown>).totalSlots;
+		if (!Number.isSafeInteger(totalSlots) || (totalSlots as number) < MIN_TOTAL_SLOTS || (totalSlots as number) > MAX_TOTAL_SLOTS) {
+			return {
+				ok: false,
+				error: {
+					kind: "invalid-shape",
+					message: `scheduler.totalSlots must be an integer from ${MIN_TOTAL_SLOTS} to ${MAX_TOTAL_SLOTS}`,
+				},
+			};
+		}
+		scheduler = { totalSlots: totalSlots as number };
+	}
 	const worktreeIn = obj.worktree;
 	let worktree = emptyConfig().worktree;
 	if (worktreeIn !== undefined) {
@@ -91,7 +113,7 @@ export function parseConfig(raw: unknown): ConfigResult<DstackConfig> {
 			from: parseFrom(wt.from),
 		};
 	}
-	return { ok: true, value: { roles, worktree } };
+	return { ok: true, value: { roles, scheduler, worktree } };
 }
 
 function refsOf(value: RoleValue): ModelRef[] {

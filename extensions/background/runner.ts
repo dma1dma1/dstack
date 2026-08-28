@@ -13,6 +13,7 @@ import {
 	type WorkflowResultIndexV2,
 } from "./workflow.ts";
 import { parseChildSessionRef } from "./session.ts";
+import { MAX_TOTAL_SLOTS, MIN_TOTAL_SLOTS } from "../types.ts";
 import { parseWorkflowContext } from "../workflow-context.ts";
 
 export const RUNNER_PREFLIGHT_PROTOCOL = "dstack.runner-preflight.v1";
@@ -105,6 +106,13 @@ export function parseWorkflowManifest(value: unknown): WorkflowManifestV1 {
 	const raw = record(value, "manifest");
 	if (raw["schemaVersion"] !== MANIFEST_SCHEMA) throw new Error("manifest.schemaVersion is unsupported");
 	if (raw["childDepth"] !== 1) throw new Error("manifest.childDepth must be 1");
+	const schedulerTotalSlots = raw["schedulerTotalSlots"];
+	if (
+		schedulerTotalSlots !== undefined &&
+		(typeof schedulerTotalSlots !== "number" || !Number.isSafeInteger(schedulerTotalSlots) || schedulerTotalSlots < MIN_TOTAL_SLOTS || schedulerTotalSlots > MAX_TOTAL_SLOTS)
+	) {
+		throw new Error(`manifest.schedulerTotalSlots must be an integer from ${MIN_TOTAL_SLOTS} to ${MAX_TOTAL_SLOTS}`);
+	}
 	const mode = raw["mode"];
 	if (mode !== "single" && mode !== "parallel" && mode !== "chain") throw new Error("manifest.mode is invalid");
 	const rawSpecs = raw["specs"];
@@ -125,6 +133,7 @@ export function parseWorkflowManifest(value: unknown): WorkflowManifestV1 {
 		workflowId: string(raw["workflowId"], "manifest.workflowId"),
 		sessionId: string(raw["sessionId"], "manifest.sessionId"),
 		schedulerRoot: absolutePath(raw["schedulerRoot"], "manifest.schedulerRoot"),
+		schedulerTotalSlots: typeof schedulerTotalSlots === "number" ? schedulerTotalSlots : undefined,
 		artifactDir: absolutePath(raw["artifactDir"], "manifest.artifactDir"),
 		extensionPath: absolutePath(raw["extensionPath"], "manifest.extensionPath"),
 		piChildLaunch: {

@@ -5,6 +5,12 @@ import { link, lstat, mkdir, open, readdir, readFile, realpath, rename, rm } fro
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
+import {
+	DEFAULT_TOTAL_SLOTS,
+	MAX_TOTAL_SLOTS,
+	MIN_TOTAL_SLOTS,
+	nestingCapableSlotLimit,
+} from "../types.ts";
 import type { AbsolutePath } from "./artifacts.ts";
 
 /**
@@ -26,12 +32,12 @@ import type { AbsolutePath } from "./artifacts.ts";
  *   <root>/events/*.json     immutable ticket and slot telemetry records
  *
  * Admission rules (safety before fairness):
- *   - at most MAX_ACTIVE_CHILDREN leases exist at once;
+ *   - at most the persisted total slot capacity leases exist at once;
  *   - work is admitted by internal capacity class. Depth-1 work is "reserved"
  *     (nesting-capable) unless its explicit tool allowlist excludes
- *     `dstack_task`; at most MAX_NESTING_CAPABLE_CHILDREN reserved leases exist
- *     at once so nesting cannot deadlock. Depth-2 work and depth-1 work whose
- *     allowlist excludes `dstack_task` is "terminal" and may use slot four;
+ *     `dstack_task`; the persisted nesting-capable limit leaves terminal
+ *     headroom so nesting cannot deadlock. Depth-2 work and depth-1 work whose
+ *     allowlist excludes `dstack_task` is "terminal" and may use that headroom;
  *   - tickets are served FIFO by sequence number, except a terminal ticket may
  *     bypass an earlier reserved ticket that is currently blocked by the
  *     nesting reserve.
@@ -48,8 +54,13 @@ import type { AbsolutePath } from "./artifacts.ts";
  * closed with an error. It is never deleted or reset.
  */
 
-export const MAX_ACTIVE_CHILDREN = 4;
-export const MAX_NESTING_CAPABLE_CHILDREN = 3;
+export const MAX_ACTIVE_CHILDREN = DEFAULT_TOTAL_SLOTS;
+export const MAX_NESTING_CAPABLE_CHILDREN = nestingCapableSlotLimit(DEFAULT_TOTAL_SLOTS);
+
+export type SchedulerCapacity = Readonly<{
+	totalActiveSlots: number;
+	nestingCapableLimit: number;
+}>;
 
 export type LeaseSnapshot = Readonly<{
 	workflowId: string;
@@ -63,6 +74,7 @@ const LEASE_SCHEMA = "dstack.scheduler.lease.v2";
 export const QUEUE_EVENT_SCHEMA = "dstack.scheduler.queue-event.v1" as const;
 const LOCK_SCHEMA = "dstack.scheduler.lock.v2";
 const CLAIM_SCHEMA = "dstack.scheduler.lockclaim.v1";
+const CAPACITY_SCHEMA = "dstack.scheduler.capacity.v1";
 const UNPROVABLE_START_TOKEN = "unprovable";
 const POLL_INTERVAL_MS = 40;
 const LOCK_RETRY_MS = 10;
@@ -104,6 +116,7 @@ export type AcquireChildSlotInput = Readonly<{
 	workflowId: string;
 	childId: string;
 	work: ChildWork;
+	requestedTotalSlots?: number;
 	signal: AbortSignal;
 	/** Test-only seam; production callers must not set this. */
 	__testHooks?: Readonly<{ afterAdmission?: () => void | Promise<void> }>;
@@ -181,6 +194,7 @@ export type QueueEventV1 =
 
 type LockRecord = Readonly<{ nonce: string; owner: OwnerIdentity }>;
 type ClaimRecord = Readonly<{ lockNonce: string; owner: OwnerIdentity }>;
+type CapacityRecord = SchedulerCapacity & Readonly<{ schemaVersion: typeof CAPACITY_SCHEMA }>;
 
 type Liveness = "live" | "dead" | "unknown";
 type LivenessCache = Map<string, Liveness>;
@@ -202,6 +216,27 @@ function errnoCode(error: unknown): string | undefined {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function capacityFor(totalActiveSlots: number): CapacityRecord {
+	if (!Number.isSafeInteger(totalActiveSlots) || totalActiveSlots < MIN_TOTAL_SLOTS || totalActiveSlots > MAX_TOTAL_SLOTS) {
+		throw new Error(`requestedTotalSlots must be an integer from ${MIN_TOTAL_SLOTS} to ${MAX_TOTAL_SLOTS}`);
+	}
+	return {
+		schemaVersion: CAPACITY_SCHEMA,
+		totalActiveSlots,
+		nestingCapableLimit: nestingCapableSlotLimit(totalActiveSlots),
+	};
+}
+
+function parseCapacity(value: unknown): CapacityRecord | undefined {
+	if (!isRecord(value) || value.schemaVersion !== CAPACITY_SCHEMA) return undefined;
+	const totalActiveSlots = value.totalActiveSlots;
+	const nestingCapableLimit = value.nestingCapableLimit;
+	if (!Number.isSafeInteger(totalActiveSlots) || !Number.isSafeInteger(nestingCapableLimit)) return undefined;
+	const expected = capacityFor(totalActiveSlots as number);
+	if (nestingCapableLimit !== expected.nestingCapableLimit) return undefined;
+	return expected;
 }
 
 // --- Liveness -------------------------------------------------------------
@@ -687,6 +722,18 @@ async function collectLeases(root: AbsolutePath, cache: LivenessCache): Promise<
 	return { active, opaqueCount };
 }
 
+export async function snapshotSchedulerCapacity(root: string | AbsolutePath): Promise<SchedulerCapacity> {
+	const read = await readJsonFile(join(root, "capacity.json"));
+	if (read.kind === "missing") return capacityFor(DEFAULT_TOTAL_SLOTS);
+	if (read.kind !== "value") throw corruptStateError("capacity.json is unreadable");
+	const capacity = parseCapacity(read.value);
+	if (capacity === undefined) throw corruptStateError("capacity.json does not parse as a capacity record");
+	return {
+		totalActiveSlots: capacity.totalActiveSlots,
+		nestingCapableLimit: capacity.nestingCapableLimit,
+	};
+}
+
 export async function snapshotActiveLeases(root: string | AbsolutePath): Promise<readonly LeaseSnapshot[]> {
 	const dir = join(root, "leases");
 	const cache: LivenessCache = new Map();
@@ -818,6 +865,7 @@ function makeLease(root: AbsolutePath, lease: LeaseRecord): ChildSlotLease {
 }
 
 async function tryAdmit(root: AbsolutePath, ticket: TicketRecord): Promise<ChildSlotLease | undefined> {
+	const capacity = await snapshotSchedulerCapacity(root);
 	const cache: LivenessCache = new Map();
 	const leases = await collectLeases(root, cache);
 	const tickets = await collectTickets(root, cache);
@@ -831,8 +879,8 @@ async function tryAdmit(root: AbsolutePath, ticket: TicketRecord): Promise<Child
 	const reservedHeld =
 		leases.active.filter((lease) => lease.capacityClass === "reserved").length + leases.opaqueCount;
 	const admissible = (candidate: Readonly<{ capacityClass: CapacityClass }>): boolean =>
-		activeCount < MAX_ACTIVE_CHILDREN &&
-		!(candidate.capacityClass === "reserved" && reservedHeld >= MAX_NESTING_CAPABLE_CHILDREN);
+		activeCount < capacity.totalActiveSlots &&
+		!(candidate.capacityClass === "reserved" && reservedHeld >= capacity.nestingCapableLimit);
 	if (!admissible(ticket)) return undefined;
 	for (const earlier of tickets.pending) {
 		if (earlier.seq >= ticket.seq) break;
@@ -877,15 +925,23 @@ async function removeTicketBestEffort(root: AbsolutePath, ticket: TicketRecord):
  * that races admission releases the just-granted lease and still rejects.
  */
 export async function acquireChildSlot(input: AcquireChildSlotInput): Promise<ChildSlotLease> {
-	const { schedulerRoot, workflowId, childId, work, signal } = input;
+	const { schedulerRoot, workflowId, childId, work, requestedTotalSlots, signal } = input;
 	if (workflowId === "") throw new Error("workflowId must not be empty");
 	if (childId === "") throw new Error("childId must not be empty");
 	const capacityClass = capacityClassOf(work);
 	signal.throwIfAborted();
 	await ensureSchedulerDirs(schedulerRoot);
+	const requestedCapacity = capacityFor(requestedTotalSlots ?? DEFAULT_TOTAL_SLOTS);
 	const owner: OwnerIdentity = { pid: process.pid, startToken: await currentStartToken() };
 	const nonce = randomBytes(12).toString("hex");
 	const ticket = await withSchedulerLock(schedulerRoot, signal, async () => {
+		const capacityPath = join(schedulerRoot, "capacity.json");
+		const capacityRead = await readJsonFile(capacityPath);
+		if (capacityRead.kind === "missing") {
+			await writeFileAtomic(capacityPath, JSON.stringify(requestedCapacity));
+		} else if (capacityRead.kind !== "value" || parseCapacity(capacityRead.value) === undefined) {
+			throw corruptStateError("capacity.json does not parse as a capacity record");
+		}
 		const seq = await nextSequence(schedulerRoot);
 		const record: TicketRecord = {
 			schemaVersion: TICKET_SCHEMA,

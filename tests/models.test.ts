@@ -107,13 +107,20 @@ test("loadConfig migrates legacy role names", async (t) => {
 	}
 });
 
-test("parseConfig reads worktree.from", () => {
+test("parseConfig reads worktree.from and scheduler.totalSlots", () => {
 	const parsed = parseConfig({
 		roles: { "bug-fix": "acme/fast" },
+		scheduler: { totalSlots: 12 },
 		worktree: { base: "~/.dma/worktrees", from: "origin/main" },
 	});
 	assert.equal(parsed.ok, true);
-	if (parsed.ok) assert.equal(parsed.value.worktree.from, "origin/main");
+	if (parsed.ok) {
+		assert.equal(parsed.value.scheduler.totalSlots, 12);
+		assert.equal(parsed.value.worktree.from, "origin/main");
+	}
+	for (const totalSlots of [2, 65, 4.5]) {
+		assert.equal(parseConfig({ scheduler: { totalSlots } }).ok, false);
+	}
 });
 
 test("resolveNestedLaunchModel prefers resolved explicit model over env", () => {

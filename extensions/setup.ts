@@ -201,6 +201,7 @@ export function formatSetupSummary(config: DstackConfig): string {
 	const lines = ROLE_NAMES.filter((role) => config.roles[role] !== undefined).map(
 		(role) => `${role}: ${formatRoleValue(config.roles[role] as RoleValue)}`,
 	);
+	lines.push(`scheduler.totalSlots: ${config.scheduler.totalSlots}`);
 	lines.push(`worktree.from: ${config.worktree.from}`);
 	return lines.join("\n");
 }
@@ -298,6 +299,7 @@ export function suggestConfig(slugs: readonly string[], current: DstackConfig = 
 	const valid = validateRoles(roles, new Set(slugs));
 	return {
 		roles: valid.ok ? valid.value : roles,
+		scheduler: { ...current.scheduler },
 		worktree: { ...current.worktree },
 	};
 }
