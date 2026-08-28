@@ -307,6 +307,7 @@ export type ChildResult = {
 	errorMessage?: string;
 	model?: string;
 	usage: ChildUsage;
+	unresolvedTaskIds?: readonly string[];
 };
 
 export function sumChildUsage(usages: readonly ChildUsage[]): Usage | undefined {
@@ -650,7 +651,7 @@ export async function runChildProcess(input: {
 	if (result.exitCode === 0 && unresolvedTaskIds.length > 0) {
 		result.exitCode = 1;
 		result.errorMessage = `Child agent exited before collecting launched task ${unresolvedTaskIds.join(", ")}. Call dstack_result or dstack_kill before finishing.`;
-		result.text = result.errorMessage;
+		result.unresolvedTaskIds = unresolvedTaskIds;
 	}
 	if (!result.text) result.text = result.errorMessage || result.stderr || "(no output)";
 	return result;
