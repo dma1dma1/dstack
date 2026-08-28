@@ -420,7 +420,6 @@ export default function dstack(pi: ExtensionAPI) {
 	let treeSchedulerRoot: string | undefined;
 	let lastContext: ExtensionContext | undefined;
 	const nestedTaskRegistry = new NestedTaskRegistry();
-	let extensionContextGeneration = 0;
 	const firedStaleWakes = new Set<string>();
 	const firedCompletionWakes = new Set<string>();
 	let lastCompanionCheck = 0;
@@ -956,7 +955,6 @@ export default function dstack(pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
-		extensionContextGeneration += 1;
 		pendingContinuation = undefined;
 		stopTreeTimer();
 		stopStatusHeartbeat();
@@ -1004,7 +1002,6 @@ export default function dstack(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_tree", async (_event, ctx) => {
-		extensionContextGeneration += 1;
 		mode = restoreMode(branchEntries(ctx));
 		activeWorkflow = restoreActiveWorkflow(branchEntries(ctx));
 		sessionId = ctx.sessionManager.getSessionId();
@@ -1049,6 +1046,26 @@ export default function dstack(pi: ExtensionAPI) {
 	pi.on("agent_start", async () => {
 		rootState = "working";
 		await publishMachineStatus();
+	});
+
+	pi.on("agent_end", async () => {
+		const record = nestedTaskRegistry.firstUncollected();
+		if (record === undefined) return;
+		const running = record.status === "running";
+		const content = running
+			? `Nested task "${record.taskId}" is still running and has not been collected. Call dstack_result now with taskId "${record.taskId}"; it waits for completion. Do not finish before collecting the result.`
+			: formatNestedCompletionPrompt(record.taskId, record.status);
+		try {
+			void Promise.resolve(pi.sendMessage(
+				{
+					customType: running ? "dstack-nested-collect" : "dstack-nested-complete",
+					content,
+					display: false,
+					details: running ? { taskId: record.taskId, status: record.status } : { taskId: record.taskId },
+				},
+				{ deliverAs: "followUp", triggerTurn: true },
+			)).catch(() => undefined);
+		} catch {}
 	});
 
 	pi.on("agent_settled", async () => {
@@ -1103,7 +1120,6 @@ export default function dstack(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		extensionContextGeneration += 1;
 		pendingContinuation = undefined;
 		stopStatusHeartbeat();
 		rootState = "idle";
@@ -1329,7 +1345,7 @@ export default function dstack(pi: ExtensionAPI) {
 		name: "dstack_task",
 		label: "dstack task",
 		description:
-			"Launch child agents. For dmode, root sends one nontrivial request to a workflow owner; owners may launch as many bounded worker batches as needed. Pass workflow metadata so workers receive phase and artifact state without rereading dmode. Both root and nested calls return a task id immediately. Wait for completion notifications or a stale wake-up, then call dstack_result once. Do not poll.",
+			"Launch child agents. For dmode, root sends one nontrivial request to a workflow owner; owners may launch as many bounded worker batches as needed. Pass workflow metadata so workers receive phase and artifact state without rereading dmode. Both root and nested calls return a task id immediately. Root waits for a completion or stale wake-up. Nested owners call dstack_result after independent work; it waits for completion. Never poll or finish with an uncollected task.",
 		parameters: TaskParams,
 		renderCall(params, theme) {
 			const request = parseTaskRequest(params);
@@ -1464,32 +1480,6 @@ export default function dstack(pi: ExtensionAPI) {
 				childDepth,
 				registry: nestedTaskRegistry,
 			});
-			let completionWakeSent = false;
-			const completionWakeGeneration = extensionContextGeneration;
-			void launched.record.completionPromise.then(() => {
-				// reads before resolution only peeked at running state; suppress the wake
-				// only when a read lands after terminal (an in-flight blocking collect)
-				const readsAtResolve = launched.record.readCount;
-				setImmediate(() => {
-					if (
-						completionWakeSent ||
-						completionWakeGeneration !== extensionContextGeneration ||
-						launched.record.readCount > readsAtResolve
-					) return;
-					completionWakeSent = true;
-					try {
-						void Promise.resolve(pi.sendMessage(
-							{
-								customType: "dstack-nested-complete",
-								content: formatNestedCompletionPrompt(launched.taskId, launched.record.status),
-								display: false,
-								details: { taskId: launched.taskId },
-							},
-							{ deliverAs: "followUp", triggerTurn: true },
-						)).catch(() => undefined);
-					} catch {}
-				});
-			});
 			const receipt = {
 				taskId: launched.taskId,
 				mode: launched.mode,
@@ -1612,6 +1602,16 @@ export default function dstack(pi: ExtensionAPI) {
 			if (nestedTaskRegistry.has(params.taskId)) {
 				const record = nestedTaskRegistry.get(params.taskId)!;
 				if (record.status !== "running") {
+					try {
+						await markNestedTaskCollected(record);
+					} catch (error) {
+						const killRes: DstackKillResult = {
+							taskId: params.taskId,
+							status: "kill_failed",
+							message: `Task is terminal, but its collection record could not be saved: ${error instanceof Error ? error.message : String(error)}`,
+						};
+						return textResult(JSON.stringify(killRes), killRes, true);
+					}
 					const usage = claimNestedUsage(record);
 					const killRes: DstackKillResult = {
 						taskId: params.taskId,
@@ -1622,6 +1622,16 @@ export default function dstack(pi: ExtensionAPI) {
 				}
 				nestedTaskRegistry.cancel(params.taskId);
 				await record.completionPromise;
+				try {
+					await markNestedTaskCollected(record);
+				} catch (error) {
+					const killRes: DstackKillResult = {
+						taskId: params.taskId,
+						status: "kill_failed",
+						message: `Task was cancelled, but its collection record could not be saved: ${error instanceof Error ? error.message : String(error)}`,
+					};
+					return textResult(JSON.stringify(killRes), killRes, true);
+				}
 				const usage = claimNestedUsage(record);
 				taskTerminalState = "cancelled";
 				await publishMachineStatus();

@@ -185,6 +185,7 @@ export type NestedTaskRecord = {
 	cancelledMessage?: string;
 	cancellationReason?: CancellationReason;
 	markCollected?: () => Promise<void>;
+	collected: boolean;
 	readCount: number;
 	usageClaimed: boolean;
 	completionPromise: Promise<TaskDetails>;
@@ -329,6 +330,13 @@ export class NestedTaskRegistry {
 		return this.tasks.has(taskId);
 	}
 
+	firstUncollected(): NestedTaskRecord | undefined {
+		for (const record of this.tasks.values()) {
+			if (!record.collected) return record;
+		}
+		return undefined;
+	}
+
 	cancel(taskId: string, reason: CancellationReason = "user_requested"): boolean {
 		const record = this.tasks.get(taskId);
 		if (!record) return false;
@@ -344,7 +352,7 @@ export class NestedTaskRegistry {
 	prune(maxCompleted = 100): void {
 		const completedKeys: string[] = [];
 		for (const [taskId, record] of this.tasks.entries()) {
-			if (record.status !== "running" && record.readCount > 0) {
+			if (record.status !== "running" && record.collected) {
 				completedKeys.push(taskId);
 			}
 		}
@@ -451,6 +459,7 @@ export function projectNestedResult(record: NestedTaskRecord, detail: "summary" 
 export async function markNestedTaskCollected(record: NestedTaskRecord): Promise<void> {
 	if (record.status === "running") return;
 	await record.markCollected?.();
+	record.collected = true;
 }
 
 function persistedNestedDetails(record: SpawnRecordV1): TaskDetails {
@@ -1021,6 +1030,7 @@ export function launchNestedTask(options: {
 		abortController,
 		children: initialChildren,
 		status: "running",
+		collected: false,
 		readCount: 0,
 		usageClaimed: false,
 		completionPromise,

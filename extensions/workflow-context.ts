@@ -87,6 +87,7 @@ export function workflowSystemPrompt(skillPath: string, depth: ChildDepth, workf
 			...facts,
 			"Run the playbook end to end. You own grounding, phase transitions, worker briefs, integration, diff review, and verification.",
 			"Pass workflow metadata to every child. Workers may be launched in as many bounded batches as the task needs.",
+			"Never return a final response with an uncollected child task. After independent work, call dstack_result with its task id; nested results wait for completion instead of requiring polling.",
 			"Return one concise, evidence-backed result to the root. Do not forward worker transcripts.",
 		].join("\n");
 	}
