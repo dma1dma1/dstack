@@ -2607,7 +2607,7 @@ test("tailSessionFile handles partial lines, truncation, identity replacement, a
 	assert.equal(stateCapped.records[9]?.id, "49");
 });
 
-test("AgentInspector opens native conversation by default and follows running session", async (t) => {
+test("AgentInspector opens summary by default and follows running conversation", async (t) => {
 	const dir = await temporaryDirectory(t);
 	const sessionFile = join(dir, "live.jsonl");
 
@@ -2674,6 +2674,12 @@ test("AgentInspector opens native conversation by default and follows running se
 
 	await new Promise((r) => setTimeout(r, 30));
 
+	const summaryLines = inspector.render(100);
+	assert.ok(summaryLines.some((l) => l.includes("Summary")));
+	assert.ok(summaryLines.some((l) => l.includes("Agent:")));
+	assert.ok(summaryLines.some((l) => l.includes("implement feature X")));
+
+	inspector.handleInput("c");
 	const convLines = inspector.render(100);
 	assert.ok(convLines.some((l) => l.includes("Conversation")));
 	assert.ok(convLines.some((l) => l.includes("User")));
