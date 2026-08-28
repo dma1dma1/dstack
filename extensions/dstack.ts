@@ -74,17 +74,34 @@ import { readDstackResult, type CommittedResult, type DstackResultView } from ".
 import { buildChildSessionRef } from "./background/session.ts";
 import { snapshotActiveLeases, type LeaseSnapshot } from "./background/scheduler.ts";
 import {
+	formatCompletionWakePrompt,
+	formatNestedCompletionPrompt,
+	formatRunnerFailureWakePrompt,
 	formatStaleWakePrompt,
 	launchNestedTask,
 	NestedTaskRegistry,
 	projectNestedResult,
+	restoreFiredCompletionWakes,
 	restoreFiredStaleWakes,
+	shouldTriggerCompletionWake,
 	shouldTriggerStaleWake,
 	type DstackKillResult,
 	type NestedTaskRecord,
 	type TaskDetails,
 	type TaskResult,
 } from "./task-registry.ts";
+import {
+	augmentRequestForRetry,
+	classifyFailure,
+	formatRecoveryRelaunchNotice,
+	formatRecoveryStoppedNotice,
+	MAX_OWNER_ATTEMPTS,
+	nextRecoveryAction,
+	RECOVERY_ENTRY,
+	restoreRecoveryLineages,
+	summarizeFailure,
+	type RecoveryLineage,
+} from "./background/recovery.ts";
 import { activityLines, buildTreeSnapshot, latestActivity, parseTreeSnapshot, renderTreeLines, type SessionRefCache, type TreeSnapshot } from "./background/tree.ts";
 import { DstackStatusWriter, type DstackRootState, type DstackStatusTask, type DstackTaskState } from "./status.ts";
 import {
@@ -322,6 +339,39 @@ function formatDstackResultSummary(details: unknown): string {
 
 export { latestActivity };
 
+const NESTED_RESULT_WAIT_MS = 15 * 60 * 1000;
+const COMPANION_CHECK_INTERVAL_MS = 15_000;
+
+async function awaitNestedCompletion(completion: Promise<unknown>, signal: AbortSignal | undefined): Promise<void> {
+	let timer: NodeJS.Timeout | undefined;
+	let onAbort: (() => void) | undefined;
+	try {
+		const waiters: Promise<unknown>[] = [
+			completion,
+			new Promise<void>((resolve) => {
+				timer = setTimeout(resolve, NESTED_RESULT_WAIT_MS);
+				timer.unref();
+			}),
+		];
+		if (signal !== undefined) {
+			waiters.push(
+				new Promise<void>((resolve) => {
+					onAbort = () => resolve();
+					if (signal.aborted) {
+						resolve();
+						return;
+					}
+					signal.addEventListener("abort", onAbort, { once: true });
+				}),
+			);
+		}
+		await Promise.race(waiters);
+	} finally {
+		if (timer !== undefined) clearTimeout(timer);
+		if (signal !== undefined && onAbort !== undefined) signal.removeEventListener("abort", onAbort);
+	}
+}
+
 function branchEntries(ctx: ExtensionContext): SessionEntryLike[] {
 	return ctx.sessionManager.getBranch() as SessionEntryLike[];
 }
@@ -365,6 +415,11 @@ export default function dstack(pi: ExtensionAPI) {
 	let lastContext: ExtensionContext | undefined;
 	const nestedTaskRegistry = new NestedTaskRegistry();
 	const firedStaleWakes = new Set<string>();
+	const firedCompletionWakes = new Set<string>();
+	let lastCompanionCheck = 0;
+	const recoveryLineages = new Map<string, RecoveryLineage>();
+	const lineageIdByTaskId = new Map<string, string>();
+	const recoveryInFlight = new Set<string>();
 	let treePollGeneration = 0;
 	const transcriptProgress = new TranscriptProgressTracker();
 
@@ -597,8 +652,63 @@ export default function dstack(pi: ExtensionAPI) {
 						{ deliverAs: "followUp", triggerTurn: true },
 					);
 				}
+				const collected = activeWorkflow?.taskId !== snapshot.taskId;
+				if (shouldTriggerCompletionWake({ snapshot, collected, firedTaskIds: firedCompletionWakes, control })) {
+					firedCompletionWakes.add(snapshot.taskId);
+					pi.appendEntry("dstack-completion-wake", { taskId: snapshot.taskId, timestamp: new Date().toISOString() });
+					pi.sendMessage(
+						{
+							customType: "dstack-completion-wake",
+							content: formatCompletionWakePrompt(snapshot.taskId),
+							display: false,
+							details: { taskId: snapshot.taskId },
+						},
+						{ deliverAs: "followUp", triggerTurn: true },
+					);
+					void recoverFromCommitted(snapshot.taskId);
+				}
+				if (
+					!snapshot.committed &&
+					!collected &&
+					!firedCompletionWakes.has(snapshot.taskId) &&
+					control.isIdle &&
+					!control.hasPendingMessages &&
+					Date.now() - lastCompanionCheck >= COMPANION_CHECK_INTERVAL_MS
+				) {
+					lastCompanionCheck = Date.now();
+					try {
+						const state = await getEventBusPort().statusExact(snapshot.taskId);
+						if (
+							(state?.status === "failed" || state?.status === "killed") &&
+							activeWorkflow?.taskId === snapshot.taskId &&
+							!firedCompletionWakes.has(snapshot.taskId)
+						) {
+							firedCompletionWakes.add(snapshot.taskId);
+							pi.appendEntry("dstack-completion-wake", { taskId: snapshot.taskId, timestamp: new Date().toISOString() });
+							pi.sendMessage(
+								{
+									customType: "dstack-completion-wake",
+									content: formatRunnerFailureWakePrompt(snapshot.taskId, state.status),
+									display: false,
+									details: { taskId: snapshot.taskId },
+								},
+								{ deliverAs: "followUp", triggerTurn: true },
+							);
+							// killed companions map to a cancelled view so recovery never retries user-cancelled work
+							const view: DstackResultView = state.status === "failed"
+								? { kind: "runner_failed", taskId: snapshot.taskId, message: "The background task runner failed.", companionOutputPath: state.outputPath }
+								: { kind: "cancelled", taskId: snapshot.taskId, message: "The background task was killed." };
+							void maybeRecover(snapshot.taskId, view, lastContext);
+						}
+					} catch {}
+				}
 			}
-			if (snapshot.committed && activeWorkflowCount === 0) {
+			// keep ticking on uncollected committed workflows until the completion wake fires
+			if (
+				snapshot.committed &&
+				activeWorkflowCount === 0 &&
+				(activeWorkflow?.taskId !== snapshot.taskId || firedCompletionWakes.has(snapshot.taskId))
+			) {
 				stopTreeTimer();
 			}
 		} catch {}
@@ -632,6 +742,138 @@ export default function dstack(pi: ExtensionAPI) {
 	function persistActiveWorkflow(next: ActiveWorkflow | undefined) {
 		activeWorkflow = next;
 		pi.appendEntry(ACTIVE_WORKFLOW_ENTRY, next ?? null);
+	}
+
+	function indexLineage(lineage: RecoveryLineage) {
+		recoveryLineages.set(lineage.lineageId, lineage);
+		lineageIdByTaskId.set(lineage.currentTaskId, lineage.lineageId);
+		for (const attempt of lineage.attempts) lineageIdByTaskId.set(attempt.taskId, lineage.lineageId);
+	}
+
+	function persistLineage(lineage: RecoveryLineage) {
+		indexLineage(lineage);
+		pi.appendEntry(RECOVERY_ENTRY, lineage);
+	}
+
+	function restoreRecoveryState(entries: readonly SessionEntryLike[]) {
+		recoveryLineages.clear();
+		lineageIdByTaskId.clear();
+		for (const lineage of restoreRecoveryLineages(entries).values()) indexLineage(lineage);
+	}
+
+	async function evidenceDirFor(taskId: string): Promise<string | undefined> {
+		try {
+			const binding = await createTaskResultFiles(sessionId).readBinding(taskId);
+			if (binding === undefined) return undefined;
+			return join(binding.root ?? sessionRoot(sessionId), "workflows", binding.workflowId);
+		} catch {
+			return undefined;
+		}
+	}
+
+	async function maybeRecover(taskId: string, view: DstackResultView, ctx: ExtensionContext | undefined): Promise<void> {
+		const lineageId = lineageIdByTaskId.get(taskId);
+		if (lineageId === undefined) return;
+		const lineage = recoveryLineages.get(lineageId);
+		if (lineage === undefined) return;
+		const action = nextRecoveryAction(lineage, taskId, classifyFailure(view));
+		if (action.kind === "ignore") return;
+		if (recoveryInFlight.has(lineageId)) return;
+		recoveryInFlight.add(lineageId);
+		try {
+			if (action.kind === "stop" && action.status === "resolved") {
+				persistLineage({ ...lineage, status: "resolved" });
+				return;
+			}
+			const reason = summarizeFailure(view);
+			const endedAt = new Date().toISOString();
+			const attempts = [...lineage.attempts, { taskId, endedAt, reason }];
+			const evidenceDir = await evidenceDirFor(taskId);
+			if (action.kind === "stop") {
+				persistLineage({ ...lineage, attempts, status: action.status });
+				// a user-cancelled task is a deliberate stop; recording it is enough, waking the agent is noise
+				if (view.kind === "cancelled") return;
+				pi.sendMessage(
+					{
+						customType: RECOVERY_ENTRY,
+						content: formatRecoveryStoppedNotice({ status: action.status, attempts, evidenceDir }),
+						display: false,
+						details: { lineageId, taskId, status: action.status },
+					},
+					{ deliverAs: "followUp", triggerTurn: true },
+				);
+				return;
+			}
+			const augmented = augmentRequestForRetry(lineage.request, {
+				attemptNumber: action.attemptNumber,
+				maxAttempts: MAX_OWNER_ATTEMPTS,
+				priorTaskId: taskId,
+				reason,
+				evidenceDir,
+			});
+			try {
+				const port = getEventBusPort();
+				await port.capabilities(AbortSignal.timeout(1000));
+				const loaded = await loadConfig(defaultConfigPath());
+				const config = loaded.ok ? loaded.value : emptyConfig();
+				const launchCtx = ctx ?? lastContext;
+				const receipt = await launchTaskGroup({
+					request: augmented,
+					ctxCwd: launchCtx?.cwd ?? process.cwd(),
+					sessionId,
+					config,
+					agents: discoverAgents(),
+					extensionPath: extensionPath(),
+					skillPath: skillPath(),
+					runnerPath: join(packageRoot(), "extensions/background/runner.ts"),
+					port,
+				});
+				persistLineage({ ...lineage, currentTaskId: receipt.taskId, attempts, status: "active" });
+				persistActiveWorkflow({ taskId: receipt.taskId, playbook: lineage.playbook ?? activeWorkflow?.playbook ?? "" });
+				if (launchCtx !== undefined) startTreePolling(receipt.taskId, receipt.workflowId, launchCtx);
+				pi.sendMessage(
+					{
+						customType: RECOVERY_ENTRY,
+						content: formatRecoveryRelaunchNotice({
+							priorTaskId: taskId,
+							newTaskId: receipt.taskId,
+							attemptNumber: action.attemptNumber,
+							maxAttempts: MAX_OWNER_ATTEMPTS,
+							reason,
+						}),
+						display: false,
+						details: { lineageId, priorTaskId: taskId, taskId: receipt.taskId, attemptNumber: action.attemptNumber },
+					},
+					{ deliverAs: "followUp", triggerTurn: true },
+				);
+			} catch (error) {
+				const launchFailure = `recovery relaunch failed: ${error instanceof Error ? error.message : String(error)}`;
+				const failedAttempts = [...attempts.slice(0, -1), { taskId, endedAt, reason: `${reason}; ${launchFailure}` }];
+				persistLineage({ ...lineage, attempts: failedAttempts, status: "unrecoverable" });
+				pi.sendMessage(
+					{
+						customType: RECOVERY_ENTRY,
+						content: formatRecoveryStoppedNotice({ status: "unrecoverable", attempts: failedAttempts, evidenceDir }),
+						display: false,
+						details: { lineageId, taskId, status: "unrecoverable" },
+					},
+					{ deliverAs: "followUp", triggerTurn: true },
+				);
+			}
+		} finally {
+			recoveryInFlight.delete(lineageId);
+		}
+	}
+
+	async function recoverFromCommitted(taskId: string): Promise<void> {
+		try {
+			const files = createTaskResultFiles(sessionId);
+			const binding = await files.readBinding(taskId);
+			if (binding === undefined) return;
+			const committed = await files.readCommittedResult(binding);
+			if (committed?.kind !== "complete") return;
+			await maybeRecover(taskId, { kind: "complete", taskId, detail: "full", package: committed.package }, lastContext);
+		} catch {}
 	}
 
 	function applyStatus(ctx: ExtensionContext) {
@@ -721,6 +963,9 @@ export default function dstack(pi: ExtensionAPI) {
 		treeSchedulerRoot = undefined;
 		firedStaleWakes.clear();
 		for (const id of restoreFiredStaleWakes(branchEntries(ctx))) firedStaleWakes.add(id);
+		firedCompletionWakes.clear();
+		for (const id of restoreFiredCompletionWakes(branchEntries(ctx))) firedCompletionWakes.add(id);
+		restoreRecoveryState(branchEntries(ctx));
 		nestedTaskRegistry.clear();
 		if (ctx.hasUI && typeof ctx.ui.setWidget === "function") {
 			ctx.ui.setWidget("dstack-tree", undefined);
@@ -765,6 +1010,9 @@ export default function dstack(pi: ExtensionAPI) {
 		await publishMachineStatus();
 		firedStaleWakes.clear();
 		for (const id of restoreFiredStaleWakes(branchEntries(ctx))) firedStaleWakes.add(id);
+		firedCompletionWakes.clear();
+		for (const id of restoreFiredCompletionWakes(branchEntries(ctx))) firedCompletionWakes.add(id);
+		restoreRecoveryState(branchEntries(ctx));
 		nestedTaskRegistry.clear();
 		applyStatus(ctx);
 		if (!isChild) void refreshCost(ctx);
@@ -1164,6 +1412,16 @@ export default function dstack(pi: ExtensionAPI) {
 							taskId: receipt.taskId,
 							playbook: specs[0].workflow.playbook,
 						});
+						if (!lineageIdByTaskId.has(receipt.taskId)) {
+							persistLineage({
+								lineageId: receipt.taskId,
+								request,
+								playbook: specs[0].workflow.playbook,
+								currentTaskId: receipt.taskId,
+								attempts: [],
+								status: "active",
+							});
+						}
 					}
 					startTreePolling(receipt.taskId, receipt.workflowId, ctx);
 					await publishMachineStatus();
@@ -1185,6 +1443,25 @@ export default function dstack(pi: ExtensionAPI) {
 				extensionPath: extensionPath(),
 				childDepth,
 				registry: nestedTaskRegistry,
+			});
+			let completionWakeSent = false;
+			void launched.record.completionPromise.then(() => {
+				// reads before resolution only peeked at running state; suppress the wake
+				// only when a read lands after terminal (an in-flight blocking collect)
+				const readsAtResolve = launched.record.readCount;
+				setImmediate(() => {
+					if (completionWakeSent || launched.record.readCount > readsAtResolve) return;
+					completionWakeSent = true;
+					pi.sendMessage(
+						{
+							customType: "dstack-nested-complete",
+							content: formatNestedCompletionPrompt(launched.taskId, launched.record.status),
+							display: false,
+							details: { taskId: launched.taskId },
+						},
+						{ deliverAs: "followUp", triggerTurn: true },
+					);
+				});
 			});
 			const receipt = {
 				taskId: launched.taskId,
@@ -1215,6 +1492,9 @@ export default function dstack(pi: ExtensionAPI) {
 			await publishMachineStatus();
 			if (nestedTaskRegistry.has(params.taskId)) {
 				const record = nestedTaskRegistry.get(params.taskId)!;
+				if (record.status === "running") {
+					await awaitNestedCompletion(record.completionPromise, signal);
+				}
 				const result = projectNestedResult(record, params.detail);
 				const usage = record.status !== "running" && record.details !== undefined && !record.usageClaimed
 					? sumChildUsage(record.details.results.map((child) => child.usage))
@@ -1261,6 +1541,9 @@ export default function dstack(pi: ExtensionAPI) {
 				}
 			}
 			await publishMachineStatus();
+			if (terminal || result.kind === "infrastructure_failure") {
+				void maybeRecover(params.taskId, result, ctx);
+			}
 			return textResult(JSON.stringify(result), result, false, usage);
 		},
 	});
