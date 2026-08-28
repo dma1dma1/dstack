@@ -106,6 +106,27 @@ function blueBorder(value: string): string {
 	return `${LIGHT_BLUE_BORDER}${value}${ANSI_RESET}`;
 }
 
+type WheelDirection = -1 | 1;
+
+function parseWheelDirection(data: string): WheelDirection | undefined {
+	const sgrMatch = /^\x1b\[<(\d+);\d+;\d+[Mm]$/.exec(data);
+	if (sgrMatch !== null) {
+		const button = Number.parseInt(sgrMatch[1] ?? "", 10);
+		if ((button & 64) === 0) return undefined;
+		const direction = button & 3;
+		return direction === 0 ? -1 : direction === 1 ? 1 : undefined;
+	}
+
+	if (data.length === 6 && data.startsWith("\x1b[M")) {
+		const button = data.charCodeAt(3) - 32;
+		if ((button & 64) === 0) return undefined;
+		const direction = button & 3;
+		return direction === 0 ? -1 : direction === 1 ? 1 : undefined;
+	}
+
+	return undefined;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
@@ -1418,6 +1439,20 @@ export class AgentInspector implements Component {
 	}
 
 	handleInput(data: string): void {
+		const wheelDirection = parseWheelDirection(data);
+		if (wheelDirection !== undefined) {
+			const frame = this.currentFrame();
+			if (frame.kind === "list") {
+				const maxIndex = Math.max(0, this.visibleItems.length - 1);
+				this.selectedIndex = Math.min(maxIndex, Math.max(0, this.selectedIndex + wheelDirection));
+				this.ensureSelectionVisible();
+				this.tui.requestRender();
+			} else {
+				this.scrollActiveDetailView(wheelDirection);
+			}
+			return;
+		}
+
 		if (data === "q" || data === "Q") {
 			this.close();
 			return;
@@ -2224,24 +2259,24 @@ export class AgentInspector implements Component {
 		switch (this.detailView) {
 			case "conversation":
 				body = this.renderConversationView(width, inspection);
-				footer = ` ${this.theme.fg("dim", `↑/↓ PgUp/PgDn scroll · Home/End · s Summary · t Task · f Final · o Raw${actionHint} · Esc/← back · q close`)}`;
+				footer = ` ${this.theme.fg("dim", `wheel/PgUp/PgDn scroll · Home/End · s Summary · t Task · f Final · o Raw${actionHint} · Esc/← back · q close`)}`;
 				break;
 			case "task":
 				body = this.renderTaskView(width, inspection);
-				footer = ` ${this.theme.fg("dim", `↑/↓ PgUp/PgDn scroll · Home/End · c Conversation · s Summary · f Final · o Raw${actionHint} · Esc/← back · q close`)}`;
+				footer = ` ${this.theme.fg("dim", `wheel/PgUp/PgDn scroll · Home/End · c Conversation · s Summary · f Final · o Raw${actionHint} · Esc/← back · q close`)}`;
 				break;
 			case "final":
 				body = this.renderFinalView(width, inspection);
-				footer = ` ${this.theme.fg("dim", `↑/↓ PgUp/PgDn scroll · Home/End · c Conversation · s Summary · t Task · o Raw${actionHint} · Esc/← back · q close`)}`;
+				footer = ` ${this.theme.fg("dim", `wheel/PgUp/PgDn scroll · Home/End · c Conversation · s Summary · t Task · o Raw${actionHint} · Esc/← back · q close`)}`;
 				break;
 			case "raw":
 				body = this.renderRawView(width, inspection);
-				footer = ` ${this.theme.fg("dim", `↑/↓ scroll · r refresh · c Conversation · s Summary · t Task · f Final${actionHint} · Esc/← back · q close`)}`;
+				footer = ` ${this.theme.fg("dim", `wheel/keys · r refresh · c Conversation · s Summary · t Task · f Final${actionHint} · Esc/← back · q close`)}`;
 				break;
 			case "summary":
 			default:
 				body = this.renderSummaryView(width, inspection, snapshot, child, nowMs);
-				footer = ` ${this.theme.fg("dim", `↑/↓ PgUp/PgDn scroll · Home/End · c Conversation · t Task · f Final · o Raw${actionHint} · Enter nested · Esc/← back · q close`)}`;
+				footer = ` ${this.theme.fg("dim", `wheel/PgUp/PgDn scroll · Home/End · c Conversation · t Task · f Final · o Raw${actionHint} · Enter nested · Esc/← back · q close`)}`;
 				break;
 		}
 
