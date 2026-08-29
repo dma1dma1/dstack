@@ -126,8 +126,8 @@ export type TodoState = {
 
 export const COMMENT_SICKO_TOOLS = "read,grep,find,ls";
 export const EXPLORER_TOOLS = "read,grep,find,ls";
-export const MAX_PARALLEL_TASKS = 8;
-export const DEFAULT_TOTAL_SLOTS = 8;
+export const MAX_PARALLEL_TASKS = 12;
+export const DEFAULT_TOTAL_SLOTS = 12;
 export const MIN_TOTAL_SLOTS = 3;
 export const MAX_TOTAL_SLOTS = 64;
 export const MAX_CONCURRENCY = DEFAULT_TOTAL_SLOTS;

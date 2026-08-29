@@ -391,6 +391,69 @@ test("root task returns a receipt before the runner completes and dstack_result 
 	);
 	assert.equal(unknownRole.isError, true);
 	assert.equal(unknownRole.content[0]?.text, 'Unknown role "architect runners". Did you mean "architect-runners"?');
+
+	const multiOwnerResult = await taskTool.execute(
+		"multi-owner-call",
+		{
+			tasks: [
+				{
+					agent: "poteto-agent",
+					task: "owner one",
+					workflow: { playbook: "feature", assignment: "owner", phase: "run", completedPhases: [], artifacts: [] },
+				},
+				{
+					agent: "poteto-agent",
+					task: "owner two",
+					workflow: { playbook: "bug-fix", assignment: "owner", phase: "run", completedPhases: [], artifacts: [] },
+				},
+			],
+		},
+		undefined,
+		undefined,
+		runtime.ctx,
+	);
+	assert.equal(multiOwnerResult.isError, false);
+
+	const invalidOwnerAgent = await taskTool.execute(
+		"invalid-owner-agent-call",
+		{
+			tasks: [
+				{
+					agent: "general-purpose",
+					task: "bad owner agent",
+					workflow: { playbook: "feature", assignment: "owner", phase: "run", completedPhases: [], artifacts: [] },
+				},
+			],
+		},
+		undefined,
+		undefined,
+		runtime.ctx,
+	);
+	assert.equal(invalidOwnerAgent.isError, true);
+	assert.equal(invalidOwnerAgent.content[0]?.text, 'dstack_task refused: workflow owners must use agent "poteto-agent".');
+
+	const multiOwnerChain = await taskTool.execute(
+		"multi-owner-chain-call",
+		{
+			chain: [
+				{
+					agent: "poteto-agent",
+					task: "chain owner one",
+					workflow: { playbook: "feature", assignment: "owner", phase: "run", completedPhases: [], artifacts: [] },
+				},
+				{
+					agent: "poteto-agent",
+					task: "chain owner two",
+					workflow: { playbook: "bug-fix", assignment: "owner", phase: "run", completedPhases: [], artifacts: [] },
+				},
+			],
+		},
+		undefined,
+		undefined,
+		runtime.ctx,
+	);
+	assert.equal(multiOwnerChain.isError, true);
+	assert.equal(multiOwnerChain.content[0]?.text, "dstack_task refused: one task group may have at most one workflow owner.");
 	await runtime.handlers.get("session_shutdown")?.({}, runtime.ctx);
 	assert.deepEqual(runtime.widgets, []);
 });
@@ -416,6 +479,20 @@ test("depth 1 returns immediate receipt and inspection via dstack_result", async
 	delete process.env[SCHEDULER_ROOT_ENV];
 
 	try {
+		const nestedOwnerAttempt = await runtime.tools.get("dstack_task")?.execute(
+			"nested-owner-call",
+			{
+				agent: "poteto-agent",
+				task: "nested owner attempt",
+				workflow: { playbook: "feature", assignment: "owner", phase: "run", completedPhases: [], artifacts: [] },
+			},
+			undefined,
+			undefined,
+			runtime.ctx,
+		);
+		assert.equal(nestedOwnerAttempt?.isError, true);
+		assert.equal(nestedOwnerAttempt?.content[0]?.text, "dstack_task refused: depth-2 children cannot be task owners.");
+
 		const result = await runtime.tools.get("dstack_task")?.execute(
 			"nested-call",
 			{ agent: "missing-agent", task: "fail asynchronously" },

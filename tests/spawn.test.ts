@@ -462,7 +462,7 @@ test("output cap 50 KiB", () => {
 	assert.ok(Buffer.byteLength(capped.split("\n\n[Output truncated")[0] ?? "", "utf8") <= PER_TASK_OUTPUT_CAP);
 });
 
-test("default local concurrency runs all 8 tasks", async () => {
+test("default local concurrency runs all 12 tasks", async () => {
 	let live = 0;
 	let peak = 0;
 	const items = Array.from({ length: MAX_PARALLEL_TASKS }, (_, i) => i);
@@ -478,7 +478,7 @@ test("default local concurrency runs all 8 tasks", async () => {
 });
 
 test("parseTaskRequest rejects too many tasks", () => {
-	const tasks = Array.from({ length: 9 }, () => ({ agent: "general-purpose", task: "x" }));
+	const tasks = Array.from({ length: MAX_PARALLEL_TASKS + 1 }, () => ({ agent: "general-purpose", task: "x" }));
 	const parsed = parseTaskRequest({ tasks });
 	assert.ok("error" in parsed);
 });
