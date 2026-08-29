@@ -10,7 +10,7 @@ import dstack from "../extensions/dstack.ts";
 import { commitWorkflowResult, parseWorkflowManifest } from "../extensions/background/runner.ts";
 import { createLocalSlotAcquirer, executeWorkflow, DSTACK_ARTIFACT_DIR_ENV, DSTACK_CHILD_INDEX_ENV, ROOT_WORKFLOW_ENV, SCHEDULER_ROOT_ENV } from "../extensions/background/workflow.ts";
 import { parseSpawnRecordV1, STALE_ACTIVITY_THRESHOLD_MS } from "../extensions/background/tree.ts";
-import { formatStaleWakePrompt, launchNestedTask, markNestedTaskCollected, NestedTaskRegistry, restoreFiredStaleWakes, shouldTriggerCompletionWake, shouldTriggerStaleWake } from "../extensions/task-registry.ts";
+import { formatStaleWakePrompt, launchNestedTask, markNestedTaskCollected, NestedTaskRegistry, nextStaleWakeAttempt, restoreStaleWakes, shouldTriggerCompletionWake, shouldTriggerStaleWake, type StaleWakeRecord } from "../extensions/task-registry.ts";
 import { classifyFailure, MAX_OWNER_ATTEMPTS, nextRecoveryAction, recoveryFailureSignature, sanitizeRecoveryReason, type RecoveryLineage } from "../extensions/background/recovery.ts";
 import { acquireChildSlot, snapshotActiveLeases } from "../extensions/background/scheduler.ts";
 import { toAbsolutePath } from "../extensions/background/artifacts.ts";
@@ -582,11 +582,65 @@ test("nested collection wake prevents owner exit, respects teardown, and contain
 	const rejectedTaskId = (rejectedWake.details as { taskId: string }).taskId;
 	assert.deepEqual(runtime.sentMessages[0]?.message, {
 		customType: "dstack-nested-collect",
-		content: `Nested task "${rejectedTaskId}" is still running and has not been collected. Call dstack_result now with taskId "${rejectedTaskId}"; it waits for completion. Do not finish before collecting the result.`,
+		content: `Nested task "${rejectedTaskId}" is still running and has not been collected. Call dstack_result now with taskId "${rejectedTaskId}"; it waits until completion or the next supervision interval. Do not finish before collecting the result.`,
 		display: false,
 		details: { taskId: rejectedTaskId, status: "running" },
 	});
 	assert.deepEqual(runtime.sentMessages[0]?.options, { deliverAs: "followUp", triggerTurn: true });
+	await runtime.handlers.get("session_shutdown")?.({}, runtime.ctx);
+});
+
+test("running inspection receives one retried completion notification before collection", async (t) => {
+	const previousDepth = process.env.DSTACK_NESTING;
+	const previousAssignment = process.env.DSTACK_ASSIGNMENT;
+	process.env.DSTACK_NESTING = "1";
+	delete process.env.DSTACK_ASSIGNMENT;
+	t.after(() => {
+		if (previousDepth === undefined) delete process.env.DSTACK_NESTING;
+		else process.env.DSTACK_NESTING = previousDepth;
+		if (previousAssignment === undefined) delete process.env.DSTACK_ASSIGNMENT;
+		else process.env.DSTACK_ASSIGNMENT = previousAssignment;
+	});
+
+	const childDir = await mkdtemp(join(tmpdir(), "dstack-completion-child-"));
+	t.after(() => rm(childDir, { recursive: true, force: true }));
+	const childScript = join(childDir, "child.mjs");
+	await writeFile(childScript, `setTimeout(() => { console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" } })); }, 200);`);
+	const previousEntryScript = process.argv[1];
+	process.argv[1] = childScript;
+	t.after(() => {
+		if (previousEntryScript === undefined) delete process.argv[1];
+		else process.argv[1] = previousEntryScript;
+	});
+
+	let completionAttempts = 0;
+	const runtime = testRuntime(createEventBus(), (message) => {
+		if ((message as { customType?: string }).customType !== "dstack-nested-complete") return undefined;
+		completionAttempts++;
+		if (completionAttempts === 1) return Promise.reject(new Error("delivery failed"));
+		return Promise.resolve();
+	});
+	await runtime.handlers.get("session_start")?.({}, runtime.ctx);
+	const taskTool = runtime.tools.get("dstack_task");
+	const resultTool = runtime.tools.get("dstack_result");
+	assert.ok(taskTool && resultTool);
+	const launch = await taskTool.execute(
+		"nested-completion-notification",
+		{ agent: "general-purpose", task: "reply done", model: "inherit-parent" },
+		undefined,
+		undefined,
+		runtime.ctx,
+	);
+	const taskId = (launch.details as { taskId: string }).taskId;
+	const running = await resultTool.execute("running-read", { taskId, waitSeconds: 0 }, undefined, undefined, runtime.ctx);
+	assert.equal((running.details as { kind: string }).kind, "running");
+	await waitUntil(() => completionAttempts === 2, 10_000);
+	assert.equal(runtime.sentMessages.filter(({ message }) => (message as { customType?: string }).customType === "dstack-nested-complete").length, 2);
+
+	const complete = await resultTool.execute("complete-read", { taskId }, undefined, undefined, runtime.ctx);
+	assert.notEqual((complete.details as { kind: string }).kind, "running");
+	await new Promise((resolve) => setTimeout(resolve, 200));
+	assert.equal(completionAttempts, 2);
 	await runtime.handlers.get("session_shutdown")?.({}, runtime.ctx);
 });
 
@@ -1414,7 +1468,7 @@ test("dstack_kill is idempotent for already-terminal tasks and safe for unknown 
 	assert.equal(unknownDetails.status, "unknown_task");
 });
 
-test("shouldTriggerStaleWake pure helper enforces one-shot, staleness, terminal, and control safety invariants", () => {
+test("shouldTriggerStaleWake repeats with capped exponential backoff and resets on progress", () => {
 	const baseSnapshot = {
 		taskId: "task-stale-test",
 		workflowId: "wf-stale-test",
@@ -1423,97 +1477,80 @@ test("shouldTriggerStaleWake pure helper enforces one-shot, staleness, terminal,
 		committed: false,
 		counts: { queued: 0, running: 1, complete: 0, total: 1 },
 		slots: { active: 1, capacity: 4 },
-		children: [
-			{
-				index: 0,
-				state: "running" as const,
-				agent: "poteto-agent",
-				taskPreview: "work on task",
-				stale: true,
-				nested: [],
-				nestedGroups: [],
-			},
-		],
+		children: [{
+			index: 0,
+			state: "running" as const,
+			agent: "poteto-agent",
+			taskPreview: "work on task",
+			activity: { text: "turn 1", updatedAt: "2025-01-01T00:00:00.000Z" },
+			stale: true,
+			nested: [],
+			nestedGroups: [],
+		}],
 		todos: [],
 		todoCounts: { total: 0, completed: 0, inProgress: 0 },
 		capturedAt: new Date().toISOString(),
 	};
+	const control = { isIdle: true, hasPendingMessages: false };
+	const staleWakes = new Map<string, StaleWakeRecord>();
+	const intervals = { baseIntervalMs: 10_000, maxIntervalMs: 40_000 };
 
-	const safeControl = { isIdle: true, hasPendingMessages: false };
-	const firedSet = new Set<string>();
+	assert.equal(shouldTriggerStaleWake({ snapshot: baseSnapshot, staleWakes, control, ...intervals }), true);
+	assert.equal(nextStaleWakeAttempt(undefined, "2025-01-01T00:00:00.000Z"), 1);
 
-	assert.equal(shouldTriggerStaleWake({ snapshot: baseSnapshot, firedTaskIds: firedSet, control: safeControl }), true);
+	staleWakes.set(baseSnapshot.taskId, {
+		taskId: baseSnapshot.taskId,
+		attempts: 1,
+		lastFiredAt: new Date(1000).toISOString(),
+		lastActivityAt: "2025-01-01T00:00:00.000Z",
+	});
+	assert.equal(shouldTriggerStaleWake({ snapshot: baseSnapshot, staleWakes, control, now: 5000, ...intervals }), false);
+	assert.equal(shouldTriggerStaleWake({ snapshot: baseSnapshot, staleWakes, control, now: 11000, ...intervals }), true);
+	assert.equal(nextStaleWakeAttempt(staleWakes.get(baseSnapshot.taskId), "2025-01-01T00:00:00.000Z"), 2);
 
-	firedSet.add("task-stale-test");
-	assert.equal(shouldTriggerStaleWake({ snapshot: baseSnapshot, firedTaskIds: firedSet, control: safeControl }), false);
+	staleWakes.set(baseSnapshot.taskId, {
+		taskId: baseSnapshot.taskId,
+		attempts: 2,
+		lastFiredAt: new Date(11000).toISOString(),
+		lastActivityAt: "2025-01-01T00:00:00.000Z",
+	});
+	assert.equal(shouldTriggerStaleWake({ snapshot: baseSnapshot, staleWakes, control, now: 25000, ...intervals }), false);
+	assert.equal(shouldTriggerStaleWake({ snapshot: baseSnapshot, staleWakes, control, now: 31000, ...intervals }), true);
+	assert.equal(nextStaleWakeAttempt(staleWakes.get(baseSnapshot.taskId), "2025-01-01T00:00:00.000Z"), 3);
 
-	firedSet.clear();
+	staleWakes.set(baseSnapshot.taskId, {
+		taskId: baseSnapshot.taskId,
+		attempts: 20,
+		lastFiredAt: new Date(31000).toISOString(),
+		lastActivityAt: "2025-01-01T00:00:00.000Z",
+	});
+	assert.equal(shouldTriggerStaleWake({ snapshot: baseSnapshot, staleWakes, control, now: 70999, ...intervals }), false);
+	assert.equal(shouldTriggerStaleWake({ snapshot: baseSnapshot, staleWakes, control, now: 71000, ...intervals }), true);
 
-	const committedSnapshot = { ...baseSnapshot, committed: true };
-	assert.equal(shouldTriggerStaleWake({ snapshot: committedSnapshot, firedTaskIds: firedSet, control: safeControl }), false);
-
-	assert.equal(shouldTriggerStaleWake({ snapshot: baseSnapshot, firedTaskIds: firedSet, control: { isIdle: false, hasPendingMessages: false } }), false);
-
-	assert.equal(shouldTriggerStaleWake({ snapshot: baseSnapshot, firedTaskIds: firedSet, control: { isIdle: true, hasPendingMessages: true } }), false);
-
-	const freshSnapshot = {
+	const advancedSnapshot = {
 		...baseSnapshot,
-		children: [
-			{
-				index: 0,
-				state: "running" as const,
-				agent: "poteto-agent",
-				taskPreview: "work on task",
-				stale: false,
-				nested: [],
-				nestedGroups: [],
-			},
-		],
+		children: [{
+			...baseSnapshot.children[0]!,
+			activity: { text: "turn 2", updatedAt: "2025-01-01T00:05:00.000Z" },
+		}],
 	};
-	assert.equal(shouldTriggerStaleWake({ snapshot: freshSnapshot, firedTaskIds: firedSet, control: safeControl }), false);
+	assert.equal(shouldTriggerStaleWake({ snapshot: advancedSnapshot, staleWakes, control, now: 35000, ...intervals }), false);
+	assert.equal(shouldTriggerStaleWake({ snapshot: advancedSnapshot, staleWakes, control, now: 41000, ...intervals }), true);
+	assert.equal(nextStaleWakeAttempt(staleWakes.get(baseSnapshot.taskId), "2025-01-01T00:05:00.000Z"), 1);
 
-	const completedSnapshot = {
-		...baseSnapshot,
-		children: [
-			{
-				index: 0,
-				state: "succeeded" as const,
-				agent: "poteto-agent",
-				taskPreview: "work on task",
-				stale: true,
-				nested: [],
-				nestedGroups: [],
-			},
-		],
-	};
-	assert.equal(shouldTriggerStaleWake({ snapshot: completedSnapshot, firedTaskIds: firedSet, control: safeControl }), false);
-
-	const nestedStaleSnapshot = {
-		...baseSnapshot,
-		children: [
-			{
-				index: 0,
-				state: "running" as const,
-				agent: "poteto-agent",
-				taskPreview: "owner task",
-				stale: false,
-				nestedGroups: [],
-				nested: [
-					{
-						groupId: "g1",
-						nestedIndex: 0,
-						agent: "general-purpose",
-						taskPreview: "nested worker",
-						state: "running" as const,
-						live: true,
-						stale: true,
-						updatedAt: new Date().toISOString(),
-					},
-				],
-			},
-		],
-	};
-	assert.equal(shouldTriggerStaleWake({ snapshot: nestedStaleSnapshot, firedTaskIds: firedSet, control: safeControl }), true);
+	const restored = restoreStaleWakes([
+		{
+			type: "custom",
+			customType: "dstack-stale-wake",
+			data: { taskId: baseSnapshot.taskId, attempt: 2, timestamp: "2025-01-01T00:10:00.000Z", lastActivityAt: "2025-01-01T00:00:00.000Z" },
+		},
+	]);
+	assert.deepEqual(restored.get(baseSnapshot.taskId), {
+		taskId: baseSnapshot.taskId,
+		attempts: 2,
+		lastFiredAt: "2025-01-01T00:10:00.000Z",
+		lastActivityAt: "2025-01-01T00:00:00.000Z",
+	});
 });
 
 test("completion wake and recovery decision helpers enforce dedupe and bounded-retry invariants", () => {
@@ -1681,12 +1718,13 @@ test("stale-parent wake-up triggers one hidden follow-up and survives session re
 	assert.match(sent.message.content, /inactive for more than 2 minutes and may be stale/);
 	assert.match(sent.message.content, /dstack_result.*dstack_kill/);
 
-	const restoredFired = restoreFiredStaleWakes(runtime.entries.map((e) => ({
+	const restored = restoreStaleWakes(runtime.entries.map((e) => ({
 		type: "custom",
 		customType: e.customType,
 		data: e.data,
 	})));
-	assert.equal(restoredFired.has("bg-stale-task"), true);
+	assert.equal(restored.has("bg-stale-task"), true);
+	assert.equal(restored.get("bg-stale-task")?.attempts, 1);
 	await runtime.handlers.get("session_tree")?.({}, runtime.ctx);
 	await new Promise((resolve) => setTimeout(resolve, 50));
 	assert.equal(runtime.sentMessages.length, 1);
@@ -1722,8 +1760,7 @@ test("nested depth-1 task supports immediate receipt, running inspection, dstack
 		const receipt = launch.details as { taskId: string; mode: string };
 		assert.ok(receipt?.taskId);
 
-		// dstack_result now blocks on running nested tasks; an aborted signal projects the running state immediately
-		const runningRes = await resultTool.execute("r-run", { taskId: receipt.taskId }, AbortSignal.abort(), undefined, runtime.ctx);
+		const runningRes = await resultTool.execute("r-run", { taskId: receipt.taskId, waitSeconds: 0 }, undefined, undefined, runtime.ctx);
 		const runningDetails = runningRes.details as { kind: string };
 		assert.ok(runningDetails.kind === "running" || runningDetails.kind === "complete");
 

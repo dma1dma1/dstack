@@ -2,7 +2,7 @@ import { mkdir, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { TaskDetails, TaskResult } from "../dstack.ts";
 import { buildChildArgv, capOutput, childEnv, runChildProcess, type ChildInvocation, type ChildResult } from "../spawn.ts";
-import type { ExecutionProvenance, WorkflowContext, WorktreeFrom } from "../types.ts";
+import type { ExecutionProvenance, ProcessBudget, ThinkingLevel, WorkflowContext, WorktreeFrom } from "../types.ts";
 import { DEFAULT_TOTAL_SLOTS, MAX_CONCURRENCY, NESTING_ENV, SESSION_REF_ENV, STATUS_FILE_ENV } from "../types.ts";
 import { createWorktree } from "../worktree.ts";
 import { atomicWriteFile, readOutputArtifact, toAbsolutePath, verifyDeclaredArtifacts, writeSealedArtifact, type OutputArtifactSeal } from "./artifacts.ts";
@@ -24,11 +24,13 @@ export type ResolvedChildSpec = Readonly<{
 	cwd: string;
 	model?: string;
 	omitModel?: boolean;
+	thinking?: ThinkingLevel;
 	requestedRole?: string;
 	roleIndex?: number;
 	overrideReason?: string;
 	tools?: string;
 	workflow?: WorkflowContext;
+	budget?: ProcessBudget;
 	systemPrompt?: string;
 	worktree?: Readonly<{ repoRoot: string; base: string; from: WorktreeFrom }>;
 }>;
@@ -286,6 +288,40 @@ function isMissingFile(error: unknown): boolean {
 	return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
 }
 
+export async function reconcileCancelledNestedSpawns(childDirectory: string): Promise<void> {
+	const spawnsDirectory = join(childDirectory, "spawns");
+	let entries;
+	try {
+		entries = await readdir(spawnsDirectory, { withFileTypes: true });
+	} catch (error) {
+		if (isMissingFile(error)) return;
+		throw error;
+	}
+	for (const entry of entries) {
+		if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+		const path = join(spawnsDirectory, entry.name);
+		const raw: unknown = JSON.parse(await readFile(path, "utf8"));
+		const record = parseSpawnRecordV1(raw);
+		if (record === undefined) throw new Error(`nested cancellation record ${entry.name} is invalid`);
+		if (!record.children.some((child) => child.state === "queued" || child.state === "running")) continue;
+		const endedAt = new Date().toISOString();
+		await atomicWriteFile(path, `${JSON.stringify({
+			...record,
+			children: record.children.map((child) =>
+				child.state === "queued" || child.state === "running"
+					? {
+						...child,
+						state: "cancelled",
+						cancellationReason: "parent_cancelled",
+						updatedAt: endedAt,
+						endedAt,
+					}
+					: child,
+			),
+		}, null, 2)}\n`);
+	}
+}
+
 export async function verifyNestedJoinBarrier(childDirectory: string): Promise<void> {
 	const spawnsDirectory = join(childDirectory, "spawns");
 	let entries;
@@ -451,6 +487,7 @@ export async function executeWorkflow(
 				companionExtensionPaths: manifest.companionExtensionPaths,
 				model: spec.model,
 				omitModel: spec.omitModel,
+				thinking: spec.thinking,
 				tools: allowStatusTool(spec.tools),
 				systemPromptPath,
 				sessionDir,
@@ -478,6 +515,7 @@ export async function executeWorkflow(
 					env,
 					invocation,
 					signal,
+					budget: spec.budget,
 					onSpawn: (pid) => lease.bindChild(pid),
 					onUpdate: (partial) => {
 						throttledActivity.write({
@@ -512,12 +550,14 @@ export async function executeWorkflow(
 				}
 			} catch (error) {
 				await journalUpdates.catch(() => undefined);
+				if (signal.aborted) await reconcileCancelledNestedSpawns(childDirectory);
 				recorder.recordFailure({ error: error instanceof Error ? error.message : String(error) });
 				await recorder.persist();
 				throw error;
 			} finally {
 				await throttledActivity.dispose();
 			}
+			if (signal.aborted) await reconcileCancelledNestedSpawns(childDirectory);
 			await recorder.checkStatusFile();
 			const endedAt = new Date().toISOString();
 			const state: ChildState = signal.aborted ? "cancelled" : child.exitCode === 0 ? "succeeded" : "failed";

@@ -297,6 +297,7 @@ test("dstack_result projects every companion and committed-result state", async 
 		message: "The background task runner failed.",
 		companionOutputPath: runningTask.outputPath,
 	});
+	assert.deepEqual(await read("killed", complete), { kind: "complete", taskId, detail: "summary", package: { mode: "single", results: [] } });
 	assert.deepEqual(await read("killed", cancelled), { kind: "cancelled", taskId, message: cancelled.message });
 	assert.deepEqual(await read("killed"), { kind: "cancelled", taskId, message: "The background task was cancelled." });
 	const killedWithUnreadableCommit = await readDstackResult({
@@ -307,6 +308,39 @@ test("dstack_result projects every companion and committed-result state", async 
 		readCommittedResult: async () => { throw new Error("commit is incomplete"); },
 	});
 	assert.deepEqual(killedWithUnreadableCommit, { kind: "cancelled", taskId, message: "The background task was cancelled." });
+});
+
+test("root running progress includes journal timing, usage, and recent activity", async (t) => {
+	const root = await temporaryDirectory(t);
+	const workflowId = "wf-running-metrics";
+	const workflowDir = join(root, "workflows", workflowId);
+	const childDir = join(workflowDir, "children", "0");
+	await mkdir(childDir, { recursive: true });
+	await writeFile(join(workflowDir, "manifest.json"), JSON.stringify({
+		specs: [{ agent: "poteto-agent", task: "inspect metrics", cwd: "/workspace", model: "test/model" }],
+	}));
+	await writeFile(join(workflowDir, "progress.json"), JSON.stringify({ queued: 0, running: 1, complete: 0, total: 1 }));
+	const usage = { input: 20, output: 10, cacheRead: 2, cacheWrite: 1, cost: 0.03, contextTokens: 100, turns: 2 };
+	await writeFile(join(childDir, "journal.json"), JSON.stringify({
+		schemaVersion: "dstack.journal.v1",
+		seq: 4,
+		updatedAt: new Date().toISOString(),
+		entries: [
+			{ seq: 1, timestamp: "2025-01-01T00:00:00.000Z", kind: "spawn", agent: "poteto-agent", task: "inspect metrics", cwd: "/workspace" },
+			{ seq: 2, timestamp: "2025-01-01T00:00:01.000Z", kind: "tool", name: "read", gist: "extensions/dstack.ts" },
+			{ seq: 3, timestamp: "2025-01-01T00:00:02.000Z", kind: "turn", turn: 1, summary: "inspected lifecycle" },
+			{ seq: 4, timestamp: "2025-01-01T00:00:03.000Z", kind: "turn", turn: 2, summary: "checking tests", usage },
+		],
+	}));
+
+	const files = createTaskResultFiles("unused-session");
+	const progress = await files.readProgress({ taskId: "bg-running-metrics", workflowId, root });
+	const child = progress.children?.[0];
+	assert.equal(child?.startedAt, "2025-01-01T00:00:00.000Z");
+	assert.ok((child?.elapsedMs ?? 0) > 0);
+	assert.deepEqual(child?.usage, usage);
+	assert.equal(child?.latestActivity, "checking tests");
+	assert.deepEqual(child?.recentActivity, ["→ read extensions/dstack.ts", "inspected lifecycle", "checking tests"]);
 });
 
 test("dstack_result recovers committed result from durable bindings across prior sessions when live status is absent", async (t) => {

@@ -8,9 +8,11 @@ import {
 	MAX_TOTAL_SLOTS,
 	MIN_TOTAL_SLOTS,
 	MODEL_ALIASES,
+	THINKING_LEVELS,
 	type DstackConfig,
 	type ModelRef,
 	type RoleValue,
+	type ThinkingLevel,
 	type WorktreeFrom,
 } from "./types.ts";
 
@@ -24,6 +26,10 @@ export function isAlias(value: string): value is (typeof MODEL_ALIASES)[number] 
 	return (MODEL_ALIASES as readonly string[]).includes(value);
 }
 
+export function isThinkingLevel(value: unknown): value is ThinkingLevel {
+	return typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value);
+}
+
 export function knownSlugSet(slugs: readonly string[]): Set<string> {
 	return new Set(slugs);
 }
@@ -33,6 +39,7 @@ export type ConfigError =
 	| { kind: "unknown-role"; role: string; suggestion?: string }
 	| { kind: "override-without-reason"; role: string }
 	| { kind: "all-inherit-panel"; role: string }
+	| { kind: "invalid-thinking"; role: string; thinking: string }
 	| { kind: "invalid-json"; message: string }
 	| { kind: "invalid-shape"; message: string };
 
@@ -43,13 +50,35 @@ function asModelRef(value: unknown): ModelRef | undefined {
 	return value.trim();
 }
 
-function parseRoleValue(value: unknown): RoleValue | undefined {
+export function parseRoleValue(value: unknown): RoleValue | undefined {
+	if (typeof value === "string") {
+		return asModelRef(value);
+	}
 	if (Array.isArray(value)) {
 		const refs = value.map(asModelRef);
 		if (refs.some((r) => r === undefined)) return undefined;
 		return refs as ModelRef[];
 	}
-	return asModelRef(value);
+	if (typeof value === "object" && value !== null) {
+		const obj = value as Record<string, unknown>;
+		if (!("model" in obj)) return undefined;
+		const parsedModel = parseRoleValue(obj.model);
+		if (parsedModel === undefined || (typeof parsedModel === "object" && !Array.isArray(parsedModel))) {
+			return undefined;
+		}
+		const thinkingRaw = obj.thinking;
+		if (thinkingRaw !== undefined) {
+			if (!isThinkingLevel(thinkingRaw)) return undefined;
+			return {
+				model: parsedModel as ModelRef | ModelRef[],
+				thinking: thinkingRaw,
+			};
+		}
+		return {
+			model: parsedModel as ModelRef | ModelRef[],
+		};
+	}
+	return undefined;
 }
 
 function parseFrom(value: unknown): WorktreeFrom {
@@ -76,6 +105,19 @@ export function parseConfig(raw: unknown): ConfigResult<DstackConfig> {
 			return { ok: false, error: { kind: "invalid-shape", message: "roles must be an object" } };
 		}
 		for (const [name, value] of Object.entries(rolesIn)) {
+			if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+				const objVal = value as Record<string, unknown>;
+				if ("thinking" in objVal && objVal.thinking !== undefined && !isThinkingLevel(objVal.thinking)) {
+					return {
+						ok: false,
+						error: {
+							kind: "invalid-thinking",
+							role: name,
+							thinking: String(objVal.thinking),
+						},
+					};
+				}
+			}
 			const parsed = parseRoleValue(value);
 			if (parsed === undefined) {
 				return { ok: false, error: { kind: "invalid-shape", message: `invalid role value for ${name}` } };
@@ -116,8 +158,20 @@ export function parseConfig(raw: unknown): ConfigResult<DstackConfig> {
 	return { ok: true, value: { roles, scheduler, worktree } };
 }
 
-function refsOf(value: RoleValue): ModelRef[] {
-	return Array.isArray(value) ? value : [value];
+export function refsOf(value: RoleValue): ModelRef[] {
+	if (typeof value === "string") return [value];
+	if (Array.isArray(value)) return value;
+	if (typeof value === "object" && value !== null && "model" in value) {
+		return Array.isArray(value.model) ? value.model : [value.model];
+	}
+	return [];
+}
+
+export function thinkingOf(value: RoleValue | undefined): ThinkingLevel | undefined {
+	if (typeof value === "object" && value !== null && !Array.isArray(value) && "thinking" in value) {
+		return isThinkingLevel(value.thinking) ? value.thinking : undefined;
+	}
+	return undefined;
 }
 
 const LEGACY_ROLE_NAMES: Readonly<Record<string, readonly string[]>> = {
@@ -186,7 +240,15 @@ export function validateRoles(
 	knownSlugs: ReadonlySet<string>,
 ): ConfigResult<Record<string, RoleValue>> {
 	for (const [role, value] of Object.entries(roles)) {
+		if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+			if (value.thinking !== undefined && !isThinkingLevel(value.thinking)) {
+				return { ok: false, error: { kind: "invalid-thinking", role, thinking: String(value.thinking) } };
+			}
+		}
 		const refs = refsOf(value);
+		if (refs.length === 0) {
+			return { ok: false, error: { kind: "invalid-shape", message: `role "${role}" has no models configured` } };
+		}
 		for (const ref of refs) {
 			if (!isAlias(ref) && !knownSlugs.has(ref)) {
 				return { ok: false, error: { kind: "unknown-slug", slug: ref } };
@@ -205,7 +267,13 @@ export function resolveModel(input: {
 	roles: Record<string, RoleValue>;
 	candidateIndex?: number;
 	overrideReason?: string;
-}): ConfigResult<{ model?: string; omitModel: boolean; requestedRole?: string; roleIndex?: number }> {
+}): ConfigResult<{
+	model?: string;
+	omitModel: boolean;
+	thinking?: ThinkingLevel;
+	requestedRole?: string;
+	roleIndex?: number;
+}> {
 	if (input.role !== undefined && !Object.hasOwn(input.roles, input.role)) {
 		return {
 			ok: false,
@@ -216,26 +284,34 @@ export function resolveModel(input: {
 			},
 		};
 	}
+	const roleValue = input.role !== undefined ? input.roles[input.role] : undefined;
+	const thinking = thinkingOf(roleValue);
+	const thinkingProp = thinking !== undefined ? { thinking } : {};
+
 	if (input.explicit) {
 		if (input.role !== undefined && !input.overrideReason?.trim()) {
 			return { ok: false, error: { kind: "override-without-reason", role: input.role } };
 		}
 		const requestedRole = input.role === undefined ? {} : { requestedRole: input.role };
-		if (isAlias(input.explicit)) return { ok: true, value: { omitModel: true, ...requestedRole } };
-		return { ok: true, value: { model: input.explicit, omitModel: false, ...requestedRole } };
+		if (isAlias(input.explicit)) return { ok: true, value: { omitModel: true, ...requestedRole, ...thinkingProp } };
+		return { ok: true, value: { model: input.explicit, omitModel: false, ...requestedRole, ...thinkingProp } };
 	}
-	if (input.role === undefined) return { ok: true, value: { omitModel: true } };
+	if (input.role === undefined) return { ok: true, value: { omitModel: true, ...thinkingProp } };
 	const value = input.roles[input.role];
-	if (Array.isArray(value)) {
-		if (value.length === 0) return { ok: true, value: { omitModel: true, requestedRole: input.role } };
+	const refs = refsOf(value);
+	if (Array.isArray(value) || (typeof value === "object" && value !== null && Array.isArray(value.model))) {
+		if (refs.length === 0) return { ok: true, value: { omitModel: true, requestedRole: input.role, ...thinkingProp } };
 		const candidateIndex = Number.isSafeInteger(input.candidateIndex) ? (input.candidateIndex as number) : 0;
-		const roleIndex = ((candidateIndex % value.length) + value.length) % value.length;
-		const selected = value[roleIndex] as ModelRef;
-		if (isAlias(selected)) return { ok: true, value: { omitModel: true, requestedRole: input.role, roleIndex } };
-		return { ok: true, value: { model: selected, omitModel: false, requestedRole: input.role, roleIndex } };
+		const roleIndex = ((candidateIndex % refs.length) + refs.length) % refs.length;
+		const selected = refs[roleIndex] as ModelRef;
+		if (isAlias(selected)) return { ok: true, value: { omitModel: true, requestedRole: input.role, roleIndex, ...thinkingProp } };
+		return { ok: true, value: { model: selected, omitModel: false, requestedRole: input.role, roleIndex, ...thinkingProp } };
 	}
-	if (isAlias(value)) return { ok: true, value: { omitModel: true, requestedRole: input.role } };
-	return { ok: true, value: { model: value, omitModel: false, requestedRole: input.role } };
+	const single = refs[0];
+	if (single === undefined || isAlias(single)) {
+		return { ok: true, value: { omitModel: true, requestedRole: input.role, ...thinkingProp } };
+	}
+	return { ok: true, value: { model: single, omitModel: false, requestedRole: input.role, ...thinkingProp } };
 }
 
 export function resolveNestedLaunchModel(input: {
@@ -293,6 +369,8 @@ export function formatConfigError(error: ConfigError): string {
 			return `Explicit model override for role "${error.role}" requires a non-empty overrideReason.`;
 		case "all-inherit-panel":
 			return `Role "${error.role}" is all inherit-parent/auto. That panel is a no-op. Mix in at least one real slug.`;
+		case "invalid-thinking":
+			return `Invalid thinking level "${error.thinking}" for role "${error.role}". Must be one of: ${THINKING_LEVELS.join(", ")}.`;
 		case "invalid-json":
 			return `Could not parse models.json: ${error.message}`;
 		case "invalid-shape":

@@ -56,6 +56,49 @@ test("inherit-parent omits --model via resolveModel", () => {
 	);
 });
 
+test("role thinking level validates and resolves", () => {
+	const valid = validateRoles(
+		{
+			feature: { model: "acme/fast", thinking: "high" },
+			"hardest-tasks": { model: ["acme/fast", "acme/smart"], thinking: "max" },
+		},
+		new Set(["acme/fast", "acme/smart"]),
+	);
+	assert.equal(valid.ok, true);
+
+	const invalidThinking = validateRoles(
+		{ feature: { model: "acme/fast", thinking: "super-high" as never } },
+		new Set(["acme/fast"]),
+	);
+	assert.equal(invalidThinking.ok, false);
+	if (!invalidThinking.ok) assert.equal(invalidThinking.error.kind, "invalid-thinking");
+
+	const invalidParse = parseConfig({
+		roles: { feature: { model: "acme/fast", thinking: "super-high" } },
+	});
+	assert.equal(invalidParse.ok, false);
+	if (!invalidParse.ok) assert.equal(invalidParse.error.kind, "invalid-thinking");
+
+	const resolved = resolveModel({
+		role: "feature",
+		roles: { feature: { model: "acme/fast", thinking: "high" } },
+	});
+	assert.deepEqual(resolved, {
+		ok: true,
+		value: { model: "acme/fast", omitModel: false, thinking: "high", requestedRole: "feature" },
+	});
+
+	const resolvedArrayRole = resolveModel({
+		role: "hardest-tasks",
+		roles: { "hardest-tasks": { model: ["acme/fast", "acme/smart"], thinking: "minimal" } },
+		candidateIndex: 1,
+	});
+	assert.deepEqual(resolvedArrayRole, {
+		ok: true,
+		value: { model: "acme/smart", omitModel: false, thinking: "minimal", requestedRole: "hardest-tasks", roleIndex: 1 },
+	});
+});
+
 test("unknown role fails closed with the nearest configured role", () => {
 	const result = resolveModel({
 		role: "architect runners",
