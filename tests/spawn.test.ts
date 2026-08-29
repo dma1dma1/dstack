@@ -408,6 +408,7 @@ test("claimNestedUsage transfers terminal cancelled child usage once and repeate
 		children: [],
 		status: "cancelled",
 		collected: false,
+		collectionRequested: false,
 		readCount: 0,
 		usageClaimed: false,
 		completionPromise: Promise.resolve({ mode: "single", results: [] }),
@@ -500,4 +501,170 @@ test("dmode false forces general-purpose", () => {
 	});
 	assert.equal(resolveAgent({ agent: "poteto-agent", task: "x" }).dmode, true);
 	assert.equal(resolveAgent({ agent: "comment-sicko", task: "x" }).tools, "read,grep,find,ls");
+});
+
+test("substantive assistant report is preserved when hidden nested collection follow-up runs", () => {
+	const result: ChildResult = {
+		text: "",
+		exitCode: 0,
+		stderr: "",
+		messages: [],
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+	};
+	const state = { messages: result.messages, result };
+
+	applyJsonEvent(
+		{
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "Substantive report: All 5 requirements passed successfully." }],
+				stopReason: "stop",
+			},
+		},
+		state,
+	);
+	assert.equal(result.text, "Substantive report: All 5 requirements passed successfully.");
+
+	applyJsonEvent(
+		{
+			type: "custom_message",
+			customType: "dstack-nested-complete",
+		},
+		state,
+	);
+
+	applyJsonEvent(
+		{
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "I have collected the nested task result." }],
+				stopReason: "stop",
+			},
+		},
+		state,
+	);
+	assert.equal(result.text, "Substantive report: All 5 requirements passed successfully.");
+
+	const finalSynthesis = "Final synthesis after collection: all five requirements passed, including the nested worker result and focused verification.";
+	applyJsonEvent(
+		{
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: finalSynthesis }],
+				stopReason: "stop",
+			},
+		},
+		state,
+	);
+	assert.equal(result.text, finalSynthesis);
+});
+
+test("parseTaskRequest preserves valid budget and rejects non-positive or non-finite budgets", () => {
+	const valid = parseTaskRequest({
+		agent: "general-purpose",
+		task: "budgeted task",
+		budget: { timeoutMs: 60_000, maxTurns: 10, maxCost: 0.5 },
+	});
+	assert.ok(!("error" in valid));
+	if ("spec" in valid) {
+		assert.deepEqual(valid.spec.budget, { timeoutMs: 60_000, maxTurns: 10, maxCost: 0.5 });
+	}
+
+	const invalidTimeout = parseTaskRequest({
+		agent: "general-purpose",
+		task: "bad timeout",
+		budget: { timeoutMs: 0 },
+	});
+	assert.ok("error" in invalidTimeout);
+	assert.match(invalidTimeout.error, /budget\.timeoutMs/);
+
+	const invalidCost = parseTaskRequest({
+		agent: "general-purpose",
+		task: "bad cost",
+		budget: { maxCost: -1 },
+	});
+	assert.ok("error" in invalidCost);
+	assert.match(invalidCost.error, /budget\.maxCost/);
+});
+
+test("process runner enforces explicit caller wall-clock timeout budget and terminates child", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "dstack-budget-timeout-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+
+	const script = "setInterval(() => {}, 1000);";
+	const result = await runChildProcess({
+		args: [],
+		cwd: root,
+		env: childEnv(1),
+		invocation: { command: process.execPath, argsPrefix: ["-e", script] },
+		budget: { timeoutMs: 50 },
+	});
+
+	assert.equal(result.exitCode, 1);
+	assert.equal(result.stopReason, "budget_exceeded");
+	assert.match(result.errorMessage ?? "", /Budget exceeded: wall_clock limit was 50ms/);
+});
+
+test("process runner enforces explicit caller turn budget and terminates child", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "dstack-budget-turns-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+
+	const messages = Array.from({ length: 5 }, (_, i) => ({
+		role: "assistant",
+		content: [{ type: "text", text: `turn ${i + 1}` }],
+		stopReason: "stop",
+	}));
+	const script = `
+		for (const message of ${JSON.stringify(messages)}) {
+			console.log(JSON.stringify({ type: "message_end", message }));
+		}
+		setInterval(() => {}, 1000);
+	`;
+
+	const result = await runChildProcess({
+		args: [],
+		cwd: root,
+		env: childEnv(1),
+		invocation: { command: process.execPath, argsPrefix: ["--input-type=module", "-e", script] },
+		budget: { maxTurns: 2 },
+	});
+
+	assert.equal(result.exitCode, 1);
+	assert.equal(result.stopReason, "budget_exceeded");
+	assert.match(result.errorMessage ?? "", /Budget exceeded: turns limit was 2, observed 3/);
+});
+
+test("process runner enforces explicit caller cost budget and terminates child", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "dstack-budget-cost-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+
+	const messages = [
+		{
+			role: "assistant",
+			content: [{ type: "text", text: "expensive turn" }],
+			usage: { cost: { total: 1.50 } },
+			stopReason: "stop",
+		},
+	];
+	const script = `
+		for (const message of ${JSON.stringify(messages)}) {
+			console.log(JSON.stringify({ type: "message_end", message }));
+		}
+		setInterval(() => {}, 1000);
+	`;
+
+	const result = await runChildProcess({
+		args: [],
+		cwd: root,
+		env: childEnv(1),
+		invocation: { command: process.execPath, argsPrefix: ["--input-type=module", "-e", script] },
+		budget: { maxCost: 1.00 },
+	});
+
+	assert.equal(result.exitCode, 1);
+	assert.equal(result.stopReason, "budget_exceeded");
+	assert.match(result.errorMessage ?? "", /Budget exceeded: cost limit was \$1\.00, observed \$1\.50/);
 });

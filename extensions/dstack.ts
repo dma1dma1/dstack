@@ -81,18 +81,22 @@ import {
 	formatNestedCompletionPrompt,
 	formatRunnerFailureWakePrompt,
 	claimNestedUsage,
+	extractLatestRunningActivityAt,
 	formatStaleWakePrompt,
 	launchNestedTask,
 	markNestedTaskCollected,
 	NestedTaskRegistry,
+	nextStaleWakeAttempt,
 	projectNestedResult,
 	readPersistedNestedResult,
 	restoreFiredCompletionWakes,
-	restoreFiredStaleWakes,
+	restoreStaleWakes,
 	shouldTriggerCompletionWake,
 	shouldTriggerStaleWake,
+	STALE_ACTIVITY_THRESHOLD_MS,
 	type DstackKillResult,
 	type NestedTaskRecord,
+	type StaleWakeRecord,
 	type TaskDetails,
 	type TaskResult,
 } from "./task-registry.ts";
@@ -140,6 +144,12 @@ const WorkflowParams = Type.Object({
 	artifacts: Type.Array(WorkflowArtifactItem),
 });
 
+const BudgetParams = Type.Object({
+	timeoutMs: Type.Optional(Type.Number({ minimum: 1, description: "Wall-clock timeout in milliseconds" })),
+	maxTurns: Type.Optional(Type.Number({ minimum: 1, description: "Maximum turns limit" })),
+	maxCost: Type.Optional(Type.Number({ minimum: 0.0001, description: "Maximum cost limit in USD" })),
+});
+
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "poteto-agent | general-purpose | comment-sicko" }),
 	task: Type.String({ description: "Task to delegate" }),
@@ -151,6 +161,7 @@ const TaskItem = Type.Object({
 	worktree: Type.Optional(Type.Boolean()),
 	dmode: Type.Optional(Type.Boolean()),
 	workflow: Type.Optional(WorkflowParams),
+	budget: Type.Optional(BudgetParams),
 });
 
 const TaskParams = Type.Object({
@@ -164,6 +175,7 @@ const TaskParams = Type.Object({
 	worktree: Type.Optional(Type.Boolean()),
 	dmode: Type.Optional(Type.Boolean()),
 	workflow: Type.Optional(WorkflowParams),
+	budget: Type.Optional(BudgetParams),
 	tasks: Type.Optional(Type.Array(TaskItem)),
 	chain: Type.Optional(Type.Array(TaskItem)),
 });
@@ -172,9 +184,16 @@ const KillParams = Type.Object({
 	taskId: Type.String({ description: "Task id returned by dstack_task to kill or cancel" }),
 });
 
+const MAX_EXPLICIT_WAIT_SECONDS = 30 * 60;
+
 const ResultParams = Type.Object({
 	taskId: Type.String({ description: "Background task id returned by dstack_task" }),
 	detail: Type.Optional(StringEnum(["summary", "full"] as const)),
+	waitSeconds: Type.Optional(Type.Number({
+		minimum: 0,
+		maximum: MAX_EXPLICIT_WAIT_SECONDS,
+		description: `Wait 0-${MAX_EXPLICIT_WAIT_SECONDS} seconds for completion. Use 0 for a nonblocking running inspection; omit to wait for completion within the supervision interval.`,
+	})),
 });
 
 const TodoParams = Type.Object({
@@ -348,18 +367,23 @@ function formatDstackResultSummary(details: unknown): string {
 
 export { latestActivity };
 
-const NESTED_RESULT_WAIT_MS = 15 * 60 * 1000;
 const COMPANION_CHECK_INTERVAL_MS = 15_000;
 
-async function awaitNestedCompletion(completion: Promise<unknown>, signal: AbortSignal | undefined): Promise<void> {
+async function awaitNestedCompletion(
+	completion: Promise<unknown>,
+	signal: AbortSignal | undefined,
+	waitSeconds?: number,
+): Promise<void> {
+	if (waitSeconds === 0) return;
 	let timer: NodeJS.Timeout | undefined;
 	let onAbort: (() => void) | undefined;
+	const timeoutMs = waitSeconds !== undefined ? waitSeconds * 1000 : STALE_ACTIVITY_THRESHOLD_MS;
 	try {
 		const waiters: Promise<unknown>[] = [
 			completion,
 			new Promise<void>((resolve) => {
-				timer = setTimeout(resolve, NESTED_RESULT_WAIT_MS);
-				timer.unref();
+				timer = setTimeout(resolve, timeoutMs);
+				timer.unref?.();
 			}),
 		];
 		if (signal !== undefined) {
@@ -423,8 +447,14 @@ export default function dstack(pi: ExtensionAPI) {
 	let treeSchedulerRoot: string | undefined;
 	let lastContext: ExtensionContext | undefined;
 	const nestedTaskRegistry = new NestedTaskRegistry();
-	const firedStaleWakes = new Set<string>();
+	const nestedCompletionDelivered = new Set<string>();
+	const nestedCompletionInFlight = new Map<string, Promise<void>>();
+	const nestedCompletionRetryTimers = new Map<string, NodeJS.Timeout>();
+	let nestedNotificationsActive = false;
+	const staleWakes = new Map<string, StaleWakeRecord>();
+	const staleWakesInFlight = new Set<string>();
 	const firedCompletionWakes = new Set<string>();
+	const completionWakesInFlight = new Set<string>();
 	let lastCompanionCheck = 0;
 	const recoveryLineages = new Map<string, RecoveryLineage>();
 	const lineageIdByTaskId = new Map<string, string>();
@@ -446,6 +476,57 @@ export default function dstack(pi: ExtensionAPI) {
 			clearInterval(statusHeartbeatTimer);
 			statusHeartbeatTimer = undefined;
 		}
+	}
+
+	function clearNestedCompletionNotifications(): void {
+		nestedNotificationsActive = false;
+		for (const timer of nestedCompletionRetryTimers.values()) clearTimeout(timer);
+		nestedCompletionRetryTimers.clear();
+		nestedCompletionDelivered.clear();
+		nestedCompletionInFlight.clear();
+	}
+
+	function notifyNestedCompletion(record: NestedTaskRecord, requireInspection: boolean): Promise<void> {
+		if (!nestedNotificationsActive || record.collected || record.collectionRequested || record.status === "running") return Promise.resolve();
+		if (requireInspection && record.readCount === 0) return Promise.resolve();
+		if (nestedCompletionDelivered.has(record.taskId)) return Promise.resolve();
+		const existing = nestedCompletionInFlight.get(record.taskId);
+		if (existing !== undefined) return existing;
+
+		const delivery = Promise.resolve().then(async () => {
+			if (!nestedNotificationsActive || record.collected || record.collectionRequested) return;
+			await pi.sendMessage(
+				{
+					customType: "dstack-nested-complete",
+					content: formatNestedCompletionPrompt(record.taskId, record.status),
+					display: false,
+					details: { taskId: record.taskId },
+				},
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
+			nestedCompletionDelivered.add(record.taskId);
+		}).catch(() => {
+			if (!nestedNotificationsActive || record.collected || record.collectionRequested || nestedCompletionRetryTimers.has(record.taskId)) return;
+			const timer = setTimeout(() => {
+				nestedCompletionRetryTimers.delete(record.taskId);
+				void notifyNestedCompletion(record, requireInspection);
+			}, 100);
+			timer.unref?.();
+			nestedCompletionRetryTimers.set(record.taskId, timer);
+		}).finally(() => {
+			nestedCompletionInFlight.delete(record.taskId);
+		});
+		nestedCompletionInFlight.set(record.taskId, delivery);
+		return delivery;
+	}
+
+	async function collectNestedTask(record: NestedTaskRecord): Promise<void> {
+		record.collectionRequested = true;
+		await nestedCompletionInFlight.get(record.taskId);
+		const retryTimer = nestedCompletionRetryTimers.get(record.taskId);
+		if (retryTimer !== undefined) clearTimeout(retryTimer);
+		nestedCompletionRetryTimers.delete(record.taskId);
+		await markNestedTaskCollected(record);
 	}
 
 	function nestedStatusTask(record: NestedTaskRecord): DstackStatusTask {
@@ -648,33 +729,63 @@ export default function dstack(pi: ExtensionAPI) {
 			if (lastContext) {
 				updateTreeWidget(lastContext);
 				const control = continuationControlState(lastContext);
-				if (shouldTriggerStaleWake({ snapshot, firedTaskIds: firedStaleWakes, control })) {
-					firedStaleWakes.add(snapshot.taskId);
-					pi.appendEntry("dstack-stale-wake", { taskId: snapshot.taskId, timestamp: new Date().toISOString() });
-					pi.sendMessage(
-						{
-							customType: "dstack-stale-wake",
-							content: formatStaleWakePrompt(snapshot.taskId),
-							display: false,
-							details: { taskId: snapshot.taskId },
-						},
-						{ deliverAs: "followUp", triggerTurn: true },
-					);
+				if (!staleWakesInFlight.has(snapshot.taskId) && shouldTriggerStaleWake({ snapshot, staleWakes, control })) {
+					const currentActivity = extractLatestRunningActivityAt(snapshot);
+					const prev = staleWakes.get(snapshot.taskId);
+					const nextAttempt = nextStaleWakeAttempt(prev, currentActivity);
+					const now = new Date().toISOString();
+					staleWakesInFlight.add(snapshot.taskId);
+					try {
+						await pi.sendMessage(
+							{
+								customType: "dstack-stale-wake",
+								content: formatStaleWakePrompt(snapshot.taskId),
+								display: false,
+								details: {
+									taskId: snapshot.taskId,
+									attempt: nextAttempt,
+									...(currentActivity !== undefined ? { lastActivityAt: currentActivity } : {}),
+								},
+							},
+							{ deliverAs: "followUp", triggerTurn: true },
+						);
+						staleWakes.set(snapshot.taskId, {
+							taskId: snapshot.taskId,
+							attempts: nextAttempt,
+							lastFiredAt: now,
+							lastActivityAt: currentActivity,
+						});
+						pi.appendEntry("dstack-stale-wake", {
+							taskId: snapshot.taskId,
+							attempt: nextAttempt,
+							timestamp: now,
+							...(currentActivity !== undefined ? { lastActivityAt: currentActivity } : {}),
+						});
+					} catch {
+					} finally {
+						staleWakesInFlight.delete(snapshot.taskId);
+					}
 				}
 				const collected = activeWorkflow?.taskId !== snapshot.taskId;
-				if (shouldTriggerCompletionWake({ snapshot, collected, firedTaskIds: firedCompletionWakes, control })) {
-					firedCompletionWakes.add(snapshot.taskId);
-					pi.appendEntry("dstack-completion-wake", { taskId: snapshot.taskId, timestamp: new Date().toISOString() });
-					pi.sendMessage(
-						{
-							customType: "dstack-completion-wake",
-							content: formatCompletionWakePrompt(snapshot.taskId),
-							display: false,
-							details: { taskId: snapshot.taskId },
-						},
-						{ deliverAs: "followUp", triggerTurn: true },
-					);
-					void recoverFromCommitted(snapshot.taskId);
+				if (!completionWakesInFlight.has(snapshot.taskId) && shouldTriggerCompletionWake({ snapshot, collected, firedTaskIds: firedCompletionWakes, control })) {
+					completionWakesInFlight.add(snapshot.taskId);
+					try {
+						await pi.sendMessage(
+							{
+								customType: "dstack-completion-wake",
+								content: formatCompletionWakePrompt(snapshot.taskId),
+								display: false,
+								details: { taskId: snapshot.taskId },
+							},
+							{ deliverAs: "followUp", triggerTurn: true },
+						);
+						firedCompletionWakes.add(snapshot.taskId);
+						pi.appendEntry("dstack-completion-wake", { taskId: snapshot.taskId, timestamp: new Date().toISOString() });
+						void recoverFromCommitted(snapshot.taskId);
+					} catch {
+					} finally {
+						completionWakesInFlight.delete(snapshot.taskId);
+					}
 				}
 				if (
 					!snapshot.committed &&
@@ -692,9 +803,7 @@ export default function dstack(pi: ExtensionAPI) {
 							activeWorkflow?.taskId === snapshot.taskId &&
 							!firedCompletionWakes.has(snapshot.taskId)
 						) {
-							firedCompletionWakes.add(snapshot.taskId);
-							pi.appendEntry("dstack-completion-wake", { taskId: snapshot.taskId, timestamp: new Date().toISOString() });
-							pi.sendMessage(
+							await pi.sendMessage(
 								{
 									customType: "dstack-completion-wake",
 									content: formatRunnerFailureWakePrompt(snapshot.taskId, state.status),
@@ -703,6 +812,8 @@ export default function dstack(pi: ExtensionAPI) {
 								},
 								{ deliverAs: "followUp", triggerTurn: true },
 							);
+							firedCompletionWakes.add(snapshot.taskId);
+							pi.appendEntry("dstack-completion-wake", { taskId: snapshot.taskId, timestamp: new Date().toISOString() });
 							// killed companions map to a cancelled view so recovery never retries user-cancelled work
 							const view: DstackResultView = state.status === "failed"
 								? { kind: "runner_failed", taskId: snapshot.taskId, message: "The background task runner failed.", companionOutputPath: state.outputPath }
@@ -958,6 +1069,8 @@ export default function dstack(pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
+		clearNestedCompletionNotifications();
+		nestedNotificationsActive = true;
 		pendingContinuation = undefined;
 		stopTreeTimer();
 		stopStatusHeartbeat();
@@ -972,9 +1085,11 @@ export default function dstack(pi: ExtensionAPI) {
 		treeLastWorkflowId = undefined;
 		treeArtifactDir = undefined;
 		treeSchedulerRoot = undefined;
-		firedStaleWakes.clear();
-		for (const id of restoreFiredStaleWakes(branchEntries(ctx))) firedStaleWakes.add(id);
+		staleWakes.clear();
+		staleWakesInFlight.clear();
+		for (const [taskId, record] of restoreStaleWakes(branchEntries(ctx)).entries()) staleWakes.set(taskId, record);
 		firedCompletionWakes.clear();
+		completionWakesInFlight.clear();
 		for (const id of restoreFiredCompletionWakes(branchEntries(ctx))) firedCompletionWakes.add(id);
 		restoreRecoveryState(branchEntries(ctx));
 		nestedTaskRegistry.clear();
@@ -1005,6 +1120,8 @@ export default function dstack(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_tree", async (_event, ctx) => {
+		clearNestedCompletionNotifications();
+		nestedNotificationsActive = true;
 		mode = restoreMode(branchEntries(ctx));
 		activeWorkflow = restoreActiveWorkflow(branchEntries(ctx));
 		sessionId = ctx.sessionManager.getSessionId();
@@ -1019,9 +1136,11 @@ export default function dstack(pi: ExtensionAPI) {
 			startStatusHeartbeat();
 		}
 		await publishMachineStatus();
-		firedStaleWakes.clear();
-		for (const id of restoreFiredStaleWakes(branchEntries(ctx))) firedStaleWakes.add(id);
+		staleWakes.clear();
+		staleWakesInFlight.clear();
+		for (const [taskId, record] of restoreStaleWakes(branchEntries(ctx)).entries()) staleWakes.set(taskId, record);
 		firedCompletionWakes.clear();
+		completionWakesInFlight.clear();
 		for (const id of restoreFiredCompletionWakes(branchEntries(ctx))) firedCompletionWakes.add(id);
 		restoreRecoveryState(branchEntries(ctx));
 		nestedTaskRegistry.clear();
@@ -1053,21 +1172,21 @@ export default function dstack(pi: ExtensionAPI) {
 
 	pi.on("agent_end", async () => {
 		const record = nestedTaskRegistry.firstUncollected();
-		if (record === undefined) return;
-		const running = record.status === "running";
-		const content = running
-			? `Nested task "${record.taskId}" is still running and has not been collected. Call dstack_result now with taskId "${record.taskId}"; it waits for completion. Do not finish before collecting the result.`
-			: formatNestedCompletionPrompt(record.taskId, record.status);
+		if (record === undefined || record.collected) return;
+		if (record.status !== "running") {
+			await notifyNestedCompletion(record, false);
+			return;
+		}
 		try {
-			void Promise.resolve(pi.sendMessage(
+			await pi.sendMessage(
 				{
-					customType: running ? "dstack-nested-collect" : "dstack-nested-complete",
-					content,
+					customType: "dstack-nested-collect",
+					content: `Nested task "${record.taskId}" is still running and has not been collected. Call dstack_result now with taskId "${record.taskId}"; it waits until completion or the next supervision interval. Do not finish before collecting the result.`,
 					display: false,
-					details: running ? { taskId: record.taskId, status: record.status } : { taskId: record.taskId },
+					details: { taskId: record.taskId, status: record.status },
 				},
 				{ deliverAs: "followUp", triggerTurn: true },
-			)).catch(() => undefined);
+			);
 		} catch {}
 	});
 
@@ -1123,6 +1242,7 @@ export default function dstack(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		clearNestedCompletionNotifications();
 		pendingContinuation = undefined;
 		stopStatusHeartbeat();
 		rootState = "idle";
@@ -1483,6 +1603,7 @@ export default function dstack(pi: ExtensionAPI) {
 				childDepth,
 				registry: nestedTaskRegistry,
 			});
+			void launched.record.completionPromise.then(() => notifyNestedCompletion(launched.record, true));
 			const receipt = {
 				taskId: launched.taskId,
 				mode: launched.mode,
@@ -1510,22 +1631,29 @@ export default function dstack(pi: ExtensionAPI) {
 		},
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			await publishMachineStatus();
+			if (params.waitSeconds !== undefined && (!Number.isFinite(params.waitSeconds) || params.waitSeconds < 0 || params.waitSeconds > MAX_EXPLICIT_WAIT_SECONDS)) {
+				throw new Error(`waitSeconds must be finite and between 0 and ${MAX_EXPLICIT_WAIT_SECONDS}.`);
+			}
 			if (nestedTaskRegistry.has(params.taskId)) {
 				const record = nestedTaskRegistry.get(params.taskId)!;
 				if (record.status === "running") {
-					await awaitNestedCompletion(record.completionPromise, signal);
+					if (params.waitSeconds !== 0) record.collectionRequested = true;
+					await awaitNestedCompletion(record.completionPromise, signal, params.waitSeconds);
+					if (record.status === "running") record.collectionRequested = false;
 				}
 				const result = projectNestedResult(record, params.detail);
-				try {
-					await markNestedTaskCollected(record);
-				} catch (error) {
-					const failure: DstackResultView = {
-						kind: "infrastructure_failure",
-						taskId: params.taskId,
-						message: error instanceof Error ? error.message : String(error),
-						companionOutputPath: null,
-					};
-					return textResult(JSON.stringify(failure), failure, true);
+				if (record.status !== "running") {
+					try {
+						await collectNestedTask(record);
+					} catch (error) {
+						const failure: DstackResultView = {
+							kind: "infrastructure_failure",
+							taskId: params.taskId,
+							message: error instanceof Error ? error.message : String(error),
+							companionOutputPath: null,
+						};
+						return textResult(JSON.stringify(failure), failure, true);
+					}
 				}
 				const usage = claimNestedUsage(record);
 				nestedTaskRegistry.prune();
@@ -1578,7 +1706,7 @@ export default function dstack(pi: ExtensionAPI) {
 				stopTreeTimer();
 			}
 			let usage: Usage | undefined;
-			if (result.kind === "complete" || result.kind === "artifact") {
+			if (result.kind === "complete" || result.kind === "artifact" || result.kind === "cancelled") {
 				const binding = await files.readBinding(params.taskId);
 				if (binding !== undefined) {
 					const committed = await files.readCommittedResult(binding);
@@ -1606,7 +1734,7 @@ export default function dstack(pi: ExtensionAPI) {
 				const record = nestedTaskRegistry.get(params.taskId)!;
 				if (record.status !== "running") {
 					try {
-						await markNestedTaskCollected(record);
+						await collectNestedTask(record);
 					} catch (error) {
 						const killRes: DstackKillResult = {
 							taskId: params.taskId,
@@ -1623,10 +1751,11 @@ export default function dstack(pi: ExtensionAPI) {
 					};
 					return textResult(JSON.stringify(killRes), killRes, false, usage);
 				}
+				record.collectionRequested = true;
 				nestedTaskRegistry.cancel(params.taskId);
 				await record.completionPromise;
 				try {
-					await markNestedTaskCollected(record);
+					await collectNestedTask(record);
 				} catch (error) {
 					const killRes: DstackKillResult = {
 						taskId: params.taskId,
