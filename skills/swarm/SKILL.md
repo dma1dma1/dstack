@@ -27,7 +27,7 @@ Open a todolist with one entry per phase before launching anything.
 
 ## Phase B: Fan out
 
-Spawn all N workers in one parallel `dstack_task` call with `agent: "general-purpose"`, `dmode: false`, and the role or model choice from Phase A. The session scheduler uses `scheduler.totalSlots` from `~/.pi/agent/dstack/models.json`, which defaults to 8. `dstack_task` returns a `taskId` immediately; the parent may do independent work.
+Spawn all N workers in one parallel `dstack_task` call with `agent: "general-purpose"`, `dmode: false`, and the role or model choice from Phase A. The session scheduler uses `scheduler.totalSlots` from `~/.pi/agent/dstack/models.json`, which defaults to 12. `dstack_task` returns a `taskId` immediately; the parent may do independent work.
 When a worker must start from a non-default pushed branch, pass that branch as `cwd` after creating a worktree.
 
 Every brief stands alone. Include the goal, scope, exact slice or race arm, how to verify, and what to report. Reports use `PASS`, `ISSUES`, or `BLOCKED` with evidence.

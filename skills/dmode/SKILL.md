@@ -5,7 +5,7 @@ disable-model-invocation: true
 mode: true
 icon: crown
 color: yellow
-reminder: New task? Route nontrivial work to one playbook owner. Casual turn or user opts out -> don't.
+reminder: New task? Route nontrivial work to depth-1 playbook owners. Casual turn or user opts out -> don't.
 ---
 
 # dmode
@@ -16,7 +16,7 @@ reminder: New task? Route nontrivial work to one playbook owner. Casual turn or 
 
 **Do not overcomplicate simple tasks.** Trivial or simple tasks should not result in multi-step todolists.
 
-At depth 0, route each nontrivial request to exactly one depth-1 owner. Select the matching playbook and launch `agent: "poteto-agent"` with structured workflow metadata:
+At depth 0, route nontrivial requests to depth-1 owners. For a single request or related outcomes, route to one owner. When a single user turn asks for multiple genuinely independent nontrivial outcomes, launch one owner per outcome in a single parallel `tasks[]` batch. Select each matching playbook and launch `agent: "poteto-agent"` with structured workflow metadata:
 
 ```json
 {"playbook":"feature","assignment":"owner","phase":"run","completedPhases":[],"artifacts":[]}
@@ -32,7 +32,7 @@ The depth-1 owner reads the selected playbook and runs it end to end. The playbo
 
 Start multi-step owner work with a todolist. Read the Principles section below in full. Name only principles that changed a concrete decision.
 
-The owner may launch as many bounded worker batches as needed. Each child receives structured workflow metadata with `assignment: "worker"` or `assignment: "reviewer"`, one current phase, the completed phase names, and stable artifact paths. Include a SHA-256 seal when an artifact must be immutable. Workers are terminal. They implement or inspect their assigned slice and report contradictions instead of redesigning the task. The owner integrates the combined result, reads the diff, and verifies the real artifact.
+The owner may launch as many bounded worker batches as needed. Independent read-only or non-overlapping implementation slices default to one parallel `tasks[]` batch. Record a brief reason when clearly decomposable work stays with a single worker. Each child receives structured workflow metadata with `assignment: "worker"` or `assignment: "reviewer"`, one current phase, the completed phase names, and stable artifact paths. Include a SHA-256 seal when an artifact must be immutable. Workers are terminal. They implement or inspect their assigned slice and report contradictions instead of redesigning the task. The owner integrates the combined result, reads the diff, and verifies the real artifact.
 
 Choose each child's model role by the work it still has to decide. Use `implementation-worker` for a settled code-writing brief with named files, acceptance criteria, and verification. Use a specialized role instead when the child still owns substantive prose, investigation, performance analysis, or judgment.
 
@@ -106,11 +106,11 @@ Read the leaf skill in full for any principle you apply. Each entry names when i
 
 ## Subagents
 
-**Root depth 0 is a router.** Preserve its context by sending each nontrivial request to one playbook owner. Keep direct local work as a narrow escape hatch for trivial, low-context mechanical actions.
+**Root depth 0 is a router.** Preserve its context by sending nontrivial work to depth-1 playbook owners: one owner for related outcomes, or one owner per outcome in a single parallel `tasks[]` batch when outcomes are genuinely independent. Keep direct local work as a narrow escape hatch for trivial, low-context mechanical actions.
 
 **Use `agent: "poteto-agent"` for any subagent you spawn inside a playbook step** (code-writing delegates, ad-hoc helpers). `/dmode` and `poteto-agent` route through the same wrapper. Routed workflow skills (`how`, `why`, `interrogate`, `reflect`, `swarm`) set their own `agent` for diverse-model review; respect what the skill prescribes, don't override to `poteto-agent`.
 
-Depth-1 owners identify independent work early and dispatch it in bounded parallel batches. `dstack_task` returns a `taskId` immediately; the owner may do independent work. Never return a final response while that task is uncollected. After independent work, call `dstack_result` once with `taskId`; for nested tasks it waits for completion or the next supervision interval. If it returns a running snapshot, use its progress evidence to decide whether to wait again or kill the task. Do not poll in a tight loop or emit a placeholder final response. Parallelize independent readers freely. Give each concurrent writer a distinct checkout with `worktree: true` or an explicit distinct `cwd`; one checkout has one writer. Integrate overlapping work serially. A chain remains one background workflow. Depth-2 workers are terminal. Keep trivial work local instead of building an agent tree around it. The runtime enforces one global concurrency budget across owners and workers.
+Depth-1 owners identify independent work early. Independent read-only slices and non-overlapping write slices default to one parallel `tasks[]` batch. Record a brief reason when clearly decomposable work stays with a single worker. `dstack_task` returns a `taskId` immediately; the owner may do independent work. Never return a final response while that task is uncollected. After independent work, call `dstack_result` once with `taskId`; for nested tasks it waits for completion or the next supervision interval. If it returns a running snapshot, use its progress evidence to decide whether to wait again or kill the task. Do not poll in a tight loop or emit a placeholder final response. Parallelize independent readers freely. Give each concurrent writer a distinct checkout with `worktree: true` or an explicit distinct `cwd`; one checkout has one writer. Integrate overlapping work serially. A chain remains one background workflow. Depth-2 workers are terminal. Keep trivial work local instead of building an agent tree around it. The runtime enforces one global concurrency budget across owners and workers.
 
 **Defaults for every `dstack_task` call.** File pointers not inlined context. Missing MCP companions skip that source.
 

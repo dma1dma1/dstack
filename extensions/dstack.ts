@@ -62,7 +62,7 @@ import {
 	saveTodos,
 	todoFilePath,
 } from "./todo.ts";
-import { ACTIVE_WORKFLOW_ENTRY, MODE_ENTRY, NESTING_ENV, SESSION_REF_ENV, STATUS_FILE_ENV, THINKING_LEVELS, type ActiveWorkflow, type ChildDepth, type ModelRef, type ModeState, type RoleValue, type ThinkingLevel, type TodoState } from "./types.ts";
+import { ACTIVE_WORKFLOW_ENTRY, MAX_PARALLEL_TASKS, MODE_ENTRY, NESTING_ENV, SESSION_REF_ENV, STATUS_FILE_ENV, THINKING_LEVELS, type ActiveWorkflow, type ChildDepth, type ModelRef, type ModeState, type RoleValue, type ThinkingLevel, type TodoState } from "./types.ts";
 import { createEventBusV1Port, type BackgroundTaskPort, type CompanionTaskState } from "./background/eventbus-v1.ts";
 import { createTaskResultFiles, launchTaskGroup, sessionRoot } from "./background/launch.ts";
 import { atomicWriteFile } from "./background/artifacts.ts";
@@ -165,19 +165,24 @@ const TaskItem = Type.Object({
 });
 
 const TaskParams = Type.Object({
-	agent: Type.Optional(Type.String()),
-	task: Type.Optional(Type.String()),
-	model: Type.Optional(Type.String()),
-	role: Type.Optional(Type.String()),
-	overrideReason: Type.Optional(Type.String()),
-	tools: Type.Optional(Type.String()),
+	agent: Type.Optional(Type.String({ description: "poteto-agent | general-purpose | comment-sicko (single task)" })),
+	task: Type.Optional(Type.String({ description: "Task to delegate (single task)" })),
+	model: Type.Optional(Type.String({ description: "provider/model or inherit-parent / auto" })),
+	role: Type.Optional(Type.String({ description: "Role name from models.json" })),
+	overrideReason: Type.Optional(Type.String({ description: "Required reason when model overrides role" })),
+	tools: Type.Optional(Type.String({ description: "Comma-separated tool allowlist" })),
 	cwd: Type.Optional(Type.String()),
 	worktree: Type.Optional(Type.Boolean()),
 	dmode: Type.Optional(Type.Boolean()),
 	workflow: Type.Optional(WorkflowParams),
 	budget: Type.Optional(BudgetParams),
-	tasks: Type.Optional(Type.Array(TaskItem)),
-	chain: Type.Optional(Type.Array(TaskItem)),
+	tasks: Type.Optional(
+		Type.Array(TaskItem, {
+			maxItems: MAX_PARALLEL_TASKS,
+			description: "Bounded parallel task batch. Concurrently executes child tasks and returns one collectable task ID.",
+		}),
+	),
+	chain: Type.Optional(Type.Array(TaskItem, { description: "Sequential task chain where output flows into the next task." })),
 });
 
 const KillParams = Type.Object({
@@ -1468,7 +1473,7 @@ export default function dstack(pi: ExtensionAPI) {
 		name: "dstack_task",
 		label: "dstack task",
 		description:
-			"Launch child agents. For dmode, root sends one nontrivial request to a workflow owner; owners may launch as many bounded worker batches as needed. Pass workflow metadata so workers receive phase and artifact state without rereading dmode. Both root and nested calls return a task id immediately. Root waits for a completion or stale wake-up. Nested owners call dstack_result after independent work; it waits for completion. Never poll or finish with an uncollected task.",
+			"Launch child agents. Single tasks, concurrent batches (tasks[]), or sequential chains (chain[]). A parallel tasks[] batch launches child tasks concurrently and returns one collectable task ID. For dmode, root sends related outcomes to one workflow owner. When one user turn has multiple genuinely independent nontrivial outcomes, root may launch one owner per outcome in a single tasks[] batch. Owners may launch as many bounded worker batches as needed. Pass workflow metadata so workers receive phase and artifact state without rereading dmode. Both root and nested calls return a task id immediately. Root waits for a completion or stale wake-up. Nested owners call dstack_result after independent work; it waits for completion. Never poll or finish with an uncollected task.",
 		parameters: TaskParams,
 		renderCall(params, theme) {
 			const request = parseTaskRequest(params);
@@ -1529,8 +1534,12 @@ export default function dstack(pi: ExtensionAPI) {
 			const agents = discoverAgents();
 			const specs = request.kind === "single" ? [request.spec] : request.specs;
 			const owners = specs.filter((spec) => spec.workflow?.assignment === "owner");
-			if (owners.length > 1) {
-				return textResult("dstack_task refused: one task group may have at most one workflow owner.", {}, true);
+			if (parentDepth === 0) {
+				if (request.kind === "chain" && owners.length > 1) {
+					return textResult("dstack_task refused: one task group may have at most one workflow owner.", {}, true);
+				}
+			} else if (owners.length > 0) {
+				return textResult("dstack_task refused: depth-2 children cannot be task owners.", {}, true);
 			}
 			if (owners.some((spec) => spec.agent !== "poteto-agent")) {
 				return textResult('dstack_task refused: workflow owners must use agent "poteto-agent".', {}, true);
