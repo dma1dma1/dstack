@@ -10,7 +10,25 @@ import dstack from "../extensions/dstack.ts";
 import { commitWorkflowResult, parseWorkflowManifest } from "../extensions/background/runner.ts";
 import { createLocalSlotAcquirer, executeWorkflow, DSTACK_ARTIFACT_DIR_ENV, DSTACK_CHILD_INDEX_ENV, ROOT_WORKFLOW_ENV, SCHEDULER_ROOT_ENV } from "../extensions/background/workflow.ts";
 import { parseSpawnRecordV1, STALE_ACTIVITY_THRESHOLD_MS } from "../extensions/background/tree.ts";
-import { formatStaleWakePrompt, launchNestedTask, markNestedTaskCollected, NestedTaskRegistry, nextStaleWakeAttempt, restoreStaleWakes, shouldTriggerCompletionWake, shouldTriggerStaleWake, type StaleWakeRecord } from "../extensions/task-registry.ts";
+import { launchNestedTask, markNestedTaskCollected, NestedTaskRegistry, projectNestedResult, type NestedTaskRecord, type TaskDetails } from "../extensions/task-registry.ts";
+import {
+	awaitCompletion,
+	countLiveDescendantLeases,
+	fingerprintRunningView,
+	formatStaleWakePrompt,
+	MAX_EXPLICIT_WAIT_SECONDS,
+	nextStaleWakeAttempt,
+	READ_BREAKER_THRESHOLD,
+	resolveWaitMs,
+	restoreStaleWakes,
+	shouldTriggerCompletionWake,
+	shouldTriggerStaleWake,
+	superviseRead,
+	SUPERVISION_INTERVAL_MS,
+	SUPERVISION_READ_ENTRY,
+	SupervisionRegistry,
+	type StaleWakeRecord,
+} from "../extensions/background/supervision.ts";
 import { classifyFailure, MAX_OWNER_ATTEMPTS, nextRecoveryAction, recoveryFailureSignature, sanitizeRecoveryReason, type RecoveryLineage } from "../extensions/background/recovery.ts";
 import { acquireChildSlot, snapshotActiveLeases } from "../extensions/background/scheduler.ts";
 import { toAbsolutePath } from "../extensions/background/artifacts.ts";
@@ -231,12 +249,29 @@ test("root task returns a receipt before the runner completes and dstack_result 
 		resultTool: "dstack_result",
 	});
 
-	const running = await resultTool.execute("result-running", { taskId: receipt.taskId }, undefined, undefined, runtime.ctx);
-	assert.deepEqual(running.details, {
-		kind: "running",
-		taskId: receipt.taskId,
-		progress: { queued: 2, running: 0, complete: 0, total: 2 },
-	});
+	const running = await resultTool.execute("result-running", { taskId: receipt.taskId, waitSeconds: 0 }, undefined, undefined, runtime.ctx);
+	const runningDetails = running.details as {
+		kind: string;
+		taskId: string;
+		progress: unknown;
+		supervision?: { wakeReason: { kind: string }; changed: boolean; unchangedImmediateReads: number; breaker: string; transport: string };
+	};
+	assert.equal(runningDetails.kind, "running");
+	assert.equal(runningDetails.taskId, receipt.taskId);
+	assert.deepEqual(runningDetails.progress, { queued: 2, running: 0, complete: 0, total: 2 });
+	assert.equal(runningDetails.supervision?.wakeReason.kind, "nonblocking");
+	assert.equal(runningDetails.supervision?.changed, true);
+	assert.equal(runningDetails.supervision?.transport, "companion");
+
+	const runningRepeat = await resultTool.execute("result-running-2", { taskId: receipt.taskId, waitSeconds: 0 }, undefined, undefined, runtime.ctx);
+	const repeatDetails = runningRepeat.details as typeof runningDetails;
+	assert.equal(repeatDetails.supervision?.changed, false, "identical immediate re-read must report unchanged");
+	assert.equal(repeatDetails.supervision?.unchangedImmediateReads, 1);
+
+	const bounded = await resultTool.execute("result-bounded", { taskId: receipt.taskId, waitSeconds: 1 }, undefined, undefined, runtime.ctx);
+	const boundedDetails = bounded.details as typeof runningDetails;
+	assert.equal(boundedDetails.kind, "running");
+	assert.equal(boundedDetails.supervision?.wakeReason.kind, "wait_elapsed", "bounded root wait must expose an explicit wake reason");
 
 	const artifactDir = join(home, ".pi", "agent", "dstack", "background", "public-tools-session", "workflows", receipt.workflowId);
 	const manifestBytes = await readFile(join(artifactDir, "manifest.json"));
@@ -1963,4 +1998,205 @@ test("dstack_result renderResult renders concise collapsed summary with expand h
 	assert.equal(malformedLines.length, 1);
 	assert.match(malformedLines[0] ?? "", /\(result output\)/);
 	assert.ok(!malformedLines[0]?.includes('"package"'));
+});
+
+test("supervision wait policy: undefined bounded by interval, 0 nonblocking, explicit honored, invalid rejected", () => {
+	assert.equal(resolveWaitMs(undefined), SUPERVISION_INTERVAL_MS);
+	assert.equal(resolveWaitMs(0), 0);
+	assert.equal(resolveWaitMs(5), 5000);
+	assert.equal(resolveWaitMs(MAX_EXPLICIT_WAIT_SECONDS), MAX_EXPLICIT_WAIT_SECONDS * 1000);
+	assert.throws(() => resolveWaitMs(-1), /waitSeconds must be finite/);
+	assert.throws(() => resolveWaitMs(Number.POSITIVE_INFINITY), /waitSeconds must be finite/);
+	assert.throws(() => resolveWaitMs(MAX_EXPLICIT_WAIT_SECONDS + 1), /waitSeconds must be finite/);
+});
+
+test("superviseRead exposes explicit wake outcomes for nonblocking, elapsed, and terminal reads", async () => {
+	let reads = 0;
+	const nonblocking = await superviseRead({
+		read: async () => { reads += 1; return "running"; },
+		isRunning: (view) => view === "running",
+		waitMs: 0,
+	});
+	assert.equal(nonblocking.outcome, "nonblocking");
+	assert.equal(reads, 1);
+
+	const started = Date.now();
+	const elapsed = await superviseRead({
+		read: async () => "running",
+		isRunning: (view) => view === "running",
+		waitMs: 120,
+		pollIntervalMs: 25,
+	});
+	assert.equal(elapsed.outcome, "wait_elapsed");
+	assert.ok(Date.now() - started >= 100, "bounded wait must actually wait");
+
+	let flips = 0;
+	const terminal = await superviseRead({
+		read: async () => (flips++ < 2 ? "running" : "done"),
+		isRunning: (view) => view === "running",
+		waitMs: 5_000,
+		pollIntervalMs: 10,
+	});
+	assert.equal(terminal.outcome, "terminal");
+	assert.equal(terminal.view, "done");
+
+	const aborted = await superviseRead({
+		read: async () => "running",
+		isRunning: (view) => view === "running",
+		waitMs: 5_000,
+		pollIntervalMs: 10,
+		signal: AbortSignal.abort(),
+	});
+	assert.equal(aborted.outcome, "aborted");
+
+	const completion = await awaitCompletion({ completion: Promise.resolve("x"), waitMs: 5_000 });
+	assert.equal(completion.outcome, "terminal");
+	const noWait = await awaitCompletion({ completion: new Promise(() => {}), waitMs: 0 });
+	assert.equal(noWait.outcome, "nonblocking");
+	const timedOut = await awaitCompletion({ completion: new Promise(() => {}), waitMs: 30 });
+	assert.equal(timedOut.outcome, "wait_elapsed");
+});
+
+test("supervision breaker trips on repeated unchanged immediate reads, resets on change, and survives reload", () => {
+	const entries: Array<{ type: "custom"; customType: string; data: unknown }> = [];
+	const registry = new SupervisionRegistry({
+		appendEntry: (customType, data) => entries.push({ type: "custom", customType, data }),
+	});
+	const fingerprint = fingerprintRunningView({ kind: "running", progress: { running: 1 } });
+
+	for (let i = 0; i < READ_BREAKER_THRESHOLD; i++) {
+		registry.noteRunningRead({ taskId: "bg-spin", fingerprint, immediate: true });
+	}
+	const verdict = registry.noteRunningRead({ taskId: "bg-spin", fingerprint, immediate: true });
+	assert.equal(verdict.changed, false);
+	assert.equal(verdict.breaker, "tripped");
+	assert.deepEqual(registry.effectiveWaitMs("bg-spin", 0), { waitMs: SUPERVISION_INTERVAL_MS, coerced: true });
+	assert.deepEqual(registry.effectiveWaitMs("bg-spin", 2_000), { waitMs: 2_000, coerced: false });
+	assert.deepEqual(registry.effectiveWaitMs("bg-other", 0), { waitMs: 0, coerced: false });
+
+	// Reload compatibility: state rebuilt purely from persisted entries.
+	const restored = new SupervisionRegistry();
+	restored.restore(entries);
+	assert.equal(restored.breakerState("bg-spin"), "tripped");
+	assert.deepEqual(restored.effectiveWaitMs("bg-spin", 0), { waitMs: SUPERVISION_INTERVAL_MS, coerced: true });
+
+	// Progress resets the breaker.
+	const changedFingerprint = fingerprintRunningView({ kind: "running", progress: { running: 0, complete: 1 } });
+	const reset = registry.noteRunningRead({ taskId: "bg-spin", fingerprint: changedFingerprint, immediate: true });
+	assert.equal(reset.changed, true);
+	assert.equal(reset.breaker, "idle");
+	assert.deepEqual(registry.effectiveWaitMs("bg-spin", 0), { waitMs: 0, coerced: false });
+
+	// Terminal observation clears persisted dedupe state.
+	registry.noteTerminalRead("bg-spin");
+	const cleared = new SupervisionRegistry();
+	cleared.restore(entries);
+	assert.equal(cleared.breakerState("bg-spin"), "idle");
+	assert.ok(entries.some((entry) => entry.customType === SUPERVISION_READ_ENTRY));
+
+	// Fingerprints ignore wall-clock-only fields so elapsed time is not "progress".
+	assert.equal(
+		fingerprintRunningView({ kind: "running", children: [{ state: "running", elapsedMs: 100 }] }),
+		fingerprintRunningView({ kind: "running", children: [{ state: "running", elapsedMs: 9_999 }] }),
+	);
+});
+
+test("supervision registry unifies stale and completion wake dedupe on the legacy persisted entry types", () => {
+	const entries: Array<{ type: "custom"; customType: string; data: unknown }> = [];
+	const registry = new SupervisionRegistry({
+		appendEntry: (customType, data) => entries.push({ type: "custom", customType, data }),
+	});
+	registry.recordStaleWakeFired({ taskId: "bg-a", attempt: 2, firedAt: "2025-01-01T00:10:00.000Z", lastActivityAt: "2025-01-01T00:00:00.000Z" });
+	registry.recordCompletionWakeFired("bg-b", "2025-01-01T00:11:00.000Z");
+	registry.recordCompletionWakeFired("bg-b");
+	assert.equal(entries.filter((entry) => entry.customType === "dstack-completion-wake").length, 1, "completion wake dedupe must be idempotent");
+
+	// The persisted shapes must remain parseable by the legacy restore paths.
+	assert.deepEqual(restoreStaleWakes(entries).get("bg-a"), {
+		taskId: "bg-a",
+		attempts: 2,
+		lastFiredAt: "2025-01-01T00:10:00.000Z",
+		lastActivityAt: "2025-01-01T00:00:00.000Z",
+	});
+	const restored = new SupervisionRegistry();
+	restored.restore(entries);
+	assert.deepEqual(restored.staleWakes.get("bg-a"), registry.staleWakes.get("bg-a"));
+	assert.equal(restored.completionWakeFired("bg-b"), true);
+	assert.equal(restored.completionWakeFired("bg-a"), false);
+});
+
+test("a quiet owner with live descendant leases is not falsely stale", () => {
+	const snapshot = {
+		taskId: "task-quiet-owner",
+		workflowId: "wf-quiet-owner",
+		mode: "single" as const,
+		createdAt: "2025-01-01T00:00:00.000Z",
+		committed: false,
+		counts: { queued: 0, running: 1, complete: 0, total: 1 },
+		slots: { active: 2, capacity: 4 },
+		children: [{
+			index: 0,
+			state: "running" as const,
+			agent: "poteto-agent",
+			taskPreview: "own workflow",
+			activity: { text: "delegating", updatedAt: "2025-01-01T00:00:00.000Z" },
+			stale: true,
+			nested: [],
+			nestedGroups: [],
+		}],
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		capturedAt: "2025-01-01T00:10:00.000Z",
+	};
+	const control = { isIdle: true, hasPendingMessages: false };
+	const descendantLease = { workflowId: "wf-quiet-owner", childId: "nested-group-0", depth: 2 as const, acquiredAt: "2025-01-01T00:05:00.000Z" };
+	const foreignLease = { ...descendantLease, workflowId: "wf-other" };
+	const ownerLease = { ...descendantLease, depth: 1 as const };
+
+	assert.equal(shouldTriggerStaleWake({ snapshot, control }), true, "no lease evidence keeps the legacy stale verdict");
+	assert.equal(shouldTriggerStaleWake({ snapshot, control, activeLeases: [descendantLease] }), false, "a live depth-2 lease proves active descendants");
+	assert.equal(shouldTriggerStaleWake({ snapshot, control, activeLeases: [foreignLease] }), true, "leases of other workflows are not evidence");
+	assert.equal(shouldTriggerStaleWake({ snapshot, control, activeLeases: [ownerLease] }), true, "the owner's own lease is not descendant evidence");
+
+	assert.equal(countLiveDescendantLeases([descendantLease, foreignLease, ownerLease], { workflowId: "wf-quiet-owner" }), 1);
+	assert.equal(countLiveDescendantLeases([descendantLease], { workflowId: "wf-quiet-owner", childIdPrefix: "nested-group-" }), 1);
+	assert.equal(countLiveDescendantLeases([descendantLease], { workflowId: "wf-quiet-owner", childIdPrefix: "nested-other-" }), 0);
+});
+
+test("cancellation preserves already-completed nested descendant results", () => {
+	const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0.01, contextTokens: 2, turns: 1 };
+	const details: TaskDetails = {
+		mode: "parallel",
+		results: [
+			{ agent: "general-purpose", cwd: "/tmp", task: "finished work", text: "completed summary text", exitCode: 0, stderr: "", messages: [], usage },
+			{ agent: "comment-sicko", cwd: "/tmp", task: "interrupted work", text: "", exitCode: 1, stderr: "", messages: [], usage, cancellationReason: "user_requested" },
+		],
+	};
+	const record: NestedTaskRecord = {
+		taskId: "nested-cancel-preserve",
+		groupId: "nested-cancel-preserve",
+		mode: "parallel",
+		createdAt: new Date().toISOString(),
+		abortController: new AbortController(),
+		children: [],
+		status: "cancelled",
+		cancelledMessage: "The task was cancelled (user_requested).",
+		details,
+		collected: false,
+		collectionRequested: false,
+		readCount: 0,
+		usageClaimed: false,
+		completionPromise: Promise.resolve(details),
+	};
+	const view = projectNestedResult(record);
+	assert.equal(view.kind, "cancelled");
+	if (view.kind !== "cancelled") return;
+	assert.match(view.message, /user_requested/);
+	assert.equal(view.completed?.results.length, 1, "only descendants that finished are preserved");
+	assert.equal(view.completed?.results[0]?.agent, "general-purpose");
+	assert.match(view.completed?.results[0]?.summary ?? "", /completed summary text/);
+
+	const barren = projectNestedResult({ ...record, taskId: "nested-cancel-empty", details: { mode: "parallel", results: [details.results[1]!] } });
+	assert.equal(barren.kind, "cancelled");
+	if (barren.kind === "cancelled") assert.equal(barren.completed, undefined);
 });

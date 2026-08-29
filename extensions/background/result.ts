@@ -3,6 +3,7 @@ import type { TaskDetails, TaskResult } from "../dstack.ts";
 import type { AbsolutePath, OutputArtifactSeal, Sha256 } from "./artifacts.ts";
 import type { CompanionTaskState } from "./eventbus-v1.ts";
 import type { JournalEntry, SemanticStatus } from "./journal.ts";
+import type { SupervisionInfo } from "./supervision.ts";
 
 export type ChildStateView = Readonly<{
 	index: number;
@@ -61,6 +62,8 @@ export type DstackResultView =
 		progress: WorkflowProgress;
 		children?: readonly ChildStateView[];
 		latestStatus?: SemanticStatus;
+		/** Wake reason and change/progress evidence for this running read. */
+		supervision?: SupervisionInfo;
 	}>
 	| Readonly<{ kind: "complete"; taskId: string; detail: "summary"; package: TaskSummaryDetails }>
 	| Readonly<{ kind: "complete"; taskId: string; detail: "full"; package: TaskDetails }>
@@ -75,7 +78,13 @@ export type DstackResultView =
 		usage?: Usage;
 	}>
 	| Readonly<{ kind: "runner_failed"; taskId: string; message: string; companionOutputPath: string }>
-	| Readonly<{ kind: "cancelled"; taskId: string; message: string }>
+	| Readonly<{
+		kind: "cancelled";
+		taskId: string;
+		message: string;
+		/** Results of descendants that completed before the cancellation. */
+		completed?: TaskSummaryDetails;
+	}>
 	| Readonly<{ kind: "unknown_task"; taskId: string; message: string }>
 	| Readonly<{ kind: "infrastructure_failure"; taskId: string; message: string; companionOutputPath: string | null }>;
 

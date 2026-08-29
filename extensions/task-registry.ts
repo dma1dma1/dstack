@@ -36,13 +36,10 @@ import {
 } from "./background/workflow.ts";
 import {
 	latestActivity,
-	STALE_ACTIVITY_THRESHOLD_MS,
 	taskPreviewOf,
 	type SpawnChildV1,
-	type SpawnNestedChild,
 	parseSpawnRecordV1,
 	type SpawnRecordV1,
-	type TreeSnapshot,
 } from "./background/tree.ts";
 import {
 	projectRunning,
@@ -243,170 +240,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
 
-export type StaleWakeRecord = Readonly<{
-	taskId: string;
-	attempts: number;
-	lastFiredAt: string;
-	lastActivityAt?: string;
-}>;
-
-export const BASE_STALE_WAKE_INTERVAL_MS = STALE_ACTIVITY_THRESHOLD_MS;
-export const MAX_STALE_WAKE_INTERVAL_MS = 60 * 60 * 1000;
-export { STALE_ACTIVITY_THRESHOLD_MS };
-
-export function extractLatestRunningActivityAt(snapshot: TreeSnapshot): string | undefined {
-	let latest: string | undefined;
-	const updateLatest = (ts?: string) => {
-		if (!ts) return;
-		if (latest === undefined || Date.parse(ts) > Date.parse(latest)) {
-			latest = ts;
-		}
-	};
-	for (const child of snapshot.children) {
-		if (child.state === "running") {
-			updateLatest(child.activity?.updatedAt);
-			if (child.journal) {
-				for (const entry of child.journal) {
-					updateLatest(entry.timestamp);
-				}
-			}
-		}
-		for (const nested of child.nested) {
-			if ("state" in nested && nested.state === "running") {
-				updateLatest(nested.updatedAt);
-				if (nested.journal) {
-					for (const entry of nested.journal) {
-						updateLatest(entry.timestamp);
-					}
-				}
-			}
-		}
-	}
-	return latest;
-}
-
-export function shouldTriggerStaleWake(input: {
-	snapshot?: TreeSnapshot;
-	staleWakes?: ReadonlyMap<string, StaleWakeRecord>;
-	control: { isIdle: boolean; hasPendingMessages: boolean };
-	now?: number;
-	baseIntervalMs?: number;
-	maxIntervalMs?: number;
-}): boolean {
-	if (!input.snapshot) return false;
-	if (input.snapshot.committed) return false;
-	if (!input.control.isIdle || input.control.hasPendingMessages) return false;
-
-	const capturedAtMs = Date.parse(input.snapshot.capturedAt);
-	const hasStaleChild = input.snapshot.children.some((child) => {
-		if (child.state !== "running") return false;
-		const runningNested = child.nested.filter(
-			(nested): nested is SpawnNestedChild => "state" in nested && nested.state === "running",
-		);
-		if (runningNested.length === 0) return child.stale === true;
-		return runningNested.some((nested) => {
-			if (nested.stale === true) return true;
-			const updatedAtMs = Date.parse(nested.updatedAt);
-			return !Number.isFinite(capturedAtMs) || !Number.isFinite(updatedAtMs) || capturedAtMs - updatedAtMs > STALE_ACTIVITY_THRESHOLD_MS;
-		});
-	});
-	if (!hasStaleChild) return false;
-
-	if (input.staleWakes !== undefined) {
-		const existing = input.staleWakes.get(input.snapshot.taskId);
-		if (existing === undefined) return true;
-		const currentActivity = extractLatestRunningActivityAt(input.snapshot);
-		const hasProgress =
-			existing.lastActivityAt !== undefined &&
-			currentActivity !== undefined &&
-			Date.parse(currentActivity) > Date.parse(existing.lastActivityAt);
-		const effectiveAttempts = hasProgress ? 1 : existing.attempts;
-		const baseMs = input.baseIntervalMs ?? BASE_STALE_WAKE_INTERVAL_MS;
-		const maxMs = input.maxIntervalMs ?? MAX_STALE_WAKE_INTERVAL_MS;
-		const interval = Math.min(maxMs, baseMs * Math.pow(2, effectiveAttempts - 1));
-		const now = input.now ?? Date.now();
-		const elapsed = now - Date.parse(existing.lastFiredAt);
-		return elapsed >= interval;
-	}
-
-	return true;
-}
-
-export function nextStaleWakeAttempt(existing: StaleWakeRecord | undefined, currentActivity: string | undefined): number {
-	if (existing === undefined) return 1;
-	if (
-		existing.lastActivityAt !== undefined &&
-		currentActivity !== undefined &&
-		Date.parse(currentActivity) > Date.parse(existing.lastActivityAt)
-	) {
-		return 1;
-	}
-	return existing.attempts + 1;
-}
-
-export function formatStaleWakePrompt(taskId: string): string {
-	const staleMinutes = STALE_ACTIVITY_THRESHOLD_MS / 60_000;
-	return `Task "${taskId}" has a child that has been inactive for more than ${staleMinutes} minutes and may be stale. Call dstack_result with taskId "${taskId}" to inspect elapsed time, usage, and recent journal activity, then decide whether to continue waiting or call dstack_kill if it is unrecoverable.`;
-}
-
-export function restoreStaleWakes(entries: readonly SessionEntryLike[]): Map<string, StaleWakeRecord> {
-	const map = new Map<string, StaleWakeRecord>();
-	for (const entry of entries) {
-		if (entry.type !== "custom" || entry.customType !== "dstack-stale-wake") continue;
-		if (!isRecord(entry.data) || typeof entry.data.taskId !== "string") continue;
-		const taskId = entry.data.taskId;
-		const timestamp = typeof entry.data.timestamp === "string" ? entry.data.timestamp : new Date(0).toISOString();
-		const attemptNumber = typeof entry.data.attempt === "number" && Number.isSafeInteger(entry.data.attempt) ? entry.data.attempt : undefined;
-		const lastActivityAt = typeof entry.data.lastActivityAt === "string" ? entry.data.lastActivityAt : undefined;
-		const prev = map.get(taskId);
-		const attempts = attemptNumber ?? (prev ? prev.attempts + 1 : 1);
-		map.set(taskId, {
-			taskId,
-			attempts,
-			lastFiredAt: timestamp,
-			...(lastActivityAt !== undefined ? { lastActivityAt } : prev?.lastActivityAt !== undefined ? { lastActivityAt: prev.lastActivityAt } : {}),
-		});
-	}
-	return map;
-}
-
-export function restoreFiredCompletionWakes(entries: readonly SessionEntryLike[]): Set<string> {
-	const fired = new Set<string>();
-	for (const entry of entries) {
-		if (entry.type !== "custom" || entry.customType !== "dstack-completion-wake") continue;
-		if (isRecord(entry.data) && typeof entry.data.taskId === "string") {
-			fired.add(entry.data.taskId);
-		}
-	}
-	return fired;
-}
-
-export function shouldTriggerCompletionWake(input: {
-	snapshot?: TreeSnapshot;
-	collected: boolean;
-	firedTaskIds: ReadonlySet<string>;
-	control: { isIdle: boolean; hasPendingMessages: boolean };
-}): boolean {
-	if (!input.snapshot) return false;
-	if (!input.snapshot.committed) return false;
-	if (input.collected) return false;
-	if (input.firedTaskIds.has(input.snapshot.taskId)) return false;
-	if (!input.control.isIdle || input.control.hasPendingMessages) return false;
-	return true;
-}
-
-export function formatCompletionWakePrompt(taskId: string): string {
-	return `Task "${taskId}" has committed its result (success or failure). Call dstack_result with taskId "${taskId}" now to collect it.`;
-}
-
-export function formatRunnerFailureWakePrompt(taskId: string, status: string): string {
-	return `The background runner for task "${taskId}" is ${status} and no result was committed. Call dstack_result with taskId "${taskId}" to inspect the failure.`;
-}
-
-export function formatNestedCompletionPrompt(taskId: string, status: string): string {
-	return `Nested task "${taskId}" reached terminal status ${status}. Call dstack_result once with taskId "${taskId}" to collect its success or failure.`;
-}
-
 export class NestedTaskRegistry {
 	private readonly tasks = new Map<string, NestedTaskRecord>();
 
@@ -521,10 +354,17 @@ export function projectNestedResult(record: NestedTaskRecord, detail: "summary" 
 	}
 
 	if (record.status === "cancelled") {
+		// Preserve descendants that finished before the cancellation so their
+		// completed work is never lost to a kill of the surrounding group.
+		const finished = (record.details?.results ?? []).filter((result) => result.exitCode === 0);
+		const completed = finished.length > 0
+			? summaryPackage({ kind: "complete", package: { mode: record.mode, results: finished } })
+			: undefined;
 		return {
 			kind: "cancelled",
 			taskId: record.taskId,
 			message: record.cancelledMessage ?? "The task was cancelled.",
+			...(completed !== undefined ? { completed } : {}),
 		};
 	}
 
