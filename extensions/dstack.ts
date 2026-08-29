@@ -18,8 +18,10 @@ import {
 	defaultConfigPath,
 	emptyConfig,
 	formatConfigError,
+	isThinkingLevel,
 	loadConfig,
 	parseConfig,
+	parseRoleValue,
 	saveConfig,
 	slugsFromRegistry,
 	validateRoles,
@@ -60,7 +62,7 @@ import {
 	saveTodos,
 	todoFilePath,
 } from "./todo.ts";
-import { ACTIVE_WORKFLOW_ENTRY, MODE_ENTRY, NESTING_ENV, SESSION_REF_ENV, STATUS_FILE_ENV, type ActiveWorkflow, type ChildDepth, type ModeState, type TodoState } from "./types.ts";
+import { ACTIVE_WORKFLOW_ENTRY, MODE_ENTRY, NESTING_ENV, SESSION_REF_ENV, STATUS_FILE_ENV, THINKING_LEVELS, type ActiveWorkflow, type ChildDepth, type ModelRef, type ModeState, type RoleValue, type ThinkingLevel, type TodoState } from "./types.ts";
 import { createEventBusV1Port, type BackgroundTaskPort, type CompanionTaskState } from "./background/eventbus-v1.ts";
 import { createTaskResultFiles, launchTaskGroup, sessionRoot } from "./background/launch.ts";
 import { atomicWriteFile } from "./background/artifacts.ts";
@@ -198,8 +200,9 @@ const AskParams = Type.Object({
 
 const ConfigParams = Type.Object({
 	action: StringEnum(["get", "set", "list", "write"] as const),
-	role: Type.Optional(Type.String()),
-	value: Type.Optional(Type.String({ description: "Slug, inherit-parent, auto, comma-separated list, or full models.json for write" })),
+	role: Type.Optional(Type.String({ description: "Role name from models.json" })),
+	value: Type.Optional(Type.String({ description: "Model slug, inherit-parent, auto, comma-separated list, JSON role object with model and optional thinking, or full models.json for write" })),
+	thinking: Type.Optional(StringEnum(THINKING_LEVELS, { description: "Optional thinking level (off, minimal, low, medium, high, xhigh, max)" })),
 });
 
 const StatusParams = Type.Object({
@@ -1811,7 +1814,7 @@ export default function dstack(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "dstack_config",
 		label: "dstack config",
-		description: "Get, set, or list role-to-model mappings in ~/.pi/agent/dstack/models.json.",
+		description: "Get, set, or list role-to-model mappings and optional thinking levels in ~/.pi/agent/dstack/models.json.",
 		parameters: ConfigParams,
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const path = defaultConfigPath();
@@ -1846,10 +1849,51 @@ export default function dstack(pi: ExtensionAPI) {
 			if (!params.role || params.value === undefined) {
 				return textResult("set requires role and value", {}, true);
 			}
-			const value = params.value.includes(",")
-				? params.value.split(",").map((s) => s.trim()).filter(Boolean)
-				: params.value.trim();
-			const next = { ...loaded.value, roles: { ...loaded.value.roles, [params.role]: value } };
+			let roleValue: RoleValue;
+			const trimmedValue = params.value.trim();
+			if (trimmedValue.startsWith("{")) {
+				let parsedJson: unknown;
+				try {
+					parsedJson = JSON.parse(trimmedValue) as unknown;
+				} catch (err) {
+					return textResult(`invalid JSON for ${params.role}: ${(err as Error).message}`, {}, true);
+				}
+				if (typeof parsedJson === "object" && parsedJson !== null && !Array.isArray(parsedJson)) {
+					const objVal = parsedJson as Record<string, unknown>;
+					if ("thinking" in objVal && objVal.thinking !== undefined && !isThinkingLevel(objVal.thinking)) {
+						return textResult(
+							formatConfigError({
+								kind: "invalid-thinking",
+								role: params.role,
+								thinking: String(objVal.thinking),
+							}),
+							{},
+							true,
+						);
+					}
+				}
+				const parsed = parseRoleValue(parsedJson);
+				if (parsed === undefined) {
+					return textResult(`invalid JSON role object for ${params.role}`, {}, true);
+				}
+				if (params.thinking && typeof parsed === "object" && !Array.isArray(parsed)) {
+					roleValue = { ...parsed, thinking: params.thinking as ThinkingLevel };
+				} else if (params.thinking) {
+					roleValue = { model: parsed as ModelRef | ModelRef[], thinking: params.thinking as ThinkingLevel };
+				} else {
+					roleValue = parsed;
+				}
+			} else {
+				const modelVal = params.value.includes(",")
+					? params.value.split(",").map((s) => s.trim()).filter(Boolean)
+					: params.value.trim();
+				if (params.thinking) {
+					roleValue = { model: modelVal, thinking: params.thinking as ThinkingLevel };
+				} else {
+					roleValue = modelVal;
+				}
+			}
+			const next = { ...loaded.value, roles: { ...loaded.value.roles, [params.role]: roleValue } };
 			const valid = validateRoles(next.roles, known);
 			if (!valid.ok) {
 				return textResult(formatConfigError(valid.error), {}, true);

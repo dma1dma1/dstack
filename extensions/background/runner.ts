@@ -13,8 +13,9 @@ import {
 	type WorkflowResultIndexV2,
 } from "./workflow.ts";
 import { parseChildSessionRef } from "./session.ts";
-import { MAX_TOTAL_SLOTS, MIN_TOTAL_SLOTS } from "../types.ts";
+import { MAX_TOTAL_SLOTS, MIN_TOTAL_SLOTS, type ThinkingLevel } from "../types.ts";
 import { parseWorkflowContext } from "../workflow-context.ts";
+import { isThinkingLevel } from "../models.ts";
 
 export const RUNNER_PREFLIGHT_PROTOCOL = "dstack.runner-preflight.v1";
 const MANIFEST_SCHEMA = "dstack.workflow.v1";
@@ -80,6 +81,12 @@ function parseSpec(value: unknown, index: number) {
 	}
 	const omitModel = spec["omitModel"];
 	if (omitModel !== undefined && typeof omitModel !== "boolean") throw new Error(`manifest.specs[${index}].omitModel must be boolean`);
+	const thinkingValue = spec["thinking"];
+	let thinking: ThinkingLevel | undefined;
+	if (thinkingValue !== undefined) {
+		if (!isThinkingLevel(thinkingValue)) throw new Error(`manifest.specs[${index}].thinking is invalid`);
+		thinking = thinkingValue;
+	}
 	const workflowValue = spec["workflow"];
 	let workflow;
 	if (workflowValue !== undefined) {
@@ -92,6 +99,7 @@ function parseSpec(value: unknown, index: number) {
 		cwd: absolutePath(spec["cwd"], `manifest.specs[${index}].cwd`),
 		model: optionalString(spec["model"], `manifest.specs[${index}].model`),
 		omitModel,
+		thinking,
 		requestedRole: optionalString(spec["requestedRole"], `manifest.specs[${index}].requestedRole`),
 		roleIndex: optionalIndex(spec["roleIndex"], `manifest.specs[${index}].roleIndex`),
 		overrideReason: optionalString(spec["overrideReason"], `manifest.specs[${index}].overrideReason`),

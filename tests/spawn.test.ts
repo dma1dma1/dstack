@@ -83,6 +83,15 @@ test("inherit-parent omits --model", () => {
 	assert.equal(args.includes("--model"), false);
 });
 
+test("thinking flag is passed when provided and omitted when undefined", () => {
+	const withoutThinking = childArgv({ task: "x", model: "acme/fast" });
+	assert.equal(withoutThinking.includes("--thinking"), false);
+
+	const withThinking = childArgv({ task: "x", model: "acme/fast", thinking: "high" });
+	assert.ok(withThinking.includes("--thinking"));
+	assert.equal(withThinking[withThinking.indexOf("--thinking") + 1], "high");
+});
+
 test("append-system-prompt is a file path", () => {
 	const args = childArgv({
 		task: "x",

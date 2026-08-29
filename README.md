@@ -90,9 +90,21 @@ Set `scheduler.totalSlots` in `~/.pi/agent/dstack/models.json` to an integer fro
 ```json
 {
   "scheduler": { "totalSlots": 8 },
-  "roles": {}
+  "roles": {
+    "feature": "anthropic/claude-3-7-sonnet",
+    "hardest-tasks": {
+      "model": "anthropic/claude-3-7-sonnet",
+      "thinking": "high"
+    },
+    "how-critics": [
+      "anthropic/claude-3-7-sonnet",
+      "openai/gpt-4o"
+    ]
+  }
 }
 ```
+
+Role entries accept a model slug, a list of candidate slugs, or an object with `model` and optional `thinking` (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Omitted thinking passes no `--thinking` argument, preserving Pi and model defaults.
 
 The first scheduler process in a session persists the effective capacity for that session. Later config changes apply to new sessions. The scheduler reserves `max(1, floor(totalSlots / 4))` slots for terminal work, so nesting-capable work can use at most `totalSlots - max(1, floor(totalSlots / 4))` slots. The default leaves 2 terminal slots.
 
