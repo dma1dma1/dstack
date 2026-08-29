@@ -49,7 +49,7 @@ Pi Powerline users should make `dstack-cost` the only cost segment. Merge this i
 
 Keep any existing disabled segments and custom items when merging the object. The custom item hides `dstack-cost` from Powerline's aggregate extension-status segment by default. The separate `dstack` mode status remains there. Run `/reload` after editing settings.
 
-For nontrivial work, dmode routes the request to one depth-1 playbook owner. The owner grounds the task, chooses the playbook phases, launches bounded batches of terminal workers, integrates their work, and verifies the result. The root keeps only the task receipt and the owner's final evidence.
+For nontrivial work, dmode routes the request to depth-1 playbook owners: one owner for single requests or related outcomes, or one owner per outcome in a single parallel `tasks[]` batch when one user turn asks for multiple genuinely independent outcomes. The owner grounds the task, chooses the playbook phases, launches bounded batches of terminal workers, integrates their work, and verifies the result. The root keeps only the task receipt and each owner's final evidence.
 
 ## Full stack
 
@@ -76,7 +76,7 @@ The first `/setup-dstack` also writes `~/.pi/agent/extensions/pi-permission-syst
 
 | Tool | Role |
 | --- | --- |
-| `dstack_task` | Launches one background single, parallel, or chain group through `pi-background-tasks`. Each batch accepts 8 tasks. One session-wide scheduler limits child processes across root and nested groups. |
+| `dstack_task` | Launches one background single, parallel, or chain group through `pi-background-tasks`. Each batch accepts 12 tasks. One session-wide scheduler limits child processes across root and nested groups. |
 | `dstack_result` | Returns current progress or a bounded completed summary. `detail: "full"` is an explicit escape hatch. |
 | `dstack_todo` | Durable todos under `~/.pi/agent/dstack/todos/`. |
 | `dstack_ask` | Typed questions. |
@@ -85,18 +85,18 @@ The first `/setup-dstack` also writes `~/.pi/agent/extensions/pi-permission-syst
 
 `dstack_task` returns a task ID immediately. Root tasks send a completion notification; call `dstack_result` once after it arrives. A depth-1 owner may do independent work, then calls `dstack_result`, which waits for its nested task to finish. If the owner tries to finish first, dstack queues a collection turn instead of tearing down the worker. Do not poll.
 
-Set `scheduler.totalSlots` in `~/.pi/agent/dstack/models.json` to an integer from 3 through 64. It defaults to 8:
+Set `scheduler.totalSlots` in `~/.pi/agent/dstack/models.json` to an integer from 3 through 64. It defaults to 12:
 
 ```json
 {
-  "scheduler": { "totalSlots": 8 },
+  "scheduler": { "totalSlots": 12 },
   "roles": {}
 }
 ```
 
-The first scheduler process in a session persists the effective capacity for that session. Later config changes apply to new sessions. The scheduler reserves `max(1, floor(totalSlots / 4))` slots for terminal work, so nesting-capable work can use at most `totalSlots - max(1, floor(totalSlots / 4))` slots. The default leaves 2 terminal slots.
+The first scheduler process in a session persists the effective capacity for that session. Later config changes apply to new sessions. The scheduler reserves `max(1, floor(totalSlots / 4))` slots for terminal work, so nesting-capable work can use at most `totalSlots - max(1, floor(totalSlots / 4))` slots. The default leaves 3 terminal slots.
 
-Nesting has three depths. An unset `DSTACK_NESTING` or `0` is root depth 0. A structured dmode request names one depth-1 `owner`. That owner may launch as many batches as needed. Each depth-2 `worker` or `reviewer` receives a playbook phase, completed phase names, and artifact paths. Worker and reviewer assignments are terminal even if their process depth is malformed or reused. dstack rejects malformed values instead of guessing. Parallel writers should each set `worktree: true`.
+Nesting has three depths. An unset `DSTACK_NESTING` or `0` is root depth 0. A structured dmode request names depth-1 `owner` tasks. Independent read-only or non-overlapping worker slices default to parallel `tasks[]` calls. That owner may launch as many batches as needed. Each depth-2 `worker` or `reviewer` receives a playbook phase, completed phase names, and artifact paths. Worker and reviewer assignments are terminal even if their process depth is malformed or reused. dstack rejects malformed values instead of guessing. Parallel writers should each set `worktree: true`.
 
 `worktree: true` on `dstack_task` creates `~/.dma/worktrees/<repo>/<slug>` on branch `dma/<slug>` and runs the child there. The default base is `HEAD`, so the child sees the parent's current commit, not `origin/main`, unless `worktree.from` in `models.json` is `origin/main`. If `git worktree add` fails, the child does not run in the parent tree. Uncommitted parent diffs stay invisible either way.
 

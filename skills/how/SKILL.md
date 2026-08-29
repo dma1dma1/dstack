@@ -27,10 +27,10 @@ Identify the scope. If ambiguous, state your best-guess interpretation before ex
 
 **Assess complexity to decide the approach:**
 
-- **Simple** (a single module, a small utility, a narrow question like "how does function X work"): skip explorer agents; the explainer explores and explains in a single pass. Go to Step 2b.
-- **Complex** (a subsystem spanning multiple files/services, a cross-cutting feature, a full architectural overview): spawn parallel explorer agents first, then hand off to the explainer. Go to Step 2a.
+- **Complex** (a subsystem spanning multiple files or services, a cross-cutting feature, an architectural overview, or any question with distinct exploration angles): spawn parallel explorer agents first, then hand off to the explainer. Go to Step 2a.
+- **Simple** (a single function, a small self-contained utility, or a narrow query with no distinct slices): skip explorer agents; the explainer explores and explains in a single pass. Go to Step 2b.
 
-When in doubt, lean simple. You can always spawn explorers if the explainer hits a wall.
+When in doubt, fan out parallel explorers.
 
 ### Step 2a. Explore (complex questions only)
 

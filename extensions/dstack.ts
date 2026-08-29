@@ -1350,7 +1350,7 @@ export default function dstack(pi: ExtensionAPI) {
 		name: "dstack_task",
 		label: "dstack task",
 		description:
-			"Launch child agents. Single tasks, concurrent batches (tasks[]), or sequential chains (chain[]). A parallel tasks[] batch launches child tasks concurrently and returns one collectable task ID. For dmode, root sends one nontrivial request to a workflow owner (or multiple concurrent owners); owners may launch as many bounded worker batches as needed. Pass workflow metadata so workers receive phase and artifact state without rereading dmode. Both root and nested calls return a task id immediately. Root waits for a completion or stale wake-up. Nested owners call dstack_result after independent work; it waits for completion. Never poll or finish with an uncollected task.",
+			"Launch child agents. Single tasks, concurrent batches (tasks[]), or sequential chains (chain[]). A parallel tasks[] batch launches child tasks concurrently and returns one collectable task ID. For dmode, root sends related outcomes to one workflow owner. When one user turn has multiple genuinely independent nontrivial outcomes, root may launch one owner per outcome in a single tasks[] batch. Owners may launch as many bounded worker batches as needed. Pass workflow metadata so workers receive phase and artifact state without rereading dmode. Both root and nested calls return a task id immediately. Root waits for a completion or stale wake-up. Nested owners call dstack_result after independent work; it waits for completion. Never poll or finish with an uncollected task.",
 		parameters: TaskParams,
 		renderCall(params, theme) {
 			const request = parseTaskRequest(params);
