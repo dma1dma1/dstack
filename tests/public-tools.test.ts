@@ -1553,6 +1553,60 @@ test("shouldTriggerStaleWake repeats with capped exponential backoff and resets 
 	});
 });
 
+test("shouldTriggerStaleWake ignores a stale owner while nested workers are active", () => {
+	const nested = {
+		groupId: "nested-group",
+		nestedIndex: 0,
+		agent: "poteto-agent",
+		taskPreview: "inspect code",
+		state: "running" as const,
+		updatedAt: "2025-01-01T00:09:30.000Z",
+		live: true,
+	};
+	const snapshot = {
+		taskId: "task-active-nested",
+		workflowId: "wf-active-nested",
+		mode: "single" as const,
+		createdAt: "2025-01-01T00:00:00.000Z",
+		committed: false,
+		counts: { queued: 0, running: 1, complete: 0, total: 1 },
+		slots: { active: 2, capacity: 4 },
+		children: [{
+			index: 0,
+			state: "running" as const,
+			agent: "poteto-agent",
+			taskPreview: "own workflow",
+			activity: { text: "waiting for nested workers", updatedAt: "2025-01-01T00:00:00.000Z" },
+			stale: true,
+			nested: [nested],
+			nestedGroups: [],
+		}],
+		todos: [],
+		todoCounts: { total: 0, completed: 0, inProgress: 0 },
+		capturedAt: "2025-01-01T00:10:00.000Z",
+	};
+	const control = { isIdle: true, hasPendingMessages: false };
+
+	assert.equal(shouldTriggerStaleWake({ snapshot, control }), false);
+	assert.equal(shouldTriggerStaleWake({
+		snapshot: {
+			...snapshot,
+			children: [{
+				...snapshot.children[0]!,
+				nested: [{ ...nested, updatedAt: "2025-01-01T00:07:00.000Z", stale: true }],
+			}],
+		},
+		control,
+	}), true);
+	assert.equal(shouldTriggerStaleWake({
+		snapshot: {
+			...snapshot,
+			children: [{ ...snapshot.children[0]!, nested: [] }],
+		},
+		control,
+	}), true);
+});
+
 test("completion wake and recovery decision helpers enforce dedupe and bounded-retry invariants", () => {
 	const committedSnapshot = {
 		taskId: "task-cw",
