@@ -39,6 +39,7 @@ import {
 	STALE_ACTIVITY_THRESHOLD_MS,
 	taskPreviewOf,
 	type SpawnChildV1,
+	type SpawnNestedChild,
 	parseSpawnRecordV1,
 	type SpawnRecordV1,
 	type TreeSnapshot,
@@ -296,12 +297,18 @@ export function shouldTriggerStaleWake(input: {
 	if (input.snapshot.committed) return false;
 	if (!input.control.isIdle || input.control.hasPendingMessages) return false;
 
+	const capturedAtMs = Date.parse(input.snapshot.capturedAt);
 	const hasStaleChild = input.snapshot.children.some((child) => {
 		if (child.state !== "running") return false;
-		if (child.stale === true) return true;
-		return child.nested.some(
-			(nested) => "state" in nested && nested.state === "running" && nested.stale === true,
+		const runningNested = child.nested.filter(
+			(nested): nested is SpawnNestedChild => "state" in nested && nested.state === "running",
 		);
+		if (runningNested.length === 0) return child.stale === true;
+		return runningNested.some((nested) => {
+			if (nested.stale === true) return true;
+			const updatedAtMs = Date.parse(nested.updatedAt);
+			return !Number.isFinite(capturedAtMs) || !Number.isFinite(updatedAtMs) || capturedAtMs - updatedAtMs > STALE_ACTIVITY_THRESHOLD_MS;
+		});
 	});
 	if (!hasStaleChild) return false;
 
