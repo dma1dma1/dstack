@@ -106,6 +106,30 @@ export type JournalEntry =
 	| ExitJournalEntry
 	| FailureJournalEntry;
 
+export function formatJournalActivity(entry: JournalEntry): string {
+	switch (entry.kind) {
+		case "spawn":
+			return `spawned (${entry.agent})`;
+		case "tool":
+			return `→ ${entry.name} ${entry.gist}`;
+		case "turn":
+			return entry.summary ?? `turn ${entry.turn}`;
+		case "phase": {
+			const parts = [entry.phase, entry.note].filter((part): part is string => part !== undefined && part !== "");
+			if (entry.blocking) parts.push("[blocking]");
+			return parts.join(": ") || "status updated";
+		}
+		case "exit":
+			return entry.exitCode === 0 ? "completed" : `failed (exit ${entry.exitCode})`;
+		case "failure":
+			return `failed: ${entry.error}`;
+	}
+}
+
+export function recentJournalActivity(entries: readonly JournalEntry[], limit = 3): readonly string[] {
+	return entries.slice(-Math.max(0, limit)).map(formatJournalActivity);
+}
+
 export type ChildJournalSnapshot = Readonly<{
 	schemaVersion: "dstack.journal.v1";
 	seq: number;

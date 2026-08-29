@@ -13,6 +13,7 @@ import {
 	PER_TASK_OUTPUT_CAP,
 	type ChildDepth,
 	type NestingDepth,
+	type ProcessBudget,
 	type SpawnableDepth,
 	type TaskRequest,
 	type TaskSpec,
@@ -21,6 +22,8 @@ import {
 	type WorkflowContext,
 } from "./types.ts";
 import { parseWorkflowContext } from "./workflow-context.ts";
+
+export type { ProcessBudget } from "./types.ts";
 
 export class NestingError extends Error {
 	constructor(message: string) {
@@ -163,6 +166,32 @@ export async function mapWithConcurrency<TIn, TOut>(
 	return results;
 }
 
+export function parseBudget(raw: unknown): ProcessBudget | { error: string } | undefined {
+	if (raw === undefined) return undefined;
+	if (!isRecord(raw)) return { error: "budget must be an object." };
+	const { timeoutMs, maxTurns, maxCost } = raw;
+	if (timeoutMs !== undefined) {
+		if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+			return { error: "budget.timeoutMs must be a finite positive number." };
+		}
+	}
+	if (maxTurns !== undefined) {
+		if (typeof maxTurns !== "number" || !Number.isFinite(maxTurns) || maxTurns <= 0) {
+			return { error: "budget.maxTurns must be a finite positive number." };
+		}
+	}
+	if (maxCost !== undefined) {
+		if (typeof maxCost !== "number" || !Number.isFinite(maxCost) || maxCost <= 0) {
+			return { error: "budget.maxCost must be a finite positive number." };
+		}
+	}
+	return {
+		...(timeoutMs !== undefined ? { timeoutMs } : {}),
+		...(maxTurns !== undefined ? { maxTurns } : {}),
+		...(maxCost !== undefined ? { maxCost } : {}),
+	};
+}
+
 export function parseTaskRequest(params: {
 	agent?: string;
 	task?: string;
@@ -174,6 +203,7 @@ export function parseTaskRequest(params: {
 	worktree?: boolean;
 	dmode?: boolean;
 	workflow?: WorkflowContext;
+	budget?: ProcessBudget;
 	tasks?: TaskSpec[];
 	chain?: TaskSpec[];
 }): TaskRequest | { error: string } {
@@ -183,10 +213,25 @@ export function parseTaskRequest(params: {
 	const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
 	if (modeCount !== 1) return { error: "Provide exactly one of agent+task, tasks, or chain." };
 	const normalizeSpec = (spec: TaskSpec, label: string): TaskSpec | { error: string } => {
-		if (spec.workflow === undefined) return spec;
-		const workflow = parseWorkflowContext(spec.workflow);
-		if ("error" in workflow) return { error: `${label}: ${workflow.error}` };
-		return { ...spec, workflow };
+		let workflow: WorkflowContext | undefined;
+		if (spec.workflow !== undefined) {
+			const parsedWorkflow = parseWorkflowContext(spec.workflow);
+			if ("error" in parsedWorkflow) return { error: `${label}: ${parsedWorkflow.error}` };
+			workflow = parsedWorkflow;
+		}
+		let budget: ProcessBudget | undefined;
+		if (spec.budget !== undefined) {
+			const parsedBudget = parseBudget(spec.budget);
+			if (parsedBudget !== undefined && "error" in parsedBudget) {
+				return { error: `${label}: ${parsedBudget.error}` };
+			}
+			budget = parsedBudget;
+		}
+		return {
+			...spec,
+			...(workflow !== undefined ? { workflow } : {}),
+			...(budget !== undefined ? { budget } : {}),
+		};
 	};
 	if (hasTasks) {
 		if ((params.tasks?.length ?? 0) > MAX_PARALLEL_TASKS) {
@@ -220,6 +265,7 @@ export function parseTaskRequest(params: {
 			worktree: params.worktree,
 			dmode: params.dmode,
 			workflow: params.workflow,
+			...(params.budget !== undefined ? { budget: params.budget } : {}),
 		}, "task");
 	if ("error" in spec) return spec;
 	return { kind: "single", spec };
@@ -518,8 +564,24 @@ function unresolvedNestedTaskIds(messages: readonly ChildMessage[]): string[] {
 	return [...unresolved];
 }
 
-export function applyJsonEvent(event: unknown, state: { messages: ChildMessage[]; result: ChildResult }): boolean {
+export function applyJsonEvent(
+	event: unknown,
+	state: { messages: ChildMessage[]; result: ChildResult; isLifecycleFollowUp?: boolean },
+): boolean {
 	if (!isRecord(event)) return false;
+	if (event.type === "custom_message") {
+		const customType = typeof event.customType === "string"
+			? event.customType
+			: isRecord(event.message) && typeof event.message.customType === "string"
+				? event.message.customType
+				: undefined;
+		if (customType === "dstack-nested-complete" || customType === "dstack-nested-collect") {
+			state.isLifecycleFollowUp = true;
+		} else {
+			state.isLifecycleFollowUp = false;
+		}
+		return true;
+	}
 	const toolUpdate = parseToolUpdate(event);
 	if (toolUpdate) {
 		for (let messageIndex = state.messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
@@ -544,6 +606,14 @@ export function applyJsonEvent(event: unknown, state: { messages: ChildMessage[]
 		message.toolCallId !== undefined &&
 		state.messages.some((existing) => existing.role === "toolResult" && existing.toolCallId === message.toolCallId)
 	) return false;
+	if (message.role === "user") {
+		const customType = isRecord(event.message) && typeof event.message.customType === "string"
+			? event.message.customType
+			: undefined;
+		if (customType !== "dstack-nested-complete" && customType !== "dstack-nested-collect") {
+			state.isLifecycleFollowUp = false;
+		}
+	}
 	state.messages.push(message);
 	state.result.messages = state.messages;
 	if (message.role === "toolResult" && message.usage) {
@@ -571,7 +641,14 @@ export function applyJsonEvent(event: unknown, state: { messages: ChildMessage[]
 	}
 	if (message.stopReason) state.result.stopReason = message.stopReason;
 	if (message.errorMessage) state.result.errorMessage = message.errorMessage;
-	state.result.text = lastAssistantText(state.messages);
+	const assistantText = lastAssistantText(state.messages);
+	if (
+		!state.isLifecycleFollowUp ||
+		!state.result.text ||
+		Buffer.byteLength(assistantText, "utf8") > Buffer.byteLength(state.result.text, "utf8")
+	) {
+		state.result.text = assistantText;
+	}
 	return true;
 }
 
@@ -590,6 +667,7 @@ export async function runChildProcess(input: {
 	env: Record<string, string>;
 	invocation?: ChildInvocation;
 	signal?: AbortSignal;
+	budget?: ProcessBudget;
 	onSpawn?: (pid: number) => void | Promise<void>;
 	onUpdate?: (result: ChildResult) => void;
 	onStdout?: (chunk: Buffer) => void;
@@ -606,29 +684,90 @@ export async function runChildProcess(input: {
 	};
 	const state = { messages: result.messages, result };
 
+	let childDepth = 0;
+	try {
+		childDepth = parseNestingDepth(input.env[NESTING_ENV]);
+	} catch {
+		childDepth = 0;
+	}
+	const isLeader = process.platform !== "win32" && childDepth === 1;
+
 	result.exitCode = await new Promise<number>((resolve, reject) => {
 		const proc = spawn(invocation.command, invocation.args, {
 			cwd: input.cwd,
 			env: input.env,
 			shell: false,
+			detached: isLeader,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		let buffer = "";
 		let wasAborted = input.signal?.aborted === true;
+		let budgetExceeded: { kind: "wall_clock" | "turns" | "cost"; limit: number; observed: number } | undefined;
 		let spawnBoundarySettled = false;
 		let closeCode: number | null | undefined;
 		let boundaryError: unknown;
 		let killTimer: NodeJS.Timeout | undefined;
+		let timeoutTimer: NodeJS.Timeout | undefined;
+		const startMs = Date.now();
 		proc.stdout.pause();
 
-		const terminate = () => {
-			proc.kill("SIGTERM");
+		if (input.budget?.timeoutMs !== undefined && input.budget.timeoutMs > 0) {
+			timeoutTimer = setTimeout(() => {
+				if (closeCode === undefined && !wasAborted && !budgetExceeded) {
+					const elapsed = Date.now() - startMs;
+					budgetExceeded = { kind: "wall_clock", limit: input.budget!.timeoutMs!, observed: elapsed };
+					terminate();
+				}
+			}, input.budget.timeoutMs);
+			timeoutTimer.unref?.();
+		}
+
+		const terminate = (sig: NodeJS.Signals = "SIGTERM") => {
+			let groupSignalled = false;
+			if (isLeader && proc.pid !== undefined) {
+				try {
+					process.kill(-proc.pid, sig);
+					groupSignalled = true;
+				} catch {}
+			}
+			if (!groupSignalled) {
+				try {
+					proc.kill(sig);
+				} catch {}
+			}
 			killTimer ??= setTimeout(() => {
-				if (proc.exitCode === null) proc.kill("SIGKILL");
+				if (proc.exitCode === null) {
+					if (isLeader && proc.pid !== undefined) {
+						try {
+							process.kill(-proc.pid, "SIGKILL");
+						} catch {
+							try { proc.kill("SIGKILL"); } catch {}
+						}
+					} else {
+						try { proc.kill("SIGKILL"); } catch {}
+					}
+				}
 			}, 5000);
+			killTimer.unref?.();
 		};
+
+		const checkBudgets = () => {
+			if (budgetExceeded || wasAborted || closeCode !== undefined) return;
+			if (input.budget?.maxTurns !== undefined && result.usage.turns > input.budget.maxTurns) {
+				budgetExceeded = { kind: "turns", limit: input.budget.maxTurns, observed: result.usage.turns };
+				terminate();
+				return;
+			}
+			if (input.budget?.maxCost !== undefined && result.usage.cost > input.budget.maxCost) {
+				budgetExceeded = { kind: "cost", limit: input.budget.maxCost, observed: result.usage.cost };
+				terminate();
+				return;
+			}
+		};
+
 		const finish = () => {
 			if (!spawnBoundarySettled || closeCode === undefined) return;
+			if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
 			if (killTimer !== undefined) clearTimeout(killTimer);
 			input.signal?.removeEventListener("abort", abortChild);
 			if (boundaryError !== undefined) {
@@ -636,11 +775,24 @@ export async function runChildProcess(input: {
 				return;
 			}
 			if (buffer.trim()) processLine(buffer);
-			if (wasAborted) {
+			if (budgetExceeded) {
+				result.stopReason = "budget_exceeded";
+				const limitStr = budgetExceeded.kind === "cost"
+					? `$${budgetExceeded.limit.toFixed(2)}`
+					: budgetExceeded.kind === "wall_clock"
+						? `${budgetExceeded.limit}ms`
+						: `${budgetExceeded.limit}`;
+				const obsStr = budgetExceeded.kind === "cost"
+					? `$${budgetExceeded.observed.toFixed(2)}`
+					: budgetExceeded.kind === "wall_clock"
+						? `${budgetExceeded.observed}ms`
+						: `${budgetExceeded.observed}`;
+				result.errorMessage = `Budget exceeded: ${budgetExceeded.kind} limit was ${limitStr}, observed ${obsStr}.`;
+			} else if (wasAborted) {
 				result.stopReason = "aborted";
 				result.errorMessage = "Child agent was aborted";
 			}
-			resolve(closeCode ?? (wasAborted ? 1 : 0));
+			resolve(closeCode ?? (wasAborted || budgetExceeded ? 1 : 0));
 		};
 		const abortChild = () => {
 			wasAborted = true;
@@ -650,7 +802,10 @@ export async function runChildProcess(input: {
 			if (!line.trim()) return;
 			try {
 				const event: unknown = JSON.parse(line);
-				if (applyJsonEvent(event, state)) input.onUpdate?.(snapshotChildResult(result));
+				if (applyJsonEvent(event, state)) {
+					checkBudgets();
+					input.onUpdate?.(snapshotChildResult(result));
+				}
 			} catch {
 				return;
 			}
@@ -677,7 +832,7 @@ export async function runChildProcess(input: {
 			Promise.resolve().then(() => input.onSpawn?.(pid)).then(
 				() => {
 					spawnBoundarySettled = true;
-					if (wasAborted) terminate();
+					if (wasAborted || budgetExceeded) terminate();
 					else proc.stdout.resume();
 					finish();
 				},
@@ -702,6 +857,9 @@ export async function runChildProcess(input: {
 		input.signal?.addEventListener("abort", abortChild, { once: true });
 	});
 
+	if (result.stopReason === "budget_exceeded") {
+		result.exitCode = 1;
+	}
 	const unresolvedTaskIds = unresolvedNestedTaskIds(result.messages);
 	if (result.exitCode === 0 && unresolvedTaskIds.length > 0) {
 		result.exitCode = 1;

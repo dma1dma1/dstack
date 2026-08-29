@@ -13,7 +13,11 @@ export type ChildStateView = Readonly<{
 	model?: string;
 	latestStatus?: SemanticStatus;
 	latestActivity?: string;
+	recentActivity?: readonly string[];
 	lastActiveAt?: string;
+	startedAt?: string;
+	endedAt?: string;
+	elapsedMs?: number;
 	journal?: readonly JournalEntry[];
 	journalCount?: number;
 	usage?: TaskResult["usage"];
@@ -146,8 +150,8 @@ export async function readDstackResult(input: ResultReader): Promise<DstackResul
 			};
 		case "killed": {
 			const committed = await readCommitted(input, binding, task);
-			if (committed.kind === "read" && committed.result?.kind === "cancelled") {
-				return { kind: "cancelled", taskId: input.taskId, message: committed.result.message };
+			if (committed.kind === "read" && committed.result !== undefined) {
+				return projectCommitted(input.taskId, committed.result, input.detail ?? "summary");
 			}
 			return { kind: "cancelled", taskId: input.taskId, message: "The background task was cancelled." };
 		}
@@ -189,7 +193,12 @@ export function projectRunning(
 			agent: child.agent,
 			...(child.latestStatus !== undefined ? { latestStatus: child.latestStatus } : {}),
 			...(child.latestActivity !== undefined ? { latestActivity: child.latestActivity } : {}),
+			...(child.recentActivity !== undefined ? { recentActivity: child.recentActivity } : {}),
 			...(child.lastActiveAt !== undefined ? { lastActiveAt: child.lastActiveAt } : {}),
+			...(child.startedAt !== undefined ? { startedAt: child.startedAt } : {}),
+			...(child.endedAt !== undefined ? { endedAt: child.endedAt } : {}),
+			...(child.elapsedMs !== undefined ? { elapsedMs: child.elapsedMs } : {}),
+			...(child.usage !== undefined ? { usage: child.usage } : {}),
 			...((child.journalCount ?? child.journal?.length) !== undefined
 				? { journalCount: child.journalCount ?? child.journal?.length }
 				: {}),

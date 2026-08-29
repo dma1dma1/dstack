@@ -20,6 +20,7 @@ import {
 	executeWorkflow,
 	DSTACK_ARTIFACT_DIR_ENV,
 	DSTACK_CHILD_INDEX_ENV,
+	reconcileCancelledNestedSpawns,
 	type ResolvedChildSpec,
 	type SlotAcquirer,
 	type WorkflowManifestV1,
@@ -115,6 +116,8 @@ test("manifest validation rejects malformed launch facts and mode shapes", async
 		[testMcpExtensionPath],
 	);
 	assert.equal(parseWorkflowManifest(good).companionExtensionPaths, undefined);
+	const budget = { timeoutMs: 60_000, maxTurns: 10, maxCost: 0.5 };
+	assert.deepEqual(parseWorkflowManifest({ ...good, specs: [spec(cwd, "budgeted", { budget })] }).specs[0].budget, budget);
 	assert.throws(() => parseWorkflowManifest({ ...good, childDepth: 2 }), /childDepth/);
 	assert.throws(() => parseWorkflowManifest({ ...good, companionExtensionPaths: "not-an-array" }), /string array/);
 	assert.throws(() => parseWorkflowManifest({ ...good, piChildLaunch: { executable: "pi", argvPrefix: [] } }), /absolute/);
@@ -169,6 +172,38 @@ test("parallel mixed failure is a committed domain failure", async (t) => {
 	assert.deepEqual(index.children.map((entry) => entry.state), ["succeeded", "failed"]);
 	await commitWorkflowResult(workflow, index);
 	assert.equal((await readCommittedWorkflowResult(workflow.artifactDir, "b".repeat(64), workflow.workflowId)).outcome, "failed");
+});
+
+test("cancelled owners durably finalize queued and running nested spawn records", async (t) => {
+	const root = await temporaryDirectory(t);
+	const childDirectory = join(root, "children", "0");
+	const spawnsDirectory = join(childDirectory, "spawns");
+	await mkdir(spawnsDirectory, { recursive: true });
+	const path = join(spawnsDirectory, "nested-cancelled.json");
+	await writeFile(path, JSON.stringify({
+		schemaVersion: "dstack.spawn-record.v1",
+		workflowId: "wf-cancelled-owner",
+		parentIndex: 0,
+		groupId: "nested-cancelled",
+		mode: "parallel",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		children: [
+			{ nestedIndex: 0, agent: "general-purpose", taskPreview: "running", state: "running", updatedAt: "2025-01-01T00:00:01.000Z" },
+			{ nestedIndex: 1, agent: "general-purpose", taskPreview: "queued", state: "queued", updatedAt: "2025-01-01T00:00:01.000Z" },
+			{ nestedIndex: 2, agent: "general-purpose", taskPreview: "done", state: "succeeded", updatedAt: "2025-01-01T00:00:02.000Z" },
+		],
+	}));
+
+	await reconcileCancelledNestedSpawns(childDirectory);
+	await reconcileCancelledNestedSpawns(childDirectory);
+	const record = JSON.parse(await readFile(path, "utf8")) as {
+		children: Array<{ state: string; cancellationReason?: string; endedAt?: string }>;
+	};
+	assert.deepEqual(record.children.map((child) => child.state), ["cancelled", "cancelled", "succeeded"]);
+	assert.equal(record.children[0]?.cancellationReason, "parent_cancelled");
+	assert.equal(record.children[1]?.cancellationReason, "parent_cancelled");
+	assert.ok(record.children[0]?.endedAt);
+	assert.ok(record.children[1]?.endedAt);
 });
 
 test("owner success is rejected when a persisted nested task was not collected", async (t) => {

@@ -14,7 +14,7 @@ import { atomicWriteFile, writeSealedArtifact } from "./artifacts.ts";
 import type { BackgroundTaskPort } from "./eventbus-v1.ts";
 import { readCommittedWorkflowResult } from "./runner.ts";
 import { cleanupStaleChildSessions } from "./session.ts";
-import { readJournalFile, readSemanticStatusFile, recentJournal } from "./journal.ts";
+import { formatJournalActivity, readJournalFile, readSemanticStatusFile, recentJournal, recentJournalActivity } from "./journal.ts";
 import type { ChildStateView, CommittedResult, TaskBinding, WorkflowProgress } from "./result.ts";
 import type { ResolvedChildSpec, WorkflowManifestV1 } from "./workflow.ts";
 
@@ -123,6 +123,7 @@ export async function launchTaskGroup(input: Readonly<{
 			overrideReason: spec.overrideReason,
 			tools: resolvedAgent.tools ?? agent.tools?.join(","),
 			workflow: spec.workflow,
+			budget: spec.budget,
 			systemPrompt: promptParts.filter(Boolean).join("\n\n") || undefined,
 			worktree: spec.worktree
 				? {
@@ -282,6 +283,11 @@ export function createTaskResultFiles(sessionId: string): Readonly<{
 						const semanticStatus = await readSemanticStatusFile(join(childDir, "status.json"));
 						const allJournal = journalSnapshot?.entries;
 						const journal = allJournal === undefined ? undefined : recentJournal(allJournal);
+						const spawnEntry = allJournal?.find((entry) => entry.kind === "spawn");
+						const latestTurn = allJournal?.findLast((entry) => entry.kind === "turn");
+						const startedAt = spawnEntry?.timestamp;
+						const elapsedMs = startedAt === undefined ? undefined : Math.max(0, Date.now() - Date.parse(startedAt));
+						const recentActivity = allJournal === undefined ? undefined : recentJournalActivity(allJournal);
 						let latestActivity: string | undefined;
 						let lastActiveAt: string | undefined = journalSnapshot?.updatedAt ?? semanticStatus?.updatedAt;
 						let exitCode: number | undefined;
@@ -292,27 +298,17 @@ export function createTaskResultFiles(sessionId: string): Readonly<{
 							if (last.kind === "exit") {
 								exitCode = last.exitCode;
 								state = exitCode === 0 ? "succeeded" : "failed";
-								latestActivity = exitCode === 0 ? "completed" : `failed (exit ${exitCode})`;
 							} else if (last.kind === "failure") {
 								state = "failed";
-								latestActivity = `failed: ${last.error}`;
 							} else {
 								state = "running";
-								if (semanticStatus && (semanticStatus.phase || semanticStatus.note)) {
-									const parts = [semanticStatus.phase, semanticStatus.note].filter(Boolean);
-									if (semanticStatus.blocking) parts.push("[blocking]");
-									latestActivity = parts.join(": ");
-								} else if (last.kind === "phase") {
-									const parts = [last.phase, last.note].filter(Boolean);
-									if (last.blocking) parts.push("[blocking]");
-									latestActivity = parts.join(": ");
-								} else if (last.kind === "tool") {
-									latestActivity = `→ ${last.name} ${last.gist}`;
-								} else if (last.kind === "turn") {
-									latestActivity = last.summary ?? `turn ${last.turn}`;
-								} else if (last.kind === "spawn") {
-									latestActivity = `spawned (${last.agent})`;
-								}
+							}
+							if (semanticStatus && (semanticStatus.phase || semanticStatus.note)) {
+								const parts = [semanticStatus.phase, semanticStatus.note].filter((part): part is string => part !== undefined && part !== "");
+								if (semanticStatus.blocking) parts.push("[blocking]");
+								latestActivity = parts.join(": ");
+							} else {
+								latestActivity = formatJournalActivity(last);
 							}
 						}
 						lastActiveAt = [lastActiveAt, journalSnapshot?.updatedAt, semanticStatus?.updatedAt]
@@ -330,8 +326,12 @@ export function createTaskResultFiles(sessionId: string): Readonly<{
 								latestStatus: semanticStatus,
 								latestActivity,
 								lastActiveAt,
+								startedAt,
+								elapsedMs,
+								recentActivity,
 								journal,
 								journalCount: allJournal?.length,
+								usage: latestTurn?.usage,
 								exitCode,
 							});
 						}
