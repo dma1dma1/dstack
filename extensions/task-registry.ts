@@ -805,6 +805,7 @@ export function launchNestedTask(options: {
 					companionExtensionPaths,
 					model: model.value.model,
 					omitModel: model.value.omitModel,
+					thinking: model.value.thinking,
 					tools: childTools,
 					systemPromptPath: tmp?.filePath,
 					sessionDir,

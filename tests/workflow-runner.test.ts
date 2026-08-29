@@ -122,6 +122,8 @@ test("manifest validation rejects malformed launch facts and mode shapes", async
 	assert.throws(() => parseWorkflowManifest({ ...good, specs: [spec(cwd, "bad", { tools: "read,,grep" })] }), /empty tool/);
 	assert.throws(() => parseWorkflowManifest({ ...good, specs: [spec(cwd, "bad", { tools: "read,read" })] }), /duplicate/);
 	assert.equal(parseWorkflowManifest({ ...good, specs: [spec(cwd, "ok", { tools: "read, grep" })] }).specs[0].tools, "read,grep");
+	assert.equal(parseWorkflowManifest({ ...good, specs: [spec(cwd, "ok", { thinking: "high" })] }).specs[0].thinking, "high");
+	assert.throws(() => parseWorkflowManifest({ ...good, specs: [spec(cwd, "bad", { thinking: "super-high" as never })] }), /thinking/);
 });
 
 test("parallel results retain manifest order when children finish in reverse order", async (t) => {

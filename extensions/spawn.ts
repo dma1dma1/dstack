@@ -16,6 +16,7 @@ import {
 	type SpawnableDepth,
 	type TaskRequest,
 	type TaskSpec,
+	type ThinkingLevel,
 	type WorkflowAssignment,
 	type WorkflowContext,
 } from "./types.ts";
@@ -84,6 +85,7 @@ export function buildChildArgv(input: {
 	companionExtensionPaths?: readonly string[];
 	model?: string;
 	omitModel?: boolean;
+	thinking?: ThinkingLevel;
 	tools?: string;
 	systemPromptPath?: string;
 	sessionDir?: string;
@@ -94,6 +96,7 @@ export function buildChildArgv(input: {
 	args.push("--no-extensions", "-e", input.extensionPath);
 	for (const path of input.companionExtensionPaths ?? []) args.push("-e", path);
 	if (input.model && !input.omitModel) args.push("--model", input.model);
+	if (input.thinking) args.push("--thinking", input.thinking);
 	if (input.tools) args.push("--tools", input.tools);
 	if (input.systemPromptPath) args.push("--append-system-prompt", input.systemPromptPath);
 	args.push(`Task: ${input.task}`);

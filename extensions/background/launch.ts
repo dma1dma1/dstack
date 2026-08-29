@@ -117,6 +117,7 @@ export async function launchTaskGroup(input: Readonly<{
 			cwd,
 			model: model.value.model,
 			omitModel: model.value.omitModel,
+			thinking: model.value.thinking,
 			requestedRole: model.value.requestedRole,
 			roleIndex: model.value.roleIndex,
 			overrideReason: spec.overrideReason,

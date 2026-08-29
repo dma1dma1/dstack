@@ -13,23 +13,23 @@ If the command already injected a catalog and a suggestion, use those. Do not re
 
 ### 1. Show the suggestion
 
-Print the suggested mapping as a short list. Name why a role got a family (fast explorer, judgment for prose, mixed panel for critics). Mention `inherit-parent` and `auto` as always valid.
+Print the suggested mapping as a short list. Name why a role got a family (fast explorer, judgment for prose, mixed panel for critics). Mention `inherit-parent` and `auto` as always valid. Mention that roles can optionally configure thinking (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`).
 
 If `models.json` already exists, show current next to suggested only where they differ.
 
 ### 2. Talk
 
-Ask what to change. Accept replies like "opus for judgment", "inherit-parent on feature work", "drop haiku from critics", "worktree from origin/main".
+Ask what to change. Accept replies like "opus for judgment", "inherit-parent on feature work", "drop haiku from critics", "high thinking on hardest-tasks", "turn off thinking for explorers", "worktree from origin/main".
 
 Resolve names to catalog slugs. Never write a slug that is not in the catalog. If a name is ambiguous, ask one clarifying question with two or three slugs, not the whole list.
 
 ### 3. Validate
 
-Every real slug must be in the catalog. A panel of only `inherit-parent` / `auto` is a no-op. Refuse that and ask again.
+Every real slug must be in the catalog. A panel of only `inherit-parent` / `auto` is a no-op. Refuse that and ask again. Optional thinking levels must be one of `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`.
 
 ### 4. Write
 
-When the user accepts, write the full file with `dstack_config` `action=write` and a JSON value of `{ "roles", "worktree" }`. One write. Then confirm the path `~/.pi/agent/dstack/models.json`.
+When the user accepts, write the full file with `dstack_config` `action=write` and a JSON value of `{ "roles", "worktree" }`. Roles with thinking use `{ "model": "...", "thinking": "..." }` or `{ "model": [...], "thinking": "..." }`. One write. Then confirm the path `~/.pi/agent/dstack/models.json`.
 
 ### 5. Companions
 

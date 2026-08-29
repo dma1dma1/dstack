@@ -194,7 +194,16 @@ export function isListRole(role: string): role is ListRoleName {
 }
 
 export function formatRoleValue(value: RoleValue): string {
-	return Array.isArray(value) ? value.join(", ") : value;
+	if (typeof value === "string") return value;
+	if (Array.isArray(value)) return value.join(", ");
+	if (typeof value === "object" && value !== null) {
+		const models = Array.isArray(value.model) ? value.model.join(", ") : value.model;
+		if (value.thinking) {
+			return `${models} (thinking: ${value.thinking})`;
+		}
+		return models;
+	}
+	return String(value);
 }
 
 export function formatSetupSummary(config: DstackConfig): string {

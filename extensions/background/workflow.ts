@@ -2,7 +2,7 @@ import { mkdir, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { TaskDetails, TaskResult } from "../dstack.ts";
 import { buildChildArgv, capOutput, childEnv, runChildProcess, type ChildInvocation, type ChildResult } from "../spawn.ts";
-import type { ExecutionProvenance, WorkflowContext, WorktreeFrom } from "../types.ts";
+import type { ExecutionProvenance, ThinkingLevel, WorkflowContext, WorktreeFrom } from "../types.ts";
 import { DEFAULT_TOTAL_SLOTS, MAX_CONCURRENCY, NESTING_ENV, SESSION_REF_ENV, STATUS_FILE_ENV } from "../types.ts";
 import { createWorktree } from "../worktree.ts";
 import { atomicWriteFile, readOutputArtifact, toAbsolutePath, verifyDeclaredArtifacts, writeSealedArtifact, type OutputArtifactSeal } from "./artifacts.ts";
@@ -24,6 +24,7 @@ export type ResolvedChildSpec = Readonly<{
 	cwd: string;
 	model?: string;
 	omitModel?: boolean;
+	thinking?: ThinkingLevel;
 	requestedRole?: string;
 	roleIndex?: number;
 	overrideReason?: string;
@@ -451,6 +452,7 @@ export async function executeWorkflow(
 				companionExtensionPaths: manifest.companionExtensionPaths,
 				model: spec.model,
 				omitModel: spec.omitModel,
+				thinking: spec.thinking,
 				tools: allowStatusTool(spec.tools),
 				systemPromptPath,
 				sessionDir,

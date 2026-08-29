@@ -39,7 +39,23 @@ export type ListRoleName = (typeof LIST_ROLES)[number];
 export const MODEL_ALIASES = ["inherit-parent", "auto"] as const;
 export type ModelAlias = (typeof MODEL_ALIASES)[number];
 export type ModelRef = ModelAlias | string;
-export type RoleValue = ModelRef | ModelRef[];
+
+export const THINKING_LEVELS = [
+	"off",
+	"minimal",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+] as const;
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+
+export type RoleEntry = {
+	model: ModelRef | ModelRef[];
+	thinking?: ThinkingLevel;
+};
+export type RoleValue = ModelRef | ModelRef[] | RoleEntry;
 
 export type WorktreeFrom = "HEAD" | "origin/main";
 
