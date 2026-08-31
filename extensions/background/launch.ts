@@ -123,7 +123,6 @@ export async function launchTaskGroup(input: Readonly<{
 			overrideReason: spec.overrideReason,
 			tools: resolvedAgent.tools ?? agent.tools?.join(","),
 			workflow: spec.workflow,
-			budget: spec.budget,
 			systemPrompt: promptParts.filter(Boolean).join("\n\n") || undefined,
 			worktree: spec.worktree
 				? {

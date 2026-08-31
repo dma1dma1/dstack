@@ -2,7 +2,7 @@ import { mkdir, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { TaskDetails, TaskResult } from "../dstack.ts";
 import { buildChildArgv, capOutput, childEnv, runChildProcess, type ChildInvocation, type ChildResult } from "../spawn.ts";
-import type { ExecutionProvenance, ProcessBudget, ThinkingLevel, WorkflowContext, WorktreeFrom } from "../types.ts";
+import type { ExecutionProvenance, ThinkingLevel, WorkflowContext, WorktreeFrom } from "../types.ts";
 import { DEFAULT_TOTAL_SLOTS, MAX_CONCURRENCY, NESTING_ENV, SESSION_REF_ENV, STATUS_FILE_ENV } from "../types.ts";
 import { createWorktree } from "../worktree.ts";
 import { atomicWriteFile, readOutputArtifact, toAbsolutePath, verifyDeclaredArtifacts, writeSealedArtifact, type OutputArtifactSeal } from "./artifacts.ts";
@@ -30,7 +30,6 @@ export type ResolvedChildSpec = Readonly<{
 	overrideReason?: string;
 	tools?: string;
 	workflow?: WorkflowContext;
-	budget?: ProcessBudget;
 	systemPrompt?: string;
 	worktree?: Readonly<{ repoRoot: string; base: string; from: WorktreeFrom }>;
 }>;
@@ -515,7 +514,6 @@ export async function executeWorkflow(
 					env,
 					invocation,
 					signal,
-					budget: spec.budget,
 					onSpawn: (pid) => lease.bindChild(pid),
 					onUpdate: (partial) => {
 						throttledActivity.write({
