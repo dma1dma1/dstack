@@ -61,7 +61,7 @@ function testRuntime(
 	sendMessageImpl?: (message: unknown, options?: unknown) => unknown,
 ) {
 	const tools = new Map<string, {
-		execute: (...args: unknown[]) => Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown; isError?: boolean; usage?: unknown }>;
+		execute: (...args: unknown[]) => Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown; isError?: boolean; usage?: unknown; terminate?: boolean }>;
 		renderResult?: (
 			result: { content: Array<{ type: string; text?: string }>; isError: boolean; details?: unknown },
 			options: { expanded: boolean; isPartial?: boolean },
@@ -240,6 +240,7 @@ test("root task returns a receipt before the runner completes and dstack_result 
 			{ agent: "comment-sicko", task: "second" },
 		],
 	}, undefined, undefined, runtime.ctx);
+	assert.equal(receiptResult.terminate, true);
 	const receipt = receiptResult.details as { taskId: string; workflowId: string; mode: string; childCount: number; resultTool: string };
 	assert.deepEqual(receipt, {
 		taskId: "bg-public-tools",
@@ -545,6 +546,7 @@ test("depth 1 returns immediate receipt and inspection via dstack_result", async
 			runtime.ctx,
 		);
 		assert.equal(result?.isError, false);
+		assert.equal(result?.terminate, undefined);
 		const receipt = result?.details as { taskId: string; mode: string };
 		assert.ok(receipt?.taskId);
 		assert.equal(backgroundRequests, 0);
