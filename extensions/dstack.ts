@@ -1607,7 +1607,7 @@ export default function dstack(pi: ExtensionAPI) {
 					}
 					startTreePolling(receipt.taskId, receipt.workflowId, ctx);
 					await publishMachineStatus();
-					return textResult(JSON.stringify(receipt), receipt);
+					return { ...textResult(JSON.stringify(receipt), receipt), terminate: true };
 				} catch (error) {
 					return textResult(error instanceof Error ? error.message : String(error), {}, true);
 				}
