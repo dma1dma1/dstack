@@ -778,7 +778,6 @@ export function launchNestedTask(options: {
 					cwd,
 					env,
 					signal,
-					budget: spec.budget,
 					onSpawn: async (pid) => {
 						launch.stage = "execution";
 						const spawned = spawnChildren[index];
@@ -839,9 +838,8 @@ export function launchNestedTask(options: {
 				});
 				await journalUpdates;
 				await recorder.checkStatusFile();
-				const wasCancelled = signal.aborted && child.stopReason !== "budget_exceeded";
+				const wasCancelled = signal.aborted;
 				if (wasCancelled) recorder.recordFailure({ error: "Child agent was aborted" });
-				else if (child.stopReason === "budget_exceeded") recorder.recordFailure({ error: child.errorMessage ?? "Budget exceeded" });
 				else recorder.recordExit({ exitCode: child.exitCode, text: child.text });
 				await recorder.persist();
 				const session = await readChildSessionRef({ refPath: sessionRefPath, sessionDir });
@@ -931,7 +929,7 @@ export function launchNestedTask(options: {
 			const now = new Date().toISOString();
 			const childInfo = initialChildren[index]!;
 			const errorMsg = err instanceof Error ? err.message : String(err);
-			const wasCancelled = (signal.aborted || record.cancellationRequested === true) && !errorMsg.startsWith("Budget exceeded");
+			const wasCancelled = signal.aborted || record.cancellationRequested === true;
 			if (childInfo.lifecycle.stage !== "succeeded" && childInfo.lifecycle.stage !== "failed" && childInfo.lifecycle.stage !== "cancelled") {
 				if (wasCancelled) {
 					childInfo.lifecycle = {
@@ -1128,7 +1126,7 @@ export function launchNestedTask(options: {
 		} catch (err) {
 			const now = new Date().toISOString();
 			const errorMessage = err instanceof Error ? err.message : String(err);
-			const wasCancelled = parallelFailure === undefined && (signal.aborted || record.cancellationRequested === true) && !errorMessage.startsWith("Budget exceeded");
+			const wasCancelled = parallelFailure === undefined && (signal.aborted || record.cancellationRequested === true);
 			for (let i = 0; i < specs.length; i++) {
 				const c = spawnChildren[i];
 				if (c !== undefined && (c.state === "queued" || c.state === "running")) {

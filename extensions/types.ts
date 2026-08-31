@@ -106,12 +106,6 @@ export type ActiveWorkflow = Readonly<{
 	playbook: string;
 }>;
 
-export type ProcessBudget = Readonly<{
-	timeoutMs?: number;
-	maxTurns?: number;
-	maxCost?: number;
-}>;
-
 export type TaskSpec = {
 	agent: string;
 	task: string;
@@ -123,7 +117,6 @@ export type TaskSpec = {
 	worktree?: boolean;
 	dmode?: boolean;
 	workflow?: WorkflowContext;
-	budget?: ProcessBudget;
 };
 
 export type TaskRequest =

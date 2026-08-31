@@ -116,8 +116,6 @@ test("manifest validation rejects malformed launch facts and mode shapes", async
 		[testMcpExtensionPath],
 	);
 	assert.equal(parseWorkflowManifest(good).companionExtensionPaths, undefined);
-	const budget = { timeoutMs: 60_000, maxTurns: 10, maxCost: 0.5 };
-	assert.deepEqual(parseWorkflowManifest({ ...good, specs: [spec(cwd, "budgeted", { budget })] }).specs[0].budget, budget);
 	assert.throws(() => parseWorkflowManifest({ ...good, childDepth: 2 }), /childDepth/);
 	assert.throws(() => parseWorkflowManifest({ ...good, companionExtensionPaths: "not-an-array" }), /string array/);
 	assert.throws(() => parseWorkflowManifest({ ...good, piChildLaunch: { executable: "pi", argvPrefix: [] } }), /absolute/);

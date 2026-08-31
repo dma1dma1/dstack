@@ -13,7 +13,6 @@ import {
 	type WorkflowResultIndexV2,
 } from "./workflow.ts";
 import { parseChildSessionRef } from "./session.ts";
-import { parseBudget } from "../spawn.ts";
 import { MAX_TOTAL_SLOTS, MIN_TOTAL_SLOTS, type ThinkingLevel } from "../types.ts";
 import { parseWorkflowContext } from "../workflow-context.ts";
 import { isThinkingLevel } from "../models.ts";
@@ -94,8 +93,6 @@ function parseSpec(value: unknown, index: number) {
 		workflow = parseWorkflowContext(workflowValue);
 		if ("error" in workflow) throw new Error(`manifest.specs[${index}].${workflow.error}`);
 	}
-	const budget = parseBudget(spec["budget"]);
-	if (budget !== undefined && "error" in budget) throw new Error(`manifest.specs[${index}].${budget.error}`);
 	return {
 		agent: string(spec["agent"], `manifest.specs[${index}].agent`),
 		task: string(spec["task"], `manifest.specs[${index}].task`),
@@ -109,7 +106,6 @@ function parseSpec(value: unknown, index: number) {
 		tools: optionalToolsAllowlist(spec["tools"], `manifest.specs[${index}].tools`),
 		systemPrompt: optionalString(spec["systemPrompt"], `manifest.specs[${index}].systemPrompt`),
 		workflow,
-		budget,
 		worktree,
 	};
 }

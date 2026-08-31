@@ -155,12 +155,6 @@ const WorkflowParams = Type.Object({
 	artifacts: Type.Array(WorkflowArtifactItem),
 });
 
-const BudgetParams = Type.Object({
-	timeoutMs: Type.Optional(Type.Number({ minimum: 1, description: "Wall-clock timeout in milliseconds" })),
-	maxTurns: Type.Optional(Type.Number({ minimum: 1, description: "Maximum turns limit" })),
-	maxCost: Type.Optional(Type.Number({ minimum: 0.0001, description: "Maximum cost limit in USD" })),
-});
-
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "poteto-agent | general-purpose | comment-sicko" }),
 	task: Type.String({ description: "Task to delegate" }),
@@ -172,7 +166,6 @@ const TaskItem = Type.Object({
 	worktree: Type.Optional(Type.Boolean()),
 	dmode: Type.Optional(Type.Boolean()),
 	workflow: Type.Optional(WorkflowParams),
-	budget: Type.Optional(BudgetParams),
 });
 
 const TaskParams = Type.Object({
@@ -186,7 +179,6 @@ const TaskParams = Type.Object({
 	worktree: Type.Optional(Type.Boolean()),
 	dmode: Type.Optional(Type.Boolean()),
 	workflow: Type.Optional(WorkflowParams),
-	budget: Type.Optional(BudgetParams),
 	tasks: Type.Optional(
 		Type.Array(TaskItem, {
 			maxItems: MAX_PARALLEL_TASKS,
