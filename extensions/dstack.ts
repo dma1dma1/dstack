@@ -104,6 +104,7 @@ import {
 	shouldTriggerCompletionWake,
 	shouldTriggerStaleWake,
 	superviseRead,
+	SUPERVISION_INTERVAL_MS,
 	SupervisionRegistry,
 	wakeReasonFor,
 	type DescendantEvidence,
@@ -198,7 +199,7 @@ const ResultParams = Type.Object({
 	waitSeconds: Type.Optional(Type.Number({
 		minimum: 0,
 		maximum: MAX_EXPLICIT_WAIT_SECONDS,
-		description: `Wait 0-${MAX_EXPLICIT_WAIT_SECONDS} seconds for completion. Use 0 for a nonblocking running inspection; omit to wait for completion within the supervision interval.`,
+		description: `Wait 0-${MAX_EXPLICIT_WAIT_SECONDS} seconds for completion. Zero is always nonblocking. Omit for a nonblocking root inspection or a bounded nested-owner collection wait.`,
 	})),
 });
 
@@ -1654,13 +1655,13 @@ export default function dstack(pi: ExtensionAPI) {
 		},
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			await publishMachineStatus();
-			const requestedWaitMs = resolveWaitMs(params.waitSeconds);
-			const immediate = requestedWaitMs === 0;
+			const rootWaitMs = resolveWaitMs(params.waitSeconds);
+			const collectionWaitMs = resolveWaitMs(params.waitSeconds, SUPERVISION_INTERVAL_MS);
 			const runningSupervision = (
 				view: Extract<DstackResultView, { kind: "running" }>,
 				input: Readonly<{
 					outcome: SuperviseOutcome;
-					coerced: boolean;
+					waitMs: number;
 					waitedMs: number;
 					transport: SupervisionTransport;
 					descendants?: DescendantEvidence;
@@ -1669,10 +1670,10 @@ export default function dstack(pi: ExtensionAPI) {
 				const verdict = supervision.noteRunningRead({
 					taskId: params.taskId,
 					fingerprint: fingerprintRunningView(view),
-					immediate,
+					immediate: input.waitMs === 0,
 				});
 				return {
-					wakeReason: wakeReasonFor(input.outcome, input.coerced, input.waitedMs),
+					wakeReason: wakeReasonFor(input.outcome, false, input.waitedMs),
 					changed: verdict.changed,
 					unchangedImmediateReads: verdict.unchangedImmediateReads,
 					breaker: verdict.breaker,
@@ -1680,14 +1681,13 @@ export default function dstack(pi: ExtensionAPI) {
 					...(input.descendants !== undefined ? { descendants: input.descendants } : {}),
 				};
 			};
-			const { waitMs, coerced } = supervision.effectiveWaitMs(params.taskId, requestedWaitMs);
 			if (nestedTaskRegistry.has(params.taskId)) {
 				const record = nestedTaskRegistry.get(params.taskId)!;
 				let outcome: SuperviseOutcome = "terminal";
 				let waitedMs = 0;
 				if (record.status === "running") {
-					if (waitMs > 0) record.collectionRequested = true;
-					const waited = await awaitCompletion({ completion: record.completionPromise, waitMs, signal });
+					if (collectionWaitMs > 0) record.collectionRequested = true;
+					const waited = await awaitCompletion({ completion: record.completionPromise, waitMs: collectionWaitMs, signal });
 					waitedMs = waited.waitedMs;
 					if (record.status === "running") {
 						record.collectionRequested = false;
@@ -1700,7 +1700,7 @@ export default function dstack(pi: ExtensionAPI) {
 						...result,
 						supervision: runningSupervision(result, {
 							outcome,
-							coerced,
+							waitMs: collectionWaitMs,
 							waitedMs,
 							transport: "in_process",
 							descendants: await nestedDescendantEvidence(record),
@@ -1737,7 +1737,7 @@ export default function dstack(pi: ExtensionAPI) {
 					const supervised = await superviseRead({
 						read: () => readPersistedNestedResult({ artifactDir, parentIndex, taskId: params.taskId, detail: params.detail }),
 						isRunning: (view) => view !== undefined && view.kind === "running",
-						waitMs,
+						waitMs: collectionWaitMs,
 						signal,
 					});
 					if (supervised.view !== undefined) {
@@ -1747,7 +1747,7 @@ export default function dstack(pi: ExtensionAPI) {
 								...persisted,
 								supervision: runningSupervision(persisted, {
 									outcome: supervised.outcome,
-									coerced,
+									waitMs: collectionWaitMs,
 									waitedMs: supervised.waitedMs,
 									transport: "artifact",
 								}),
@@ -1779,7 +1779,7 @@ export default function dstack(pi: ExtensionAPI) {
 					readCommittedResult: files.readCommittedResult,
 				}),
 				isRunning: (view) => view.kind === "running",
-				waitMs,
+				waitMs: rootWaitMs,
 				signal,
 			});
 			let result = supervised.view;
@@ -1788,7 +1788,7 @@ export default function dstack(pi: ExtensionAPI) {
 					...result,
 					supervision: runningSupervision(result, {
 						outcome: supervised.outcome,
-						coerced,
+						waitMs: rootWaitMs,
 						waitedMs: supervised.waitedMs,
 						transport: "companion",
 						descendants: await rootDescendantEvidence(params.taskId),

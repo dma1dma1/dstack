@@ -7,7 +7,7 @@ Skills in this package talk to Pi through dstack tools. This file is the rewrite
 | Skill name | Host |
 | --- | --- |
 | `dstack_task` | Background single, parallel, or chain group. Returns a task id immediately at root and depth 1. |
-| `dstack_result` | Bounded summary. Root reads after the normal completion notification; depth-1 collection waits for a running nested task. Full detail is opt-in. |
+| `dstack_result` | Bounded summary. Root reads are nonblocking by default and normally happen after the completion notification; depth-1 collection waits for a running nested task. Explicit `waitSeconds: 0` is always nonblocking. Full detail is opt-in. |
 | `dstack_todo` | First-party todos, or `@juicesharp/rpiv-todo` if that package is already loaded. |
 | `dstack_ask` | Typed options via `ctx.ui.select` / `ctx.ui.confirm`. |
 | `dstack_status` | Child progress with optional phase, note, blocking flag, and typed blocker. |

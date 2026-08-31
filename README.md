@@ -83,7 +83,7 @@ The first `/setup-dstack` also writes `~/.pi/agent/extensions/pi-permission-syst
 | `dstack_sessions` | `SessionManager.list(cwd)`. |
 | `dstack_config` | Get / set / list `models.json`. |
 
-`dstack_task` returns a task ID immediately. Root tasks send a completion notification; call `dstack_result` once after it arrives. A depth-1 owner may do independent work, then calls `dstack_result`, which waits for its nested task to finish. If the owner tries to finish first, dstack queues a collection turn instead of tearing down the worker. Do not poll.
+`dstack_task` returns a task ID immediately. Root tasks send a completion notification; call `dstack_result` once after it arrives. A root result read is nonblocking by default. A depth-1 owner may do independent work, then calls `dstack_result`, which waits for its nested task to finish. Explicit `waitSeconds: 0` is always nonblocking; repeated unchanged reads expose breaker telemetry but never change the requested wait. If the owner tries to finish first, dstack queues a collection turn instead of tearing down the worker. Do not poll.
 
 Set `scheduler.totalSlots` in `~/.pi/agent/dstack/models.json` to an integer from 3 through 64. It defaults to 12:
 

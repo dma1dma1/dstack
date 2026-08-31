@@ -22,17 +22,18 @@ import { STALE_ACTIVITY_THRESHOLD_MS, type SpawnNestedChild, type TreeSnapshot }
 
 // --- Wait policy ------------------------------------------------------------
 
-/** The bounded default wait applied when a caller omits waitSeconds. */
+/** The bounded default wait used when a nested owner collects child work. */
 export const SUPERVISION_INTERVAL_MS = STALE_ACTIVITY_THRESHOLD_MS;
 export const MAX_EXPLICIT_WAIT_SECONDS = 30 * 60;
 export const DEFAULT_SUPERVISION_POLL_MS = 1_000;
 
 /**
  * Resolve a caller-supplied waitSeconds into a wait budget in milliseconds.
- * Undefined is bounded by the supervision interval; 0 is nonblocking.
+ * Root inspection defaults to a nonblocking read. Callers that join nested
+ * work pass the supervision interval as their default wait.
  */
-export function resolveWaitMs(waitSeconds: number | undefined): number {
-	if (waitSeconds === undefined) return SUPERVISION_INTERVAL_MS;
+export function resolveWaitMs(waitSeconds: number | undefined, defaultWaitMs = 0): number {
+	if (waitSeconds === undefined) return defaultWaitMs;
 	if (!Number.isFinite(waitSeconds) || waitSeconds < 0 || waitSeconds > MAX_EXPLICIT_WAIT_SECONDS) {
 		throw new Error(`waitSeconds must be finite and between 0 and ${MAX_EXPLICIT_WAIT_SECONDS}.`);
 	}
@@ -541,17 +542,9 @@ export class SupervisionRegistry {
 		return count >= this.breakerThreshold ? "tripped" : count > 0 ? "armed" : "idle";
 	}
 
-	/**
-	 * Apply the breaker to a requested wait budget: once repeated immediate
-	 * reads observe no change, further immediate reads are coerced into a
-	 * bounded wait so polling cannot spin.
-	 */
-	effectiveWaitMs(taskId: string, requestedWaitMs: number): EffectiveWait {
-		if (requestedWaitMs !== 0) return { waitMs: requestedWaitMs, coerced: false };
-		if (this.breakerState(taskId) === "tripped") {
-			return { waitMs: SUPERVISION_INTERVAL_MS, coerced: true };
-		}
-		return { waitMs: 0, coerced: false };
+	/** Preserve the requested wait exactly; breaker state is reporting-only. */
+	effectiveWaitMs(_taskId: string, requestedWaitMs: number): EffectiveWait {
+		return { waitMs: requestedWaitMs, coerced: false };
 	}
 
 	/** Record a running read and report change/progress plus breaker state. */

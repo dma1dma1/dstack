@@ -249,7 +249,7 @@ test("root task returns a receipt before the runner completes and dstack_result 
 		resultTool: "dstack_result",
 	});
 
-	const running = await resultTool.execute("result-running", { taskId: receipt.taskId, waitSeconds: 0 }, undefined, undefined, runtime.ctx);
+	const running = await resultTool.execute("result-running", { taskId: receipt.taskId }, undefined, undefined, runtime.ctx);
 	const runningDetails = running.details as {
 		kind: string;
 		taskId: string;
@@ -267,6 +267,15 @@ test("root task returns a receipt before the runner completes and dstack_result 
 	const repeatDetails = runningRepeat.details as typeof runningDetails;
 	assert.equal(repeatDetails.supervision?.changed, false, "identical immediate re-read must report unchanged");
 	assert.equal(repeatDetails.supervision?.unchangedImmediateReads, 1);
+
+	await resultTool.execute("result-running-3", { taskId: receipt.taskId, waitSeconds: 0 }, undefined, undefined, runtime.ctx);
+	const breakerRead = await resultTool.execute("result-running-4", { taskId: receipt.taskId, waitSeconds: 0 }, undefined, undefined, runtime.ctx);
+	const breakerDetails = breakerRead.details as typeof runningDetails;
+	assert.equal(breakerDetails.supervision?.breaker, "tripped");
+	const afterBreaker = await resultTool.execute("result-running-5", { taskId: receipt.taskId, waitSeconds: 0 }, undefined, undefined, runtime.ctx);
+	const afterBreakerDetails = afterBreaker.details as typeof runningDetails;
+	assert.equal(afterBreakerDetails.supervision?.wakeReason.kind, "nonblocking", "an explicit zero wait remains nonblocking after the breaker trips");
+	assert.equal(afterBreakerDetails.supervision?.breaker, "tripped", "the breaker remains visible as telemetry");
 
 	const bounded = await resultTool.execute("result-bounded", { taskId: receipt.taskId, waitSeconds: 1 }, undefined, undefined, runtime.ctx);
 	const boundedDetails = bounded.details as typeof runningDetails;
@@ -2000,8 +2009,9 @@ test("dstack_result renderResult renders concise collapsed summary with expand h
 	assert.ok(!malformedLines[0]?.includes('"package"'));
 });
 
-test("supervision wait policy: undefined bounded by interval, 0 nonblocking, explicit honored, invalid rejected", () => {
-	assert.equal(resolveWaitMs(undefined), SUPERVISION_INTERVAL_MS);
+test("supervision wait policy: root defaults nonblocking, nested collection can supply a bounded default, explicit honored, invalid rejected", () => {
+	assert.equal(resolveWaitMs(undefined), 0);
+	assert.equal(resolveWaitMs(undefined, SUPERVISION_INTERVAL_MS), SUPERVISION_INTERVAL_MS);
 	assert.equal(resolveWaitMs(0), 0);
 	assert.equal(resolveWaitMs(5), 5000);
 	assert.equal(resolveWaitMs(MAX_EXPLICIT_WAIT_SECONDS), MAX_EXPLICIT_WAIT_SECONDS * 1000);
@@ -2057,7 +2067,7 @@ test("superviseRead exposes explicit wake outcomes for nonblocking, elapsed, and
 	assert.equal(timedOut.outcome, "wait_elapsed");
 });
 
-test("supervision breaker trips on repeated unchanged immediate reads, resets on change, and survives reload", () => {
+test("supervision breaker reports repeated unchanged immediate reads, resets on change, and survives reload", () => {
 	const entries: Array<{ type: "custom"; customType: string; data: unknown }> = [];
 	const registry = new SupervisionRegistry({
 		appendEntry: (customType, data) => entries.push({ type: "custom", customType, data }),
@@ -2070,22 +2080,19 @@ test("supervision breaker trips on repeated unchanged immediate reads, resets on
 	const verdict = registry.noteRunningRead({ taskId: "bg-spin", fingerprint, immediate: true });
 	assert.equal(verdict.changed, false);
 	assert.equal(verdict.breaker, "tripped");
-	assert.deepEqual(registry.effectiveWaitMs("bg-spin", 0), { waitMs: SUPERVISION_INTERVAL_MS, coerced: true });
+	assert.deepEqual(registry.effectiveWaitMs("bg-spin", 0), { waitMs: 0, coerced: false });
 	assert.deepEqual(registry.effectiveWaitMs("bg-spin", 2_000), { waitMs: 2_000, coerced: false });
-	assert.deepEqual(registry.effectiveWaitMs("bg-other", 0), { waitMs: 0, coerced: false });
 
 	// Reload compatibility: state rebuilt purely from persisted entries.
 	const restored = new SupervisionRegistry();
 	restored.restore(entries);
 	assert.equal(restored.breakerState("bg-spin"), "tripped");
-	assert.deepEqual(restored.effectiveWaitMs("bg-spin", 0), { waitMs: SUPERVISION_INTERVAL_MS, coerced: true });
 
 	// Progress resets the breaker.
 	const changedFingerprint = fingerprintRunningView({ kind: "running", progress: { running: 0, complete: 1 } });
 	const reset = registry.noteRunningRead({ taskId: "bg-spin", fingerprint: changedFingerprint, immediate: true });
 	assert.equal(reset.changed, true);
 	assert.equal(reset.breaker, "idle");
-	assert.deepEqual(registry.effectiveWaitMs("bg-spin", 0), { waitMs: 0, coerced: false });
 
 	// Terminal observation clears persisted dedupe state.
 	registry.noteTerminalRead("bg-spin");
