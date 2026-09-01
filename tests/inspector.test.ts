@@ -262,11 +262,21 @@ test("renderAmbientWidgetLine renders concise one-line indicators for running an
 		capturedAt: "2025-01-01T00:02:00.000Z",
 	};
 
-	const runningLines = renderAmbientWidgetLine({ snapshot: runningSnapshot, activeWorkflowCount: 1 }, 100, theme);
+	const runningLines = renderAmbientWidgetLine(
+		{
+			snapshot: runningSnapshot,
+			activeWorkflowCount: 1,
+			rootTurn: { elapsedMs: 120_000 },
+		},
+		120,
+		theme,
+	);
 	assert.equal(runningLines.length, 1);
 	assert.ok(runningLines[0]?.includes("2 running"));
 	assert.ok(runningLines[0]?.includes("1 queued"));
 	assert.ok(runningLines[0]?.includes("slots 2/4"));
+	assert.ok(runningLines[0]?.includes("root turn 2m00s"));
+	assert.ok(runningLines[0]?.includes("workflow"));
 	assert.ok(runningLines[0]?.includes("shift+up to inspect"));
 
 	const finishedSnapshot: TreeSnapshot = {
@@ -281,9 +291,19 @@ test("renderAmbientWidgetLine renders concise one-line indicators for running an
 		],
 	};
 
-	const finishedLines = renderAmbientWidgetLine({ snapshot: finishedSnapshot, activeWorkflowCount: 0 }, 100, theme);
+	const finishedLines = renderAmbientWidgetLine(
+		{
+			snapshot: finishedSnapshot,
+			activeWorkflowCount: 0,
+			rootTurn: { elapsedMs: 120_000 },
+		},
+		100,
+		theme,
+	);
 	assert.equal(finishedLines.length, 1);
 	assert.ok(finishedLines[0]?.includes("feature complete"));
+	assert.ok(finishedLines[0]?.includes("root turn 2m00s"));
+	assert.ok(finishedLines[0]?.includes("workflow 2m00s"));
 	assert.ok(finishedLines[0]?.includes("shift+up to inspect"));
 });
 

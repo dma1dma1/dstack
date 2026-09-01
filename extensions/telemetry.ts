@@ -1,10 +1,16 @@
 import { readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { ExecutionProvenance, WorkflowAssignment } from "./types.ts";
+import {
+	ROOT_TURN_ENTRY,
+	ROOT_TURN_SCHEMA_VERSION,
+	type ExecutionProvenance,
+	type RootTurnTelemetryRecord,
+	type WorkflowAssignment,
+} from "./types.ts";
 import type { WorkflowMode } from "./background/workflow.ts";
 
-export const TELEMETRY_SCHEMA_VERSION = "dstack.telemetry-report.v1" as const;
+export const TELEMETRY_SCHEMA_VERSION = "dstack.telemetry-report.v2" as const;
 
 export type QuantileDistribution = Readonly<{
 	count: number;
@@ -183,7 +189,7 @@ export type RecoverableAndMissingMetrics = Readonly<{
 	missingOrUnsupportedMetrics: readonly MetricLimitation[];
 }>;
 
-export type TelemetryReportV1 = Readonly<{
+export type TelemetryReportV2 = Readonly<{
 	schemaVersion: typeof TELEMETRY_SCHEMA_VERSION;
 	generatedAt: string;
 	reportPeriod: Readonly<{
@@ -193,6 +199,7 @@ export type TelemetryReportV1 = Readonly<{
 	workflowSelections: WorkflowSelectionCounts;
 	rolesAndModels: RolesAndModelsByPlaybook;
 	runtimeDistributions: RuntimeDistributions;
+	rootTurnLatency: QuantileDistribution;
 	ownerDelegationCohorts: OwnerDelegationCohorts;
 	provenance: TelemetryProvenanceSummary;
 	launchFailures: LaunchFailureSummary;
@@ -315,10 +322,13 @@ export type NormalizedQueueEventTelemetry =
 			occurredAt: string;
 	  }>;
 
+export type NormalizedRootTurnTelemetry = RootTurnTelemetryRecord;
+
 export type RawTelemetryData = Readonly<{
 	sessions: readonly NormalizedSessionTelemetry[];
 	workflows: readonly NormalizedWorkflowTelemetry[];
 	bindings: readonly NormalizedBindingTelemetry[];
+	rootTurns?: readonly NormalizedRootTurnTelemetry[];
 	queueEvents?: readonly NormalizedQueueEventTelemetry[];
 	duplicateQueueEventIds?: number;
 	excludedTestWorkflows?: number;
@@ -510,13 +520,14 @@ async function readJsonFileSafe(
 export async function scanSessions(
 	sessionsDir: string,
 	corruptTracker: { sessionFiles: number },
-): Promise<NormalizedSessionTelemetry[]> {
+): Promise<{ sessions: NormalizedSessionTelemetry[]; rootTurns: NormalizedRootTurnTelemetry[] }> {
 	const sessions: NormalizedSessionTelemetry[] = [];
+	const rootTurns: NormalizedRootTurnTelemetry[] = [];
 	let topEntries;
 	try {
 		topEntries = await readdir(sessionsDir, { withFileTypes: true });
 	} catch {
-		return sessions;
+		return { sessions, rootTurns };
 	}
 
 	for (const topEntry of topEntries) {
@@ -558,6 +569,13 @@ export async function scanSessions(
 						if (id !== undefined) sessionId = id;
 					}
 
+					if (type === "custom" && parsed["customType"] === ROOT_TURN_ENTRY) {
+						const rootTurn = parseRootTurnRecord(parsed["data"]);
+						if (rootTurn !== undefined) {
+							rootTurns.push(rootTurn);
+						}
+					}
+
 					const ts = parseDateMs(parsed["timestamp"]);
 					if (ts !== undefined) {
 						earliestMs = earliestMs === undefined ? ts : Math.min(earliestMs, ts);
@@ -593,7 +611,39 @@ export async function scanSessions(
 			}
 		}
 	}
-	return sessions;
+	return { sessions, rootTurns };
+}
+
+export function parseRootTurnRecord(value: unknown): NormalizedRootTurnTelemetry | undefined {
+	if (!isRecord(value) || value["schemaVersion"] !== ROOT_TURN_SCHEMA_VERSION) return undefined;
+	const startedAt = parseOptionalString(value["startedAt"]);
+	const endedAt = parseOptionalString(value["endedAt"]);
+	const durationMs = parseOptionalNumber(value["durationMs"]);
+	const provenance = parseOptionalString(value["provenance"]);
+	const startedAtMs = parseDateMs(startedAt);
+	const endedAtMs = parseDateMs(endedAt);
+
+	if (
+		startedAt === undefined ||
+		startedAtMs === undefined ||
+		endedAt === undefined ||
+		endedAtMs === undefined ||
+		endedAtMs < startedAtMs ||
+		durationMs === undefined ||
+		durationMs < 0 ||
+		Math.abs(endedAtMs - startedAtMs - durationMs) > 1_000 ||
+		(provenance !== "production" && provenance !== "test" && provenance !== "unknown")
+	) {
+		return undefined;
+	}
+
+	return {
+		schemaVersion: ROOT_TURN_SCHEMA_VERSION,
+		startedAt,
+		endedAt,
+		durationMs,
+		provenance,
+	};
 }
 
 function parseQueueEvent(value: unknown): NormalizedQueueEventTelemetry | undefined {
@@ -1152,7 +1202,7 @@ async function parseChildDirectory(input: {
 	};
 }
 
-export function aggregateTelemetry(data: RawTelemetryData): TelemetryReportV1 {
+export function aggregateTelemetry(data: RawTelemetryData): TelemetryReportV2 {
 	const { sessions, workflows, bindings } = data;
 	const corruptCounts = {
 		...data.corruptCounts,
@@ -1188,6 +1238,14 @@ export function aggregateTelemetry(data: RawTelemetryData): TelemetryReportV1 {
 		considerTimestamp(session.startedAt);
 		considerTimestamp(session.endedAt);
 	}
+
+	for (const turn of data.rootTurns ?? []) {
+		considerTimestamp(turn.startedAt);
+		considerTimestamp(turn.endedAt);
+	}
+
+	const rootTurnDurations = (data.rootTurns ?? []).map((t) => t.durationMs);
+	const rootTurnLatency = calculateQuantileDistribution(rootTurnDurations);
 
 	const knownWorkflowIds = new Set<string>();
 	for (const wf of workflows) {
@@ -1665,6 +1723,7 @@ export function aggregateTelemetry(data: RawTelemetryData): TelemetryReportV1 {
 	const recoverableMetrics = [
 		"Workflow selection counts partitioned by playbook, mode, and completion outcome for top-level owner workflows",
 		"Role and resolved model frequency mappings nested by playbook and aggregate across top-level and nested spawns",
+		"Completed root-turn wall-clock latency from user input receipt through final settlement",
 		"Runtime distributions with quantiles (min, median, p75, p90, p95, p99, max) partitioned by assignment role",
 		"Observational delegated-owner versus non-delegated-owner runtime cohorts",
 		"Observational associations between role/model pairs and failures, abandonment, and repeated delegation",
@@ -1739,6 +1798,7 @@ export function aggregateTelemetry(data: RawTelemetryData): TelemetryReportV1 {
 			unassigned: calculateQuantileDistribution(unassignedRuntimes),
 			all: calculateQuantileDistribution(allRuntimes),
 		},
+		rootTurnLatency,
 		ownerDelegationCohorts: {
 			delegatedOwners: {
 				count: delegatedOwnerCount,
@@ -1786,7 +1846,7 @@ export function aggregateTelemetry(data: RawTelemetryData): TelemetryReportV1 {
 	};
 }
 
-export async function collectTelemetryData(options?: TelemetryCollectOptions): Promise<TelemetryReportV1> {
+export async function collectTelemetryData(options?: TelemetryCollectOptions): Promise<TelemetryReportV2> {
 	const backgroundRoot = options?.backgroundRoot ?? defaultBackgroundRoot();
 	const sessionsDir = options?.sessionsDir ?? defaultSessionsDir();
 
@@ -1800,7 +1860,7 @@ export async function collectTelemetryData(options?: TelemetryCollectOptions): P
 		queueEventFiles: 0,
 	};
 
-	const [sessions, { workflows, bindings, queueEvents, duplicateQueueEventIds }] = await Promise.all([
+	const [{ sessions, rootTurns }, { workflows, bindings, queueEvents, duplicateQueueEventIds }] = await Promise.all([
 		scanSessions(sessionsDir, corruptCounts),
 		scanBackgroundArtifacts(backgroundRoot, corruptCounts),
 	]);
@@ -1809,6 +1869,7 @@ export async function collectTelemetryData(options?: TelemetryCollectOptions): P
 	const toMs = options?.timeWindow?.to ? parseDateMs(options.timeWindow.to) : undefined;
 
 	let filteredSessions = sessions;
+	let filteredRootTurns = rootTurns;
 	let filteredWorkflows = workflows;
 	let filteredQueueEvents = queueEvents;
 	let filteredBindings = bindings;
@@ -1818,6 +1879,14 @@ export async function collectTelemetryData(options?: TelemetryCollectOptions): P
 			if (!s.interval) return true;
 			if (fromMs !== undefined && s.interval.endMs < fromMs) return false;
 			if (toMs !== undefined && s.interval.startMs > toMs) return false;
+			return true;
+		});
+
+		filteredRootTurns = rootTurns.filter((turn) => {
+			const ms = parseDateMs(turn.startedAt);
+			if (ms === undefined) return false;
+			if (fromMs !== undefined && ms < fromMs) return false;
+			if (toMs !== undefined && ms > toMs) return false;
 			return true;
 		});
 
@@ -1842,6 +1911,7 @@ export async function collectTelemetryData(options?: TelemetryCollectOptions): P
 
 	const excludedTestWorkflows = options?.includeTests ? 0 : filteredWorkflows.filter((workflow) => workflow.provenance === "test").length;
 	if (!options?.includeTests) {
+		filteredRootTurns = filteredRootTurns.filter((turn) => turn.provenance !== "test");
 		filteredWorkflows = filteredWorkflows.filter((workflow) => workflow.provenance !== "test");
 		const includedWorkflowIds = new Set(filteredWorkflows.map((workflow) => workflow.workflowId));
 		filteredBindings = filteredBindings.filter((binding) => includedWorkflowIds.has(binding.workflowId));
@@ -1852,6 +1922,7 @@ export async function collectTelemetryData(options?: TelemetryCollectOptions): P
 		sessions: filteredSessions,
 		workflows: filteredWorkflows,
 		bindings: filteredBindings,
+		rootTurns: filteredRootTurns,
 		queueEvents: filteredQueueEvents,
 		duplicateQueueEventIds,
 		excludedTestWorkflows,

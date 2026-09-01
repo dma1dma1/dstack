@@ -607,6 +607,9 @@ export function computeWorkflowElapsed(snapshot: TreeSnapshot, nowMs: number): n
 export type AmbientStatus = Readonly<{
 	snapshot: TreeSnapshot;
 	activeWorkflowCount: number;
+	rootTurn?: Readonly<{
+		elapsedMs: number;
+	}>;
 }>;
 
 export function renderAmbientWidgetLine(
@@ -614,15 +617,19 @@ export function renderAmbientWidgetLine(
 	width: number,
 	theme: TreeTheme,
 ): string[] {
-	const { snapshot, activeWorkflowCount } = status;
+	const { snapshot, activeWorkflowCount, rootTurn } = status;
 	const label = snapshot.playbook ?? snapshot.mode;
-	const totalElapsed = formatElapsed(computeWorkflowElapsed(snapshot, Date.now()));
+	const workflowElapsed = formatElapsed(computeWorkflowElapsed(snapshot, Date.now()));
+
+	const durationSegment = rootTurn !== undefined
+		? `root turn ${formatElapsed(rootTurn.elapsedMs)} · workflow ${workflowElapsed}`
+		: `workflow ${workflowElapsed}`;
 
 	let text = "";
 	if (snapshot.committed && activeWorkflowCount > 0) {
 		const glyph = theme.fg("accent", "⛁");
 		const workflowLabel = activeWorkflowCount === 1 ? "workflow" : "workflows";
-		text = `${glyph} dstack · ${activeWorkflowCount} active ${workflowLabel} · slots ${snapshot.slots.active}/${snapshot.slots.capacity} · shift+up to inspect`;
+		text = `${glyph} dstack · ${durationSegment} · ${activeWorkflowCount} active ${workflowLabel} · slots ${snapshot.slots.active}/${snapshot.slots.capacity} · shift+up to inspect`;
 	} else if (snapshot.committed) {
 		const stateText = snapshot.counts.complete === snapshot.counts.total && snapshot.children.every((c) => c.state === "succeeded")
 			? "complete"
@@ -630,7 +637,7 @@ export function renderAmbientWidgetLine(
 		const glyph = snapshot.children.some((c) => c.state === "failed")
 			? theme.fg("error", "✗")
 			: theme.fg("success", "✓");
-		text = `${glyph} dstack · ${label} ${stateText} (${totalElapsed}) · shift+up to inspect`;
+		text = `${glyph} dstack · ${label} ${stateText} · ${durationSegment} · shift+up to inspect`;
 	} else {
 		const runningCount = snapshot.counts.running;
 		const queuedCount = snapshot.counts.queued;
@@ -640,7 +647,7 @@ export function renderAmbientWidgetLine(
 			: `${runningCount} running`;
 		const queuedSegment = queuedCount > 0 ? ` · ${queuedCount} queued` : "";
 		const slotsSegment = ` · slots ${snapshot.slots.active}/${snapshot.slots.capacity}`;
-		text = `${glyph} dstack · ${label} · ${runningSegment}${queuedSegment}${slotsSegment} · shift+up to inspect`;
+		text = `${glyph} dstack · ${label} · ${durationSegment} · ${runningSegment}${queuedSegment}${slotsSegment} · shift+up to inspect`;
 	}
 
 	return [truncateToWidth(text, Math.max(10, width))];

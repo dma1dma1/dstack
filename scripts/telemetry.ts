@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-import { collectTelemetryData, type TelemetryReportV1 } from "../extensions/telemetry.ts";
+import { collectTelemetryData, type TelemetryReportV2 } from "../extensions/telemetry.ts";
 
-export function formatReportHumanReadable(report: TelemetryReportV1): string {
+export function formatReportHumanReadable(report: TelemetryReportV2): string {
 	const lines: string[] = [];
 	lines.push(`dstack Telemetry Report (${report.schemaVersion})`);
 	lines.push(`Generated: ${report.generatedAt}`);
@@ -32,6 +32,7 @@ export function formatReportHumanReadable(report: TelemetryReportV1): string {
 			`   ${label.padEnd(12)} count=${d.count} min=${d.minMs.toFixed(0)} median=${d.medianMs.toFixed(0)} p75=${d.p75Ms.toFixed(0)} p90=${d.p90Ms.toFixed(0)} p95=${d.p95Ms.toFixed(0)} p99=${d.p99Ms.toFixed(0)} max=${d.maxMs.toFixed(0)} mean=${d.meanMs.toFixed(0)}`,
 		);
 	};
+	formatQuantiles("Root Turn", report.rootTurnLatency);
 	formatQuantiles("Owner", report.runtimeDistributions.owner);
 	formatQuantiles("Worker", report.runtimeDistributions.worker);
 	formatQuantiles("Reviewer", report.runtimeDistributions.reviewer);

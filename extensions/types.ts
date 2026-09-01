@@ -159,4 +159,30 @@ export const SESSION_REF_ENV = "DSTACK_SESSION_REF_FILE";
 export const MODE_ENTRY = "dstack-mode";
 export const TODO_ENTRY = "dstack-todos";
 export const ACTIVE_WORKFLOW_ENTRY = "dstack-active-workflow";
+export const ROOT_TURN_ENTRY = "dstack-root-turn";
+export const ROOT_TURN_SCHEMA_VERSION = "dstack.root-turn.v1";
+
+export type RootTurnTelemetryRecord = Readonly<{
+	schemaVersion: typeof ROOT_TURN_SCHEMA_VERSION;
+	startedAt: string;
+	endedAt: string;
+	durationMs: number;
+	provenance: ExecutionProvenance;
+}>;
+
+export type RootTurnState =
+	| Readonly<{
+			status: "idle";
+			lastCompleted?: Readonly<{
+				startedAt: string;
+				endedAt: string;
+				durationMs: number;
+			}>;
+	  }>
+	| Readonly<{
+			status: "active";
+			startedAt: string;
+			receiptMs: number;
+			pendingTaskIds: ReadonlySet<string>;
+	  }>;
 export const DEFAULT_WORKTREE_BASE = "~/.dma/worktrees";

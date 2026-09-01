@@ -10,7 +10,7 @@ import {
 	mergeTimeIntervals,
 	totalMergedDurationMs,
 	type RawTelemetryData,
-	type TelemetryReportV1,
+	type TelemetryReportV2,
 } from "../extensions/telemetry.ts";
 import { formatReportHumanReadable, runTelemetryCli } from "../scripts/telemetry.ts";
 
@@ -62,7 +62,7 @@ test("mergeTimeIntervals coalesces overlapping intervals and prevents double cou
 	assert.equal(totalMs, 1500 + 1000); // 2500ms
 });
 
-test("aggregateTelemetry produces TelemetryReportV1 with top-level owner selection filtering, delegation cohorts, and join reliability", () => {
+test("aggregateTelemetry produces TelemetryReportV2 with top-level owner selection filtering, delegation cohorts, and join reliability", () => {
 	const rawData: RawTelemetryData = {
 		sessions: [
 			{
@@ -291,7 +291,7 @@ test("aggregateTelemetry produces TelemetryReportV1 with top-level owner selecti
 	const report = aggregateTelemetry(rawData);
 
 	// 1. Schema version
-	assert.equal(report.schemaVersion, "dstack.telemetry-report.v1");
+	assert.equal(report.schemaVersion, "dstack.telemetry-report.v2");
 
 	// 2. Workflow selection counts ONLY from top-level owner workflows (wf-1 and wf-2, NOT wf-3-worker)
 	assert.equal(report.workflowSelections.totalWorkflows, 2);
@@ -404,6 +404,33 @@ test("privacy guarantee: telemetry parser strictly ignores private files and fie
 				role: "user",
 				content: "SECRET USER PROMPT CONTENT DO NOT LEAK",
 				timestamp: "2026-08-25T12:01:00.000Z",
+			}) +
+			"\n" +
+			JSON.stringify({
+				type: "custom",
+				customType: "dstack-root-turn",
+				data: {
+					schemaVersion: "dstack.root-turn.v1",
+					startedAt: "2026-08-25T12:00:00.000Z",
+					endedAt: "2026-08-25T12:05:00.000Z",
+					durationMs: 300000,
+					provenance: "production",
+					secretPrompt: "SECRET ROOT TURN PROMPT",
+				},
+				timestamp: "2026-08-25T12:05:00.000Z",
+			}) +
+			"\n" +
+			JSON.stringify({
+				type: "custom",
+				customType: "dstack-root-turn",
+				data: {
+					schemaVersion: "dstack.root-turn.v1",
+					startedAt: "2026-08-25T12:00:00.000Z",
+					endedAt: "2026-08-25T12:02:00.000Z",
+					durationMs: 120000,
+					provenance: "test",
+				},
+				timestamp: "2026-08-25T12:02:00.000Z",
 			}) +
 			"\n" +
 			JSON.stringify({ type: "session_end", timestamp: "2026-08-25T12:05:00.000Z" }) +
@@ -523,6 +550,7 @@ test("privacy guarantee: telemetry parser strictly ignores private files and fie
 
 	const serialized = JSON.stringify(report);
 	assert.ok(!serialized.includes("SECRET USER PROMPT CONTENT"));
+	assert.ok(!serialized.includes("SECRET ROOT TURN PROMPT"));
 	assert.ok(!serialized.includes("SECRET TASK INSTRUCTION"));
 	assert.ok(!serialized.includes("SECRET SYSTEM PROMPT"));
 	assert.ok(!serialized.includes("SECRET ASSISTANT PROSE"));
@@ -539,6 +567,24 @@ test("privacy guarantee: telemetry parser strictly ignores private files and fie
 	assert.ok(!serialized.includes("SECRET QUEUE TASK"));
 	assert.equal(report.queueEvents.matchedAcquisitions, 1);
 	assert.equal(report.queueEvents.waitTime.medianMs, 2000);
+	assert.equal(report.rootTurnLatency.count, 1);
+	assert.equal(report.rootTurnLatency.medianMs, 300000);
+
+	const windowReport = await collectTelemetryData({
+		backgroundRoot: bgRoot,
+		sessionsDir: sessRoot,
+		timeWindow: { to: "2026-08-25T11:59:00.000Z" },
+	});
+	assert.equal(windowReport.rootTurnLatency.count, 0);
+
+	const allReport = await collectTelemetryData({
+		backgroundRoot: bgRoot,
+		sessionsDir: sessRoot,
+		includeTests: true,
+	});
+	assert.equal(allReport.rootTurnLatency.count, 2);
+	assert.equal(allReport.rootTurnLatency.minMs, 120000);
+	assert.equal(allReport.rootTurnLatency.maxMs, 300000);
 
 	// Check runtime used top-level startedAt/endedAt (12:00 to 12:04 = 240,000ms)
 	assert.equal(report.runtimeDistributions.owner.medianMs, 240000);
@@ -765,8 +811,8 @@ test("collector excludes explicit and historical fixture tests while separating 
 });
 
 test("CLI handles --help, human-readable formatting, and JSON output", async () => {
-	const report: TelemetryReportV1 = {
-		schemaVersion: "dstack.telemetry-report.v1",
+	const report: TelemetryReportV2 = {
+		schemaVersion: "dstack.telemetry-report.v2",
 		generatedAt: "2026-08-25T12:00:00.000Z",
 		reportPeriod: {
 			earliestTimestamp: "2026-08-25T10:00:00.000Z",
@@ -789,6 +835,7 @@ test("CLI handles --help, human-readable formatting, and JSON output", async () 
 			unassigned: calculateQuantileDistribution([]),
 			all: calculateQuantileDistribution([10000, 5000]),
 		},
+		rootTurnLatency: calculateQuantileDistribution([15000]),
 		ownerDelegationCohorts: {
 			delegatedOwners: {
 				count: 1,
@@ -882,6 +929,7 @@ test("CLI handles --help, human-readable formatting, and JSON output", async () 
 
 	const formatted = formatReportHumanReadable(report);
 	assert.ok(formatted.includes("dstack Telemetry Report"));
+	assert.ok(formatted.includes("Root Turn"));
 	assert.ok(formatted.includes("1. Workflow Selections (Top-Level Owner Workflows):"));
 	assert.ok(formatted.includes("4. Owner Delegation Cohorts (Observational):"));
 	assert.ok(formatted.includes("5. Provenance and Launch Failures:"));
