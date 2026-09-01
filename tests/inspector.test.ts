@@ -1825,7 +1825,12 @@ test("AgentInspector grows frame and view budgets on tall viewports", async () =
 		capturedAt: "2025-01-01T00:01:00.000Z",
 	};
 
-	const inspector = new AgentInspector({ requestRender: () => {} }, plainTheme(), () => {}, {
+	let onRender: (() => void) | undefined;
+	const ready = new Promise<void>((resolve) => {
+		onRender = resolve;
+	});
+
+	const inspector = new AgentInspector({ requestRender: () => onRender?.() }, plainTheme(), () => {}, {
 		sessionId: "test-sess",
 		initialTaskId: "task-tall",
 		terminalRows: 60,
@@ -1844,7 +1849,7 @@ test("AgentInspector grows frame and view budgets on tall viewports", async () =
 		getSnapshot: async () => snapshot,
 	});
 
-	await new Promise((r) => setTimeout(r, 20));
+	await ready;
 
 	assert.equal(inspector.layoutMetrics.terminalRows, 60);
 	assert.equal(inspector.layoutMetrics.frameHeight, 54);
@@ -1854,27 +1859,27 @@ test("AgentInspector grows frame and view budgets on tall viewports", async () =
 	assert.equal(summaryLines.length, 54);
 	assert.ok(summaryLines[0]?.includes("╭"));
 	assert.ok(summaryLines[summaryLines.length - 1]?.includes("╰"));
-	assert.ok(summaryLines[summaryLines.length - 2]?.includes("Esc/← back"));
+	assert.ok(summaryLines[summaryLines.length - 2]?.includes("wheel/PgUp/PgDn scroll"));
 
 	inspector.handleInput("t");
 	const taskLines = inspector.render(100);
 	assert.equal(taskLines.length, 54);
-	assert.ok(taskLines[taskLines.length - 2]?.includes("Esc/← back"));
+	assert.ok(taskLines[taskLines.length - 2]?.includes("wheel/PgUp/PgDn scroll"));
 
 	inspector.handleInput("f");
 	const finalLines = inspector.render(100);
 	assert.equal(finalLines.length, 54);
-	assert.ok(finalLines[finalLines.length - 2]?.includes("Esc/← back"));
+	assert.ok(finalLines[finalLines.length - 2]?.includes("wheel/PgUp/PgDn scroll"));
 
 	inspector.handleInput("o");
 	const rawLines = inspector.render(100);
 	assert.equal(rawLines.length, 54);
-	assert.ok(rawLines[rawLines.length - 2]?.includes("Esc/← back"));
+	assert.ok(rawLines[rawLines.length - 2]?.includes("wheel/keys"));
 
 	inspector.handleInput("\x1b[D");
 	const listLines = inspector.render(100);
 	assert.equal(listLines.length, 54);
-	assert.ok(listLines[listLines.length - 2]?.includes("Esc/q close"));
+	assert.ok(listLines[listLines.length - 2]?.includes("↑/↓ select"));
 
 	inspector.dispose();
 });
@@ -1907,7 +1912,12 @@ test("AgentInspector bounds frame and preserves borders, footer, and scrolling o
 		capturedAt: "2025-01-01T00:01:00.000Z",
 	};
 
-	const inspector = new AgentInspector({ requestRender: () => {} }, plainTheme(), () => {}, {
+	let onRender: (() => void) | undefined;
+	const ready = new Promise<void>((resolve) => {
+		onRender = resolve;
+	});
+
+	const inspector = new AgentInspector({ requestRender: () => onRender?.() }, plainTheme(), () => {}, {
 		sessionId: "test-sess",
 		terminalRows: 15,
 		listWorkflows: async () => [
@@ -1925,7 +1935,7 @@ test("AgentInspector bounds frame and preserves borders, footer, and scrolling o
 		getSnapshot: async () => snapshot,
 	});
 
-	await new Promise((r) => setTimeout(r, 20));
+	await ready;
 
 	assert.equal(inspector.layoutMetrics.terminalRows, 15);
 	assert.equal(inspector.layoutMetrics.frameHeight, 13);
@@ -1936,7 +1946,7 @@ test("AgentInspector bounds frame and preserves borders, footer, and scrolling o
 	assert.equal(initialList.length, 13);
 	assert.ok(initialList[0]?.includes("╭"));
 	assert.ok(initialList[12]?.includes("╰"));
-	assert.ok(initialList[11]?.includes("Esc/q close"));
+	assert.ok(initialList[11]?.includes("↑/↓ select"));
 
 	inspector.handleInput("\x1b[B");
 	inspector.handleInput("\x1b[B");
@@ -1948,26 +1958,26 @@ test("AgentInspector bounds frame and preserves borders, footer, and scrolling o
 	assert.equal(scrolledList.length, 13);
 	assert.ok(scrolledList[0]?.includes("╭"));
 	assert.ok(scrolledList[12]?.includes("╰"));
-	assert.ok(scrolledList[11]?.includes("Esc/q close"));
+	assert.ok(scrolledList[11]?.includes("↑/↓ select"));
 
 	inspector.handleInput("\r");
 	const smallDetail = inspector.render(100);
 	assert.equal(smallDetail.length, 13);
 	assert.ok(smallDetail[0]?.includes("╭"));
 	assert.ok(smallDetail[12]?.includes("╰"));
-	assert.ok(smallDetail[11]?.includes("Esc/← back"));
+	assert.ok(smallDetail[11]?.includes("wheel/PgUp/PgDn scroll"));
 
 	inspector.handleInput("\x1b[B");
 	inspector.handleInput("\x1b[B");
 	const scrolledDetail = inspector.render(100);
 	assert.equal(scrolledDetail.length, 13);
-	assert.ok(scrolledDetail[11]?.includes("Esc/← back"));
+	assert.ok(scrolledDetail[11]?.includes("wheel/PgUp/PgDn scroll"));
 
 	inspector.handleInput("f");
 	const smallFinal = inspector.render(100);
 	assert.equal(smallFinal.length, 13);
 	assert.ok(smallFinal[9]?.includes("lines 1-1 of 1"));
-	assert.ok(smallFinal[11]?.includes("Esc/← back"));
+	assert.ok(smallFinal[11]?.includes("wheel/PgUp/PgDn scroll"));
 	assert.ok(smallFinal[12]?.includes("╰"));
 
 	inspector.dispose();
