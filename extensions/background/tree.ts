@@ -31,9 +31,29 @@ export {
 
 export const STALE_ACTIVITY_THRESHOLD_MS = 120_000;
 
-function isFreshActivity(updatedAt: string, nowMs: number): boolean {
+/**
+ * A live process sitting in an unfinished tool call is working, not wedged: a
+ * test suite, build, or wide grep records its journal entry when the call
+ * starts and nothing more until it returns, so the ordinary threshold reads a
+ * healthy child as stale. Such a child only counts as stale once the tool call
+ * itself has run absurdly long, which keeps a genuinely hung tool detectable.
+ */
+export const IN_FLIGHT_TOOL_STALE_THRESHOLD_MS = 15 * 60_000;
+
+function isFreshActivity(updatedAt: string, nowMs: number, thresholdMs = STALE_ACTIVITY_THRESHOLD_MS): boolean {
 	const updatedMs = Date.parse(updatedAt);
-	return Number.isFinite(updatedMs) && nowMs - updatedMs <= STALE_ACTIVITY_THRESHOLD_MS;
+	return Number.isFinite(updatedMs) && nowMs - updatedMs <= thresholdMs;
+}
+
+/** True when the newest journal entry is a tool call that has not reported a result yet. */
+function hasToolCallInFlight(journal: readonly JournalEntry[] | undefined): boolean {
+	const last = journal?.at(-1);
+	return last !== undefined && last.kind === "tool" && last.result === undefined;
+}
+
+/** Staleness budget for a running child: longer while a live process awaits a tool result. */
+function staleThresholdMs(live: boolean, journal: readonly JournalEntry[] | undefined): number {
+	return live && hasToolCallInFlight(journal) ? IN_FLIGHT_TOOL_STALE_THRESHOLD_MS : STALE_ACTIVITY_THRESHOLD_MS;
 }
 
 function semanticStatusText(status: SemanticStatus): string | undefined {
@@ -1339,7 +1359,7 @@ export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<
 			}
 
 			const staleTimestamp = latestUpdatedAt ?? startedAt ?? manifest.createdAt;
-			stale = !isFreshActivity(staleTimestamp, nowMs);
+			stale = !isFreshActivity(staleTimestamp, nowMs, staleThresholdMs(liveLease !== undefined, journal));
 
 			if (latestActivityText !== undefined && latestUpdatedAt !== undefined) {
 				activityRecordObj = { text: latestActivityText, updatedAt: latestUpdatedAt };
@@ -1372,8 +1392,9 @@ export async function buildTreeSnapshot(input: BuildTreeSnapshotInput): Promise<
 
 				const staleTimestamp = nestedUpdatedAt || spawnChild.startedAt || spawnRecord.createdAt;
 				const childUpdatedMs = Date.parse(staleTimestamp);
+				const nestedThresholdMs = staleThresholdMs(matchLease !== undefined, spawnChild.journal);
 				const isStale = spawnChild.state === "running" && (
-					!Number.isNaN(childUpdatedMs) && nowMs - childUpdatedMs > STALE_ACTIVITY_THRESHOLD_MS
+					!Number.isNaN(childUpdatedMs) && nowMs - childUpdatedMs > nestedThresholdMs
 				);
 
 				const model = spawnChild.model ?? (

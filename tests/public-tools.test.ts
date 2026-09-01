@@ -281,10 +281,16 @@ test("root task returns a receipt before the runner completes and dstack_result 
 	assert.equal(afterBreakerDetails.supervision?.wakeReason.kind, "nonblocking", "an explicit zero wait remains nonblocking after the breaker trips");
 	assert.equal(afterBreakerDetails.supervision?.breaker, "tripped", "the breaker remains visible as telemetry");
 
-	const bounded = await resultTool.execute("result-bounded", { taskId: receipt.taskId, waitSeconds: 1 }, undefined, undefined, runtime.ctx);
+	const startedAt = Date.now();
+	const bounded = await resultTool.execute("result-bounded", { taskId: receipt.taskId, waitSeconds: 5 }, undefined, undefined, runtime.ctx);
 	const boundedDetails = bounded.details as typeof runningDetails;
 	assert.equal(boundedDetails.kind, "running");
-	assert.equal(boundedDetails.supervision?.wakeReason.kind, "wait_elapsed", "bounded root wait must expose an explicit wake reason");
+	assert.equal(
+		boundedDetails.supervision?.wakeReason.kind,
+		"nonblocking",
+		"an explicit waitSeconds must not block a root read, which would pin the root turn",
+	);
+	assert.ok(Date.now() - startedAt < 2000, "a root read must return immediately regardless of waitSeconds");
 
 	const artifactDir = join(home, ".pi", "agent", "dstack", "background", "public-tools-session", "workflows", receipt.workflowId);
 	const manifestBytes = await readFile(join(artifactDir, "manifest.json"));
@@ -1659,6 +1665,20 @@ test("shouldTriggerStaleWake ignores a stale owner while nested workers are acti
 		},
 		control,
 	}), true);
+
+	// The snapshot weighs process liveness and in-flight tool calls before setting
+	// `stale`; re-deriving staleness from updatedAt alone would override that
+	// verdict and wake the root on a worker that is mid-way through a long tool call.
+	assert.equal(shouldTriggerStaleWake({
+		snapshot: {
+			...snapshot,
+			children: [{
+				...snapshot.children[0]!,
+				nested: [{ ...nested, updatedAt: "2025-01-01T00:03:00.000Z" }],
+			}],
+		},
+		control,
+	}), false, "a nested child the snapshot did not mark stale must not trigger a wake");
 });
 
 test("completion wake and recovery decision helpers enforce dedupe and bounded-retry invariants", () => {
@@ -1823,8 +1843,10 @@ test("stale-parent wake-up triggers one hidden follow-up and survives session re
 	assert.equal(sent.message.display, false);
 	assert.equal(sent.options.deliverAs, "followUp");
 	assert.equal(sent.options.triggerTurn, true);
-	assert.match(sent.message.content, /inactive for more than 2 minutes and may be stale/);
+	assert.match(sent.message.content, /no recorded activity for more than 2 minutes and may be stale/);
 	assert.match(sent.message.content, /dstack_result.*dstack_kill/);
+	assert.match(sent.message.content, /returns immediately/, "the wake must not invite a blocking wait that pins the root turn");
+	assert.doesNotMatch(sent.message.content, /continue waiting/);
 
 	const restored = restoreStaleWakes(runtime.entries.map((e) => ({
 		type: "custom",

@@ -311,7 +311,6 @@ export function shouldTriggerStaleWake(input: {
 	if (input.snapshot.committed) return false;
 	if (!input.control.isIdle || input.control.hasPendingMessages) return false;
 
-	const capturedAtMs = Date.parse(input.snapshot.capturedAt);
 	const liveDescendantLeases = input.activeLeases === undefined
 		? 0
 		: countLiveDescendantLeases(input.activeLeases, { workflowId: input.snapshot.workflowId });
@@ -325,11 +324,10 @@ export function shouldTriggerStaleWake(input: {
 			// scheduler is not stale, even when no nested records are visible.
 			return child.stale === true && liveDescendantLeases === 0;
 		}
-		return runningNested.some((nested) => {
-			if (nested.stale === true) return true;
-			const updatedAtMs = Date.parse(nested.updatedAt);
-			return !Number.isFinite(capturedAtMs) || !Number.isFinite(updatedAtMs) || capturedAtMs - updatedAtMs > STALE_ACTIVITY_THRESHOLD_MS;
-		});
+		// The snapshot is the single source of truth for staleness: it weighs
+		// process liveness and in-flight tool calls, which a bare timestamp
+		// comparison here cannot see and would false-positive on.
+		return runningNested.some((nested) => nested.stale === true);
 	});
 	if (!hasStaleChild) return false;
 
@@ -367,7 +365,7 @@ export function nextStaleWakeAttempt(existing: StaleWakeRecord | undefined, curr
 
 export function formatStaleWakePrompt(taskId: string): string {
 	const staleMinutes = STALE_ACTIVITY_THRESHOLD_MS / 60_000;
-	return `Task "${taskId}" has a child that has been inactive for more than ${staleMinutes} minutes and may be stale. Call dstack_result with taskId "${taskId}" to inspect elapsed time, usage, and recent journal activity, then decide whether to continue waiting or call dstack_kill if it is unrecoverable.`;
+	return `Task "${taskId}" has a child with no recorded activity for more than ${staleMinutes} minutes and may be stale. Call dstack_result with taskId "${taskId}" to inspect elapsed time, usage, and recent journal activity; the read returns immediately. If the task is still making progress, end your turn without waiting — you are woken again when it commits or goes stale again. Call dstack_kill only if it is unrecoverable.`;
 }
 
 export function restoreStaleWakes(entries: readonly SessionEntryLike[]): Map<string, StaleWakeRecord> {
