@@ -62,7 +62,26 @@ import {
 	saveTodos,
 	todoFilePath,
 } from "./todo.ts";
-import { ACTIVE_WORKFLOW_ENTRY, MAX_PARALLEL_TASKS, MODE_ENTRY, NESTING_ENV, SESSION_REF_ENV, STATUS_FILE_ENV, THINKING_LEVELS, type ActiveWorkflow, type ChildDepth, type ModelRef, type ModeState, type RoleValue, type ThinkingLevel, type TodoState } from "./types.ts";
+import {
+	ACTIVE_WORKFLOW_ENTRY,
+	executionProvenance,
+	MAX_PARALLEL_TASKS,
+	MODE_ENTRY,
+	NESTING_ENV,
+	ROOT_TURN_ENTRY,
+	ROOT_TURN_SCHEMA_VERSION,
+	SESSION_REF_ENV,
+	STATUS_FILE_ENV,
+	THINKING_LEVELS,
+	type ActiveWorkflow,
+	type ChildDepth,
+	type ModelRef,
+	type ModeState,
+	type RoleValue,
+	type RootTurnState,
+	type ThinkingLevel,
+	type TodoState,
+} from "./types.ts";
 import { createEventBusV1Port, type BackgroundTaskPort, type CompanionTaskState } from "./background/eventbus-v1.ts";
 import { createTaskResultFiles, launchTaskGroup, sessionRoot } from "./background/launch.ts";
 import { atomicWriteFile } from "./background/artifacts.ts";
@@ -472,6 +491,36 @@ export default function dstack(pi: ExtensionAPI) {
 	const recoveryInFlight = new Set<string>();
 	let treePollGeneration = 0;
 	const transcriptProgress = new TranscriptProgressTracker();
+	let rootTurnState: RootTurnState = { status: "idle" };
+
+	function currentRootTurnAmbient(): { elapsedMs: number } | undefined {
+		if (rootTurnState.status === "active") {
+			return {
+				elapsedMs: Math.max(0, Date.now() - rootTurnState.receiptMs),
+			};
+		}
+		if (rootTurnState.status === "idle" && rootTurnState.lastCompleted !== undefined) {
+			return {
+				elapsedMs: rootTurnState.lastCompleted.durationMs,
+			};
+		}
+		return undefined;
+	}
+
+	function updatePendingRootTasks(update: (taskIds: Set<string>) => void): void {
+		if (rootTurnState.status !== "active") return;
+		const pendingTaskIds = new Set(rootTurnState.pendingTaskIds);
+		update(pendingTaskIds);
+		rootTurnState = { ...rootTurnState, pendingTaskIds };
+	}
+
+	function trackRootTask(taskId: string): void {
+		updatePendingRootTasks((taskIds) => taskIds.add(taskId));
+	}
+
+	function settleRootTask(taskId: string): void {
+		updatePendingRootTasks((taskIds) => taskIds.delete(taskId));
+	}
 
 	function stopTreeTimer() {
 		treePollGeneration += 1;
@@ -734,6 +783,7 @@ export default function dstack(pi: ExtensionAPI) {
 			ambientStatus = {
 				snapshot,
 				activeWorkflowCount,
+				rootTurn: currentRootTurnAmbient(),
 			};
 			statusTree = snapshot;
 			await publishMachineStatus();
@@ -977,6 +1027,10 @@ export default function dstack(pi: ExtensionAPI) {
 					port,
 				});
 				persistLineage({ ...lineage, currentTaskId: receipt.taskId, attempts, status: "active" });
+				updatePendingRootTasks((taskIds) => {
+					taskIds.delete(taskId);
+					taskIds.add(receipt.taskId);
+				});
 				persistActiveWorkflow({ taskId: receipt.taskId, playbook: lineage.playbook ?? activeWorkflow?.playbook ?? "" });
 				if (launchCtx !== undefined) startTreePolling(receipt.taskId, receipt.workflowId, launchCtx);
 				pi.sendMessage(
@@ -1106,6 +1160,7 @@ export default function dstack(pi: ExtensionAPI) {
 		currentNestedTaskId = undefined;
 		taskTerminalState = undefined;
 		stopCostTimer();
+		rootTurnState = { status: "idle" };
 		ambientStatus = undefined;
 		treeLastTaskId = undefined;
 		treeLastWorkflowId = undefined;
@@ -1175,6 +1230,7 @@ export default function dstack(pi: ExtensionAPI) {
 			}
 		}
 		stopTreeTimer();
+		rootTurnState = { status: "idle" };
 		ambientStatus = undefined;
 		treeLastTaskId = undefined;
 		treeLastWorkflowId = undefined;
@@ -1183,6 +1239,17 @@ export default function dstack(pi: ExtensionAPI) {
 		if (ctx.hasUI && typeof ctx.ui.setWidget === "function") {
 			ctx.ui.setWidget("dstack-tree", undefined);
 		}
+	});
+
+	pi.on("input", async (event) => {
+		if (isChild || event.source === "extension" || rootTurnState.status === "active") return;
+		const receiptMs = Date.now();
+		rootTurnState = {
+			status: "active",
+			startedAt: new Date(receiptMs).toISOString(),
+			receiptMs,
+			pendingTaskIds: new Set(),
+		};
 	});
 
 	pi.on("agent_start", async () => {
@@ -1213,6 +1280,35 @@ export default function dstack(pi: ExtensionAPI) {
 	pi.on("agent_settled", async () => {
 		rootState = "idle";
 		await publishMachineStatus();
+		if (!isChild && rootTurnState.status === "active") {
+			if (rootTurnState.pendingTaskIds.size === 0) {
+				const endedAt = new Date().toISOString();
+				const durationMs = Math.max(0, Date.now() - rootTurnState.receiptMs);
+				const provenance = executionProvenance();
+				pi.appendEntry(ROOT_TURN_ENTRY, {
+					schemaVersion: ROOT_TURN_SCHEMA_VERSION,
+					startedAt: rootTurnState.startedAt,
+					endedAt,
+					durationMs,
+					provenance,
+				});
+				rootTurnState = {
+					status: "idle",
+					lastCompleted: {
+						startedAt: rootTurnState.startedAt,
+						endedAt,
+						durationMs,
+					},
+				};
+				if (ambientStatus) {
+					ambientStatus = {
+						...ambientStatus,
+						rootTurn: currentRootTurnAmbient(),
+					};
+					if (lastContext) updateTreeWidget(lastContext);
+				}
+			}
+		}
 	});
 
 	pi.on("before_agent_start", async (_event, ctx) => {
@@ -1272,6 +1368,7 @@ export default function dstack(pi: ExtensionAPI) {
 		eventBusPort?.close();
 		eventBusPort = undefined;
 		nestedTaskRegistry.clear();
+		rootTurnState = { status: "idle" };
 		stopTreeTimer();
 		ambientStatus = undefined;
 		if (ctx?.hasUI && typeof ctx.ui.setWidget === "function") {
@@ -1605,6 +1702,7 @@ export default function dstack(pi: ExtensionAPI) {
 							});
 						}
 					}
+					trackRootTask(receipt.taskId);
 					startTreePolling(receipt.taskId, receipt.workflowId, ctx);
 					await publishMachineStatus();
 					return { ...textResult(JSON.stringify(receipt), receipt), terminate: true };
@@ -1801,6 +1899,7 @@ export default function dstack(pi: ExtensionAPI) {
 			if (terminal) {
 				taskTerminalState = result.kind === "cancelled" ? "cancelled" : result.kind === "runner_failed" ? "failed" : "completed";
 			}
+			if (terminal) settleRootTask(params.taskId);
 			if (activeWorkflow?.taskId === params.taskId && terminal) {
 				if (ctx) lastContext = ctx;
 				await pollTreeTick();
@@ -1914,6 +2013,7 @@ export default function dstack(pi: ExtensionAPI) {
 				}
 
 				if (task.status === "completed" || task.status === "failed" || task.status === "killed") {
+					settleRootTask(params.taskId);
 					const killRes: DstackKillResult = {
 						taskId: params.taskId,
 						status: "already_terminal",
@@ -1924,6 +2024,7 @@ export default function dstack(pi: ExtensionAPI) {
 
 				try {
 					await port.kill(params.taskId, signal);
+					settleRootTask(params.taskId);
 					const killRes: DstackKillResult = {
 						taskId: params.taskId,
 						status: "killed",

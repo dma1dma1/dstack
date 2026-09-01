@@ -229,6 +229,7 @@ test("root task returns a receipt before the runner completes and dstack_result 
 
 	const runtime = testRuntime(events);
 	await runtime.handlers.get("session_start")?.({}, runtime.ctx);
+	await runtime.handlers.get("input")?.({ text: "execute tasks", source: "interactive" }, runtime.ctx);
 	const taskTool = runtime.tools.get("dstack_task");
 	const resultTool = runtime.tools.get("dstack_result");
 	assert.ok(taskTool);
@@ -241,6 +242,8 @@ test("root task returns a receipt before the runner completes and dstack_result 
 		],
 	}, undefined, undefined, runtime.ctx);
 	assert.equal(receiptResult.terminate, true);
+	await runtime.handlers.get("agent_settled")?.({}, runtime.ctx);
+	assert.equal(runtime.entries.filter((e) => e.customType === "dstack-root-turn").length, 0);
 	const receipt = receiptResult.details as { taskId: string; workflowId: string; mode: string; childCount: number; resultTool: string };
 	assert.deepEqual(receipt, {
 		taskId: "bg-public-tools",
@@ -302,6 +305,11 @@ test("root task returns a receipt before the runner completes and dstack_result 
 
 	const completed = await resultTool.execute("result-complete", { taskId: receipt.taskId }, undefined, undefined, runtime.ctx);
 	assert.equal((completed.details as { kind: string }).kind, "complete");
+	await runtime.handlers.get("agent_settled")?.({}, runtime.ctx);
+	const turnEntries = runtime.entries.filter((e) => e.customType === "dstack-root-turn");
+	assert.equal(turnEntries.length, 1);
+	assert.equal((turnEntries[0]?.data as { schemaVersion: string }).schemaVersion, "dstack.root-turn.v1");
+	assert.ok((turnEntries[0]?.data as { durationMs: number }).durationMs >= 0);
 	assert.deepEqual(
 		(completed.details as { package: { results: Array<{ summary: string }> } }).package.results.map((item) => item.summary),
 		["done:first", "done:second"],
