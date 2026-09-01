@@ -392,7 +392,7 @@ test("real runner launches from an unrelated cwd and exits zero after child fail
 	const root = await temporaryDirectory(t);
 	const unrelated = await temporaryDirectory(t);
 	const fake = join(root, "fake-pi.mjs");
-	await writeFile(fake, `const task = process.argv.at(-1).slice(6);\nconsole.log(JSON.stringify({type:"message_end",message:{role:"assistant",content:[{type:"text",text:task}]}}));\nif (task === "domain-failure") process.exitCode = 9;\n`, { mode: 0o700 });
+	await writeFile(fake, `const task = process.argv.at(-1).slice(6);\nconsole.log(JSON.stringify({type:"message_end",message:{role:"assistant",content:[{type:"text",text:task}]}}));\nawait new Promise((resolve) => setTimeout(resolve, 200));\nif (task === "domain-failure") process.exitCode = 9;\n`, { mode: 0o700 });
 	await chmod(fake, 0o700);
 	const node = await realpath(process.execPath);
 	const artifactDir = join(root, "artifacts");
@@ -415,16 +415,21 @@ test("concurrent runner processes share one four-child scheduler", async (t) => 
 	const root = await temporaryDirectory(t);
 	const schedulerRoot = join(root, "scheduler");
 	const activeDir = join(root, "active");
+	const releaseFile = join(root, "release");
 	await mkdir(activeDir, { recursive: true });
 	const fake = join(root, "fake-pi.mjs");
 	await writeFile(
 		fake,
 		[
-			`import { writeFileSync, unlinkSync } from "node:fs";`,
+			`import { existsSync, unlinkSync, writeFileSync } from "node:fs";`,
 			`import { join } from "node:path";`,
 			`const marker = join(process.env.DSTACK_TEST_ACTIVE_DIR, String(process.pid));`,
 			`writeFileSync(marker, "active");`,
-			`await new Promise((resolve) => setTimeout(resolve, 500));`,
+			`const releaseFile = process.env.DSTACK_TEST_RELEASE_FILE;`,
+			`while (!existsSync(releaseFile)) {`,
+			`	await new Promise((resolve) => setTimeout(resolve, 10));`,
+			`}`,
+			`await new Promise((resolve) => setTimeout(resolve, 200));`,
 			`const task = process.argv.at(-1).slice(6);`,
 			`process.stdout.write(JSON.stringify({type:"message_end",message:{role:"assistant",content:[{type:"text",text:task}]}}) + "\\n");`,
 			`unlinkSync(marker);`,
@@ -459,23 +464,27 @@ test("concurrent runner processes share one four-child scheduler", async (t) => 
 		};
 	}));
 	const running = runnerCommands.map(({ args }) =>
-		execFileAsync(node, args, { env: { ...process.env, DSTACK_TEST_ACTIVE_DIR: activeDir } }),
+		execFileAsync(node, args, {
+			env: {
+				...process.env,
+				DSTACK_TEST_ACTIVE_DIR: activeDir,
+				DSTACK_TEST_RELEASE_FILE: releaseFile,
+			},
+		}),
 	);
-	let complete = false;
 	let peak = 0;
-	const monitor = (async () => {
-		while (!complete) {
-			peak = Math.max(peak, (await readdir(activeDir)).length);
-			await sleep(2);
-		}
-	})();
-	let outputs: Awaited<(typeof running)[number]>[];
 	try {
-		outputs = await Promise.all(running);
+		const start = Date.now();
+		while (Date.now() - start < 10_000) {
+			const count = (await readdir(activeDir)).length;
+			peak = Math.max(peak, count);
+			if (count === 4) break;
+			await sleep(10);
+		}
 	} finally {
-		complete = true;
-		await monitor;
+		await writeFile(releaseFile, "release");
 	}
+	const outputs = await Promise.all(running);
 	assert.equal(peak, 4);
 	for (const output of outputs) assert.equal(output.stderr, "");
 	assert.deepEqual(await readdir(activeDir), []);
