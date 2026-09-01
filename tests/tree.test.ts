@@ -2100,6 +2100,79 @@ test("buildTreeSnapshot derives stale indicator when status and journal are olde
 	assert.equal(refreshed.children[0]?.stale, undefined);
 });
 
+test("buildTreeSnapshot spares a live child mid tool call from the ordinary stale threshold", async (t) => {
+	const cwd = await temporaryDirectory(t);
+	const artifactDir = join(cwd, "workflows", "wf-inflight");
+	const schedulerRoot = join(cwd, "scheduler");
+	await mkdir(join(artifactDir, "children", "0"), { recursive: true });
+	await mkdir(join(schedulerRoot, "leases"), { recursive: true });
+
+	await writeFile(join(artifactDir, "manifest.json"), JSON.stringify({
+		schemaVersion: "dstack.workflow.v1",
+		workflowId: "wf-inflight",
+		sessionId: "sess-inflight",
+		mode: "single",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		specs: [{ agent: "general-purpose", task: "run the suite", workflow: { assignment: "worker" } }],
+	}), "utf8");
+	await writeFile(join(artifactDir, "progress.json"), JSON.stringify({
+		queued: 0,
+		running: 1,
+		complete: 0,
+		total: 1,
+		children: [{ index: 0, agent: "general-purpose", state: "running", startedAt: "2025-01-01T00:00:00.000Z" }],
+	}), "utf8");
+	await writeFile(join(schedulerRoot, "leases", "l0.json"), JSON.stringify({
+		schemaVersion: "dstack.scheduler.lease.v2",
+		seq: 1,
+		nonce: "n-0",
+		workflowId: "wf-inflight",
+		childId: "0",
+		depth: 1,
+		capacityClass: "terminal",
+		owner: { pid: process.pid, startToken: "unprovable" },
+		acquiredAt: "2025-01-01T00:00:00.000Z",
+	}), "utf8");
+
+	const journalPath = join(artifactDir, "children", "0", "journal.json");
+	const journal = (entry: Record<string, unknown>) => JSON.stringify({
+		schemaVersion: "dstack.journal.v1",
+		seq: 1,
+		entries: [entry],
+		updatedAt: entry["timestamp"],
+	});
+	const inFlight = {
+		seq: 1,
+		timestamp: "2025-01-01T00:00:30.000Z",
+		kind: "tool",
+		name: "bash",
+		gist: "node --test tests/*.test.ts",
+	};
+	const build = () => buildTreeSnapshot({
+		taskId: "task-inflight",
+		workflowId: "wf-inflight",
+		artifactDir,
+		schedulerRoot,
+		now: new Date("2025-01-01T00:04:30.000Z"),
+	});
+
+	// A four-minute test run records nothing between call and result: without the
+	// in-flight grace this healthy child reads as stale after two minutes.
+	await writeFile(journalPath, journal(inFlight), "utf8");
+	const running = await build();
+	assert.equal(running?.children[0]?.stale, undefined);
+
+	// Once the call returns, the ordinary threshold applies to its timestamp again.
+	await writeFile(journalPath, journal({ ...inFlight, durationMs: 240_000, result: { status: "succeeded" } }), "utf8");
+	const settled = await build();
+	assert.equal(settled?.children[0]?.stale, true);
+
+	// The grace is bounded, so a tool call that never returns is still detectable.
+	await writeFile(journalPath, journal({ ...inFlight, timestamp: "2024-12-31T23:44:00.000Z" }), "utf8");
+	const wedged = await build();
+	assert.equal(wedged?.children[0]?.stale, true);
+});
+
 test("buildTreeSnapshot bounds journal history count and parses recent entries", async (t) => {
 	const cwd = await temporaryDirectory(t);
 	const artifactDir = join(cwd, "workflows", "wf-history-bound");

@@ -218,7 +218,7 @@ const ResultParams = Type.Object({
 	waitSeconds: Type.Optional(Type.Number({
 		minimum: 0,
 		maximum: MAX_EXPLICIT_WAIT_SECONDS,
-		description: `Wait 0-${MAX_EXPLICIT_WAIT_SECONDS} seconds for completion. Zero is always nonblocking. Omit for a nonblocking root inspection or a bounded nested-owner collection wait.`,
+		description: `Collection wait of 0-${MAX_EXPLICIT_WAIT_SECONDS} seconds for a nested owner joining its own child task. Ignored for a root inspection, which always returns immediately so the user is never locked out of the turn. Omit for the default: nonblocking at root, one supervision interval for a nested owner.`,
 	})),
 });
 
@@ -1753,8 +1753,13 @@ export default function dstack(pi: ExtensionAPI) {
 		},
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			await publishMachineStatus();
-			const rootWaitMs = resolveWaitMs(params.waitSeconds);
+			// collectionWaitMs also validates params.waitSeconds for the root path below
 			const collectionWaitMs = resolveWaitMs(params.waitSeconds, SUPERVISION_INTERVAL_MS);
+			// A root read never blocks. An explicit waitSeconds here would pin the root
+			// agent inside this tool call and queue the user's input for its whole
+			// duration; the completion wake already returns control when the task
+			// commits, so the wait buys nothing and costs interactivity.
+			const rootWaitMs = 0;
 			const runningSupervision = (
 				view: Extract<DstackResultView, { kind: "running" }>,
 				input: Readonly<{
